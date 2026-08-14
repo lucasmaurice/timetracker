@@ -146,13 +146,14 @@ struct Config: Codable {
     /// Static description of your work, injected into the LLM system prompt to ground its
     /// reasoning (role, projects, what repos/tools/meetings map to). Edit freely.
     var workflowContext: String = """
-    The user is a cloud infrastructure engineer at Coveo. Jira projects: CLOUDINFRA (AWS/EKS \
-    Kubernetes infrastructure, monitoring, SLOs), PES (platform engineering), GEN (general). \
-    Repos live under ~/Workspace and usually map to an infra area (e.g. infra-kubernetes, \
-    monitoring, infra-irsa-poc). AWS console, Grafana, k8s/Lens, kubectl/terraform usually mean \
-    infrastructure troubleshooting. Meetings on Zoom/Meet/Slack-huddle usually relate to the \
-    ticket or epic being discussed. Prefer the ticket whose summary/components match the tools \
-    and repos currently in use.
+    Describe your role, Jira projects, and how repos/tools/meetings map to tickets here — this \
+    grounds the LLM's guesses in your actual workflow. Example: "The user is a cloud \
+    infrastructure engineer. Jira projects: CLOUDINFRA (AWS/EKS Kubernetes infrastructure, \
+    monitoring, SLOs), PES (platform engineering), GEN (general). Repos live under ~/Workspace \
+    and usually map to an infra area (e.g. infra-kubernetes, monitoring, infra-irsa-poc). AWS \
+    console, Grafana, k8s/Lens, kubectl/terraform usually mean infrastructure troubleshooting. \
+    Meetings on Zoom/Meet/Slack-huddle usually relate to the ticket or epic being discussed. \
+    Prefer the ticket whose summary/components match the tools and repos currently in use."
     """
     /// Minutes between background LLM refinement passes (0 = prompt-time only).
     var llmRefreshMinutes: Double = 5

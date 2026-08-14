@@ -24,7 +24,7 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 # each rebuild, so after a rebuild you must re-grant Accessibility. The helper
 # scripts/reset-accessibility.sh resets the permission cleanly for that.
 echo "==> ad-hoc signing"
-codesign --force --deep --identifier com.arousseau.timetracker --sign - "$APP"
+codesign --force --deep --identifier ca.justereseau.timetracker --sign - "$APP"
 
 echo "==> installing to $DEST"
 mkdir -p "$DEST"

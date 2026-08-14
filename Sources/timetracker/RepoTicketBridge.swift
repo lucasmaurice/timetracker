@@ -13,7 +13,7 @@ final class RepoTicketBridge {
 
     private var map: [String: [String: Stat]] = [:]   // repoName -> (ticket -> stat)
     private let file = AppPaths.dataDir.appendingPathComponent("repo-tickets.json")
-    private let queue = DispatchQueue(label: "com.arousseau.timetracker.repobridge")
+    private let queue = DispatchQueue(label: "ca.justereseau.timetracker.repobridge")
 
     /// Half-life of a git occurrence's contribution, in days. ~6 weeks: recent work dominates
     /// but a steady-state repo still accumulates its long-running ticket.

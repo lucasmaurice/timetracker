@@ -30,6 +30,7 @@ final class Atlassian {
     /// can block waiting on a permission prompt, which froze the menu-bar UI at launch.
     private var credentials: Credentials? { cached }
     var configured: Bool { cached != nil }
+    var site: String? { cached?.site }
 
     /// Read the Keychain exactly once. MUST be called off the main thread (see above).
     func preload() {
@@ -43,7 +44,7 @@ final class Atlassian {
         cached = nil; loaded = true
     }
 
-    /// Accepts "coveo", "coveo.atlassian.net", or "https://coveo.atlassian.net/" → host only.
+    /// Accepts "acme", "acme.atlassian.net", or "https://acme.atlassian.net/" → host only.
     static func normalizeSite(_ raw: String) -> String {
         var s = raw.trimmingCharacters(in: .whitespaces).lowercased()
         for prefix in ["https://", "http://"] where s.hasPrefix(prefix) { s.removeFirst(prefix.count) }

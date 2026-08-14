@@ -5,7 +5,7 @@ import Security
 /// Used for the Atlassian credentials (site / email / API token) —
 /// never written to config.json or any plaintext file.
 enum Keychain {
-    static let service = "com.arousseau.timetracker"
+    static let service = "ca.justereseau.timetracker"
 
     static func set(_ data: Data, account: String) {
         let base: [String: Any] = [

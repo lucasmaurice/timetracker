@@ -28,7 +28,7 @@ final class FocusMonitor {
     private var sampleTimer: Timer?
     /// Enrichment (AppleScript, git, lsof, kubectl, ps) runs here — NEVER on the main
     /// thread, or it freezes the menu-bar UI. Serial, so the enricher's caches stay safe.
-    private let enrichQueue = DispatchQueue(label: "com.arousseau.timetracker.enrich", qos: .utility)
+    private let enrichQueue = DispatchQueue(label: "ca.justereseau.timetracker.enrich", qos: .utility)
     private var sampling = false
 
     private var openStart: Date?

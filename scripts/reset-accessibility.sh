@@ -4,7 +4,7 @@
 # rebuild changes the code hash, which invalidates the previous grant).
 set -euo pipefail
 
-LABEL="com.arousseau.timetracker"
+LABEL="ca.justereseau.timetracker"
 UID_NUM="$(id -u)"
 
 echo "==> stopping running instances"

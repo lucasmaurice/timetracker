@@ -3,14 +3,23 @@
   "displayName": "TimeTracker Context",
   "description": "Feeds rich editor context (repo, branch, file, symbol, terminal commands, task) to the local TimeTracker app for better JIRA-ticket inference. 100% local — writes a heartbeat file, makes no network calls.",
   "version": "0.2.0",
-  "publisher": "arousseau",
-  "engines": { "vscode": "^1.84.0" },
-  "categories": ["Other"],
-  "activationEvents": ["onStartupFinished"],
+  "publisher": "JusteReseau",
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
-      { "command": "timetracker.status", "title": "TimeTracker: Show context status" }
+      {
+        "command": "timetracker.status",
+        "title": "TimeTracker: Show context status"
+      }
     ]
   },
   "scripts": {

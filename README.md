@@ -163,7 +163,7 @@ Setup:
 
 1. Create a token at <https://id.atlassian.com/manage-profile/security/api-tokens>.
 2. In the menu bar: **Connect Atlassian (API token)…** (has an "Open token page" button) → enter:
-   - **Site**: your `<site>` (e.g. `coveo`, or `coveo.atlassian.net` — both accepted)
+   - **Site**: your `<site>` (e.g. `acme`, or `acme.atlassian.net` — both accepted)
    - **Email**: your Atlassian account email
    - **API token**: the token you created
 3. It validates against `/myself`, then loads your tickets. Use **Refresh sprint list** anytime.

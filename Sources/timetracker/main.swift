@@ -600,7 +600,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.window.initialFirstResponder = field
         let resp = alert.runModal()
         if resp == .alertThirdButtonReturn {
-            NSWorkspace.shared.open(URL(string: "https://coveord.atlassian.net/plugins/servlet/ac/io.tempo.jira/tempo-app#!/configuration/api-integration")!)
+            let site = atlassian.site ?? "id.atlassian.com"
+            NSWorkspace.shared.open(URL(string: "https://\(site)/plugins/servlet/ac/io.tempo.jira/tempo-app#!/configuration/api-integration")!)
             return promptForTempoToken()
         }
         guard resp == .alertFirstButtonReturn else { return nil }
@@ -989,7 +990,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.messageText = "Connect Atlassian (API token)"
         alert.informativeText = """
         Create a token at id.atlassian.com → Security → API tokens, then enter:
-          • Site: your <site> (e.g. coveo, or coveo.atlassian.net)
+          • Site: your <site> (e.g. acme, or acme.atlassian.net)
           • Email: your Atlassian account email
           • API token: the token you created
         """
@@ -1000,7 +1001,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 340, height: 84))
         stack.orientation = .vertical; stack.spacing = 6
         let siteField = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
-        siteField.placeholderString = "Site (e.g. coveo)"
+        siteField.placeholderString = "Site (e.g. acme)"
         let emailField = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
         emailField.placeholderString = "you@company.com"
         let tokenField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))

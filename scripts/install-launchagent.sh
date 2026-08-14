@@ -2,7 +2,7 @@
 # Install + load the LaunchAgent so TimeTracker starts at login and stays running.
 set -euo pipefail
 
-LABEL="com.arousseau.timetracker"
+LABEL="ca.justereseau.timetracker"
 BIN="$HOME/Applications/TimeTracker.app/Contents/MacOS/timetracker"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOGDIR="$HOME/Library/Application Support/TimeTracker"
