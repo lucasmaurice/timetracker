@@ -933,7 +933,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Refresh the Jira ticket list. Silent = no popup (used by the timer + launch).
     private func runRefresh(silent: Bool) {
-        guard atlassian.configured, !refreshingJira else { return }
+        // Guarding on `issueProvider` too (not just `atlassian.configured`) so a still-connected
+        // Jira account left over from before a provider switch can't clobber an Azure DevOps
+        // sprint.json on the auto-refresh timer.
+        guard config.issueProvider == .jira, atlassian.configured, !refreshingJira else { return }
         refreshingJira = true
         Task { @MainActor in
             defer { refreshingJira = false }

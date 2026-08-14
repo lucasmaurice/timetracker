@@ -13,8 +13,27 @@ enum AppPaths {
     }
 }
 
+/// Which issue tracker supplies the ticket/work-item corpus (`sprint.json`). Changing this needs
+/// a restart — `Config` is loaded once at launch and copied by value into every component.
+enum IssueProviderKind: String, Codable, CaseIterable {
+    case jira, azureDevOps
+}
+
+/// Which time-tracking system worklogs are submitted to. Changing this needs a restart.
+enum WorklogProviderKind: String, Codable, CaseIterable {
+    case tempo, sevenPace
+}
+
 /// User-tunable settings, loaded from config.json with sane defaults.
 struct Config: Codable {
+    /// Where tickets/work items come from. See `IssueProviderKind`.
+    var issueProvider: IssueProviderKind = .jira
+    /// Where worklogs are submitted. See `WorklogProviderKind`.
+    var worklogProvider: WorklogProviderKind = .tempo
+    /// Azure Boards only: regex (first capture group = the numeric work-item id) recognizing a
+    /// work item id embedded in a branch name, e.g. the default matches "feature/48210-fix-thing".
+    var azureBranchKeyPattern: String = "(?:^|/)(\\d+)[-_]"
+
     /// User is "idle" after this many seconds with no input.
     var idleSeconds: Double = 300
     /// Timesheet block model: a workday of `workdayHours` starting at `dayStartHour`, divided
@@ -174,8 +193,26 @@ struct Config: Codable {
     var embeddingAutoTagThreshold: Double = 0.62
 
     static func load() -> Config {
-        guard let data = try? Data(contentsOf: AppPaths.configFile),
-              let cfg = try? JSONDecoder().decode(Config.self, from: data) else {
+        guard let data = try? Data(contentsOf: AppPaths.configFile) else {
+            let cfg = Config()
+            cfg.saveIfAbsent()
+            return cfg
+        }
+        // JSONDecoder throws on ANY missing key, even when the Swift property has a default value
+        // (`decode(Config.self, ...)` alone would have silently discarded every existing setting
+        // the first time a new field like `issueProvider` was added and an older config.json on
+        // disk didn't have it). Layer the on-disk JSON over a freshly-serialized default Config's
+        // JSON first, so old files pick up new fields' defaults without losing anything else.
+        if let defaultsData = try? JSONEncoder().encode(Config()),
+           var merged = try? JSONSerialization.jsonObject(with: defaultsData) as? [String: Any],
+           let onDisk = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            for (k, v) in onDisk { merged[k] = v }
+            if let mergedData = try? JSONSerialization.data(withJSONObject: merged),
+               let cfg = try? JSONDecoder().decode(Config.self, from: mergedData) {
+                return cfg
+            }
+        }
+        guard let cfg = try? JSONDecoder().decode(Config.self, from: data) else {
             let cfg = Config()
             cfg.saveIfAbsent()
             return cfg

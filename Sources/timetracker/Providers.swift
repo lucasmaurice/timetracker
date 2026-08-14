@@ -1,0 +1,113 @@
+import Foundation
+
+/// Which piece of context a candidate key was pulled from. Some formats need stricter matching
+/// for noisy sources (a window title can contain any number) than for sources that only ever
+/// contain a real reference (a browser URL pointing straight at the ticket).
+enum KeySource {
+    case url, branch, title, commit, session, freeText
+}
+
+/// Defines how ticket/work-item keys look for one issue-tracking provider: how to pull one out of
+/// arbitrary text, whether a key belongs to the guessable pool, and how to canonicalize a
+/// user-typed string. This is the seam that keeps `Attribution` provider-agnostic — everything
+/// downstream of it works on opaque `Ticket.key` strings.
+protocol TicketKeyFormat {
+    /// Shown in placeholder text / help copy, e.g. "CLOUDINFRA-1234" or "AB#48210".
+    var placeholderExample: String { get }
+    /// Whether a bare number (e.g. skimmed from a window title) may be considered a candidate key
+    /// at all — the caller still gates it against the live ticket corpus before trusting it, so
+    /// this can't produce false positives on its own. Jira keys are never bare numbers.
+    var allowsBareNumberFallback: Bool { get }
+    /// Strict, source-aware extraction. Never matches a bare number — that path is handled
+    /// separately (see `allowsBareNumberFallback`) precisely because it needs corpus gating that
+    /// this format has no access to.
+    func extract(from text: String, source: KeySource) -> String?
+    /// True if a key's project/prefix is one the guesser is configured to choose from.
+    func isGuessable(_ key: String) -> Bool
+    /// Normalize a user-typed or machine-supplied string into this format's canonical key shape
+    /// (case, punctuation) — WITHOUT consulting the ticket corpus. Returns nil if the string
+    /// doesn't look like a key in this format at all.
+    func canonicalize(_ raw: String) -> String?
+}
+
+/// `PREFIX-1234` (Jira). Applies the same regex regardless of source — a straight port of
+/// TimeTracker's original single-regex behavior, kept byte-identical so existing Jira setups
+/// don't regress.
+struct JiraKeyFormat: TicketKeyFormat {
+    private let regex: NSRegularExpression
+    private let prefixes: [String]
+    let placeholderExample: String
+    let allowsBareNumberFallback = false
+
+    init(prefixes: [String]) {
+        self.prefixes = prefixes
+        let escaped = prefixes.map { NSRegularExpression.escapedPattern(for: $0) }.joined(separator: "|")
+        // Word-bounded <PREFIX>-<digits>, prefixes are case-insensitive.
+        self.regex = try! NSRegularExpression(pattern: "\\b(?:\(escaped))-\\d+\\b", options: [.caseInsensitive])
+        self.placeholderExample = prefixes.first.map { "\($0)-1234" } ?? "PROJECT-1234"
+    }
+
+    func extract(from text: String, source: KeySource) -> String? {
+        let range = NSRange(text.startIndex..., in: text)
+        guard let m = regex.firstMatch(in: text, range: range), let r = Range(m.range, in: text) else { return nil }
+        return String(text[r]).uppercased()
+    }
+
+    /// True if a key's project prefix is one the guesser is configured to choose from — a plain
+    /// prefix-string check, matching the original `hasGuessablePrefix` exactly (not derived from
+    /// the regex, so odd historical keys that predate strict validation still behave the same).
+    func isGuessable(_ key: String) -> Bool {
+        let upper = key.uppercased()
+        return prefixes.contains { upper.hasPrefix($0.uppercased() + "-") }
+    }
+
+    func canonicalize(_ raw: String) -> String? { extract(from: raw, source: .freeText) }
+}
+
+/// `AB#1234` (Azure Boards). Distinguishes by source because a bare number is dangerously
+/// ambiguous in noisy text (window titles, terminal output) but unambiguous where Azure Boards
+/// itself writes it (`_workitems/edit/1234`, `AB#1234` in commits/PR titles/branch names).
+struct AzureBoardsKeyFormat: TicketKeyFormat {
+    let placeholderExample = "AB#48210"
+    let allowsBareNumberFallback = true
+
+    private let urlRegex = try! NSRegularExpression(
+        pattern: "(?:_workitems/edit/|[?&]workitem=)(\\d+)", options: [.caseInsensitive])
+    private let hashRegex = try! NSRegularExpression(pattern: "AB#(\\d+)", options: [.caseInsensitive])
+    private let branchRegex: NSRegularExpression
+
+    init(branchPattern: String) {
+        self.branchRegex = (try? NSRegularExpression(pattern: branchPattern, options: [.caseInsensitive]))
+            ?? (try! NSRegularExpression(pattern: "(?:^|/)(\\d+)[-_]", options: [.caseInsensitive]))
+    }
+
+    private static func firstGroup(_ regex: NSRegularExpression, in text: String) -> String? {
+        let range = NSRange(text.startIndex..., in: text)
+        guard let m = regex.firstMatch(in: text, range: range), m.numberOfRanges > 1,
+              let r = Range(m.range(at: 1), in: text) else { return nil }
+        return String(text[r])
+    }
+
+    func extract(from text: String, source: KeySource) -> String? {
+        let id: String?
+        switch source {
+        case .url: id = Self.firstGroup(urlRegex, in: text) ?? Self.firstGroup(hashRegex, in: text)
+        case .branch: id = Self.firstGroup(hashRegex, in: text) ?? Self.firstGroup(branchRegex, in: text)
+        case .title, .commit, .session, .freeText: id = Self.firstGroup(hashRegex, in: text)
+        }
+        return id.map { "AB#\($0)" }
+    }
+
+    func isGuessable(_ key: String) -> Bool { key.uppercased().hasPrefix("AB#") }
+
+    /// Accepts "AB#1234", "ab#1234", or a bare "1234" (as commonly copied straight from the AzDO
+    /// UI, which shows the numeric id everywhere but rarely the "AB#" form). The bare-digits case
+    /// is intentionally NOT corpus-checked here — callers using this for the live bare-number
+    /// fallback path must check the result against the current ticket pool themselves.
+    func canonicalize(_ raw: String) -> String? {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let id = Self.firstGroup(hashRegex, in: t) { return "AB#\(id)" }
+        if t.range(of: "^\\d{1,9}$", options: .regularExpression) != nil { return "AB#\(t)" }
+        return nil
+    }
+}

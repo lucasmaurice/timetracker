@@ -345,7 +345,7 @@ final class Atlassian {
         }
 
         let f = ISO8601DateFormatter()
-        let file = SprintFile(updated: f.string(from: Date()), tickets: all)
+        let file = SprintFile(provider: IssueProviderKind.jira.rawValue, updated: f.string(from: Date()), tickets: all)
         let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         try FileManager.default.createDirectory(at: AppPaths.dataDir, withIntermediateDirectories: true)
         try enc.encode(file).write(to: AppPaths.sprintFile)
