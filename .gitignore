@@ -1,0 +1,46 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+*.xcodeproj
+.DS_Store
+
+# Xcode
+DerivedData/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+xcuserdata/
+
+# Node / VSCode extension (editor-extension)
+editor-extension/node_modules/
+editor-extension/out/
+editor-extension/*.vsix
+node_modules/
+
+# Build output
+TimeTracker.app/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Secrets & credentials — never commit tokens/keys
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.mobileprovision
+**/credentials*.json
+**/secrets*.json
+sprint.json
+
+# Editor / OS
+.DS_Store
+.vscode/*
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/extensions.json
+*.swp

@@ -1,0 +1,1398 @@
+import AppKit
+import ApplicationServices
+import SwiftUI
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var statusItem: NSStatusItem!
+    private let config = Config.load()
+    private var store: Store!
+    private var attribution: Attribution!
+    private var monitor: FocusMonitor!
+    private var summary: Summary!
+    private var atlassian: Atlassian!
+    private var ollama: Ollama!
+    private var tempo: TempoClient!
+    private var embeddings: EmbeddingMatcher!
+    private var dashboardWindow: NSWindow?
+    private var dashboardHost: NSHostingController<DashboardView>?
+    private var reviewWindow: NSWindow?
+    private var reviewHost: NSHostingController<ReviewView>?
+    private var reviewModel: ReviewModel?
+    private var reviewDay = Date()
+    private var assignWindow: NSWindow?
+    private var assignHost: NSHostingController<AssignView>?
+    private var teachWindow: NSWindow?
+    private var teachHost: NSHostingController<TeachView>?
+    private var teachModel: TeachModel?
+    private var teachCurrentSignatures: [String] = []
+    private var teachCurrentDoc = ""
+    private var settingsWindow: NSWindow?
+    private var settingsHost: NSHostingController<SettingsView>?
+    private var settingsModel: SettingsModel?
+    private var inspectorWindow: NSWindow?
+    private var inspectorHost: NSHostingController<InspectorView>?
+
+    private var promptTimer: Timer?
+    private var llmTimer: Timer?
+    private var jiraTimer: Timer?
+    private var refreshingJira = false
+    private var lastPromptDismissal: Date?
+    private var promptOpen = false
+    /// When the current activity entered a continuous "can't guess at all" state (drives the nudge).
+    private var abstainSince: Date?
+    private var lastLLM: (key: String, reason: String, confidence: Double, at: Date)?
+    /// Rolling buffer of distinct work contexts (timestamp, document) for the LLM arc.
+    private var arc: [(at: Date, ctx: WorkContext)] = []
+    private var embedTop: TicketGuess?
+    private var embedCandidates: [TicketGuess] = []
+    private var embedInFlight = false
+    private var lastEmbedDoc: String?
+
+    func applicationDidFinishLaunching(_ note: Notification) {
+        store = Store()
+        attribution = Attribution(config: config, store: store)
+        summary = Summary(store: store, config: config, attribution: attribution)
+        atlassian = Atlassian(config: config)
+        ollama = Ollama(config: config)
+        tempo = TempoClient(config: config)
+        embeddings = EmbeddingMatcher(config: config)
+        let enricher = ContextEnricher(config: config, sessions: SessionReader())
+        monitor = FocusMonitor(store: store, attribution: attribution, enricher: enricher, config: config)
+
+        runStartupMigrationsIfNeeded()
+
+        setupMainMenu()
+        setupStatusItem()
+        requestAccessibilityIfNeeded()
+
+        monitor.onUpdate = { [weak self] state in
+            DispatchQueue.main.async {
+                self?.updateStatus(state); self?.recordArc(state); self?.maybeEmbed(state)
+            }
+        }
+        monitor.start()
+        // Read the Keychain off-main (it can block on a permission prompt), then refresh.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.atlassian.preload()
+            self?.tempo.preload()
+            DispatchQueue.main.async {
+                self?.rebuildMenu(current: self?.monitor.currentState)
+                self?.runRefresh(silent: true)   // freshen Jira on launch if connected
+            }
+        }
+        reindexEmbeddings()
+
+        if config.jiraRefreshMinutes > 0 {
+            jiraTimer = Timer.scheduledTimer(withTimeInterval: config.jiraRefreshMinutes * 60, repeats: true) { [weak self] _ in
+                self?.runRefresh(silent: true)
+            }
+        }
+
+        DispatchQueue.global(qos: .background).async { [weak self] in self?.housekeeping() }
+        buildRepoBridgeAndBackfill()
+
+        promptTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.checkAbstainNudge()
+            self?.checkUnknownBacklog()
+            self?.checkReminders()
+        }
+        // The LLM is now event-driven (fired by `maybeEmbed` when fusion is still ambiguous), but
+        // keep a low-frequency safety pass for long single-context sessions where no focus change
+        // ever re-triggers embedding. `llmRefine` no-ops unless the segment is still undecided.
+        if config.ollamaEnabled, config.llmRefreshMinutes > 0 {
+            llmTimer = Timer.scheduledTimer(withTimeInterval: config.llmRefreshMinutes * 60, repeats: true) { [weak self] _ in
+                self?.llmRefine()
+            }
+        }
+    }
+
+    func applicationWillTerminate(_ note: Notification) {
+        monitor?.flush()
+    }
+
+    /// Mine workspace git history into the repo→ticket bridge (every launch), and on first run
+    /// seed `labels` from that history (warm-start). All git/store work is off the main thread;
+    /// the in-memory label index is reloaded on main. Mirrors the housekeeping pattern.
+    private func buildRepoBridgeAndBackfill() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            self.attribution.rebuildRepoBridge()
+            let firstRun = !UserDefaults.standard.bool(forKey: "ttBackfilledV1")
+            let inserted = firstRun ? self.attribution.backfillFromHistory() : 0
+            if firstRun { UserDefaults.standard.set(true, forKey: "ttBackfilledV1") }
+            DispatchQueue.main.async {
+                // The bridge was (re)built after init's reloadSprint, so reload to widen the guess
+                // pool with freshly-mined keys and re-index the matcher/embeddings.
+                self.attribution.reloadSprint()
+                if inserted > 0 {
+                    self.attribution.reloadMemory()
+                    NSLog("TimeTracker warm-start: seeded \(inserted) backfill labels from git history")
+                }
+                self.reindexEmbeddings()
+                self.rebuildMenu(current: self.monitor.currentState)
+            }
+        }
+    }
+
+    /// One-time data hygiene + config moves, guarded by a version flag. Runs synchronously on
+    /// the main thread before the monitor starts, so there's no concurrent DB access.
+    private func runStartupMigrationsIfNeeded() {
+        let key = "ttMigratedV1"
+        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        let summary = attribution.runDataMigration()
+        // The user opted into a wider guess pool; flip the (now unreliable) sprint-only gate
+        // on disk so it persists. This session already falls back to the full not-done pool.
+        var c = config
+        if c.guessFromSprintOnly { c.guessFromSprintOnly = false; c.save() }
+        UserDefaults.standard.set(true, forKey: key)
+        NSLog("TimeTracker migration v1: \(summary)")
+    }
+
+    // MARK: - Status item
+
+    /// Accessory (menu-bar-only) apps have no main menu, so ⌘C/⌘V/⌘X/⌘A are never
+    /// routed to text fields (e.g. the Connect dialog). Install a minimal Edit menu so
+    /// the standard editing shortcuts reach the first responder.
+    private func setupMainMenu() {
+        let mainMenu = NSMenu()
+
+        let editItem = NSMenuItem()
+        mainMenu.addItem(editItem)
+        let edit = NSMenu(title: "Edit")
+        editItem.submenu = edit
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+
+        NSApp.mainMenu = mainMenu
+    }
+
+    private func setupStatusItem() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = statusItem.button {
+            button.image = NSImage(systemSymbolName: "clock", accessibilityDescription: "TimeTracker")
+            button.imagePosition = .imageLeading
+            button.title = " ?"
+        }
+        rebuildMenu(current: nil)
+    }
+
+    private func updateStatus(_ state: LiveState?) {
+        guard let button = statusItem.button else { return }
+        let attr = state?.attribution
+        // Track continuous "can't guess at all" (abstain) so the nudge can fire on sustained
+        // un-attributed work — not just on a 2h block backlog.
+        let abstaining = state != nil && !(state!.idle) && attr?.ticket == nil
+            && (attr?.candidates.isEmpty ?? true) && !(state!.context.excluded) && attr?.category != "meeting"
+        abstainSince = abstaining ? (abstainSince ?? Date()) : nil
+
+        var symbol = "clock"
+        if monitor.paused {
+            button.title = " paused"; symbol = "pause.circle"
+        } else if let t = attr?.ticket {
+            button.title = t == config.noTicketLabel ? " no ticket" : " \(t)"
+            symbol = t == config.noTicketLabel ? "minus.circle" : "clock"
+        } else if let top = attr?.candidates.first {
+            button.title = " ?\(top.key)"; symbol = "questionmark.circle"     // a guess awaits confirmation
+        } else if abstaining {
+            button.title = " ?"; symbol = "exclamationmark.circle"            // nothing to go on
+        } else if let cat = attr?.category {
+            button.title = " \(cat)"
+        } else {
+            button.title = " ?"
+        }
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "TimeTracker")
+        rebuildMenu(current: state)
+    }
+
+    private func rebuildMenu(current: LiveState?) {
+        let menu = NSMenu()
+
+        if !AXIsProcessTrusted() {
+            let warn = NSMenuItem(title: "⚠️ Grant Accessibility for window titles", action: #selector(openAccessibilitySettings), keyEquivalent: "")
+            warn.target = self
+            menu.addItem(warn)
+            menu.addItem(.separator())
+        }
+
+        let appLine = current.map { "\($0.appName)\($0.idle ? " (idle)" : "")" } ?? "—"
+        menu.addItem(disabled("App: \(appLine)"))
+        if let t = current?.title, !t.isEmpty {
+            menu.addItem(disabled("Window: \(t.prefix(60))"))
+        }
+        let attr = current?.attribution
+        if let t = attr?.ticket {
+            let src = attr?.source ?? "?"
+            let conf = attr?.confidence.map { String(format: " %.2f", $0) } ?? ""
+            menu.addItem(disabled("Ticket: \(t) (\(src)\(conf))"))
+        } else if let top = attr?.candidates.first {
+            menu.addItem(disabled(String(format: "Guess: %@ (%.2f) — confirm below", top.key, top.score)))
+        } else {
+            menu.addItem(disabled("Ticket: unknown"))
+        }
+        if let cat = attr?.category {
+            menu.addItem(disabled("Category: \(cat)"))
+        }
+        if let ctx = current?.context {
+            if let b = ctx.branch { menu.addItem(disabled("Branch: \(b.prefix(44))")) }
+            if let u = ctx.url, let host = URL(string: u)?.host { menu.addItem(disabled("URL: \(host)")) }
+            if let m = ctx.meeting { menu.addItem(disabled("Meeting: \(m.prefix(44))")) }
+            if let s = ctx.aiSession { menu.addItem(disabled("Session: \(s.prefix(52))")) }
+        }
+        if let llm = lastLLM {
+            menu.addItem(disabled("LLM: \(llm.key) (\(String(format: "%.2f", llm.confidence))) \(llm.reason.prefix(34))"))
+        }
+        if let e = embedTop {
+            menu.addItem(disabled("Embed: \(e.key) (\(String(format: "%.2f", e.score)))"))
+        }
+
+        menu.addItem(.separator())
+        if let pin = monitor.pinnedTicket {
+            menu.addItem(disabled("📌 Pinned to \(pin)"))
+            let unpin = NSMenuItem(title: "Unpin", action: #selector(unpinTicket), keyEquivalent: "")
+            unpin.target = self; menu.addItem(unpin)
+        }
+        let assign = NSMenuItem(title: "Assign ticket (choose time span)…", action: #selector(openAssign), keyEquivalent: "")
+        assign.target = self; menu.addItem(assign)
+        menu.addItem(ticketSubmenuItem(title: "Quick-tag current activity", candidates: attr?.candidates ?? []))
+
+        // No-guess affordances: accept the top suggestion, or declare the work non-billable.
+        if attr?.ticket == nil, let top = attr?.candidates.first {
+            let s = attribution.summary(for: top.key).map { " — \($0.prefix(36))" } ?? ""
+            let accept = NSMenuItem(title: "✓ Accept \(top.key)\(s)", action: #selector(acceptTopGuess), keyEquivalent: "")
+            accept.target = self; menu.addItem(accept)
+        }
+        if current != nil, !(current!.idle), attr?.ticket != config.noTicketLabel {
+            let noTix = NSMenuItem(title: "Mark current work as no-ticket", action: #selector(markCurrentNoTicket), keyEquivalent: "")
+            noTix.target = self; menu.addItem(noTix)
+        }
+
+        menu.addItem(.separator())
+        let dash = NSMenuItem(title: "Dashboard…", action: #selector(openDashboard), keyEquivalent: "d")
+        dash.target = self; menu.addItem(dash)
+        let teach = NSMenuItem(title: "Teach the guesser…  (\(attribution.labelCount))", action: #selector(openTeach), keyEquivalent: "t")
+        teach.target = self; menu.addItem(teach)
+        let inspect = NSMenuItem(title: "Inspector (microscope)…", action: #selector(openInspector), keyEquivalent: "i")
+        inspect.target = self; menu.addItem(inspect)
+        let review = NSMenuItem(title: "Review today…", action: #selector(openReview), keyEquivalent: "r")
+        review.target = self; menu.addItem(review)
+        let export = NSMenuItem(title: "Export today to timesheet-log.md", action: #selector(exportToday), keyEquivalent: "e")
+        export.target = self; menu.addItem(export)
+        let refresh = NSMenuItem(title: "Refresh sprint list", action: #selector(refreshSprint), keyEquivalent: "")
+        refresh.target = self; refresh.isEnabled = atlassian.configured; menu.addItem(refresh)
+
+        menu.addItem(.separator())
+        if atlassian.configured {
+            let logout = NSMenuItem(title: "Disconnect Atlassian", action: #selector(disconnectAtlassian), keyEquivalent: "")
+            logout.target = self; menu.addItem(logout)
+        } else {
+            let connect = NSMenuItem(title: "Connect Atlassian (API token)…", action: #selector(connectAtlassian), keyEquivalent: "")
+            connect.target = self; menu.addItem(connect)
+        }
+
+        menu.addItem(.separator())
+        let pause = NSMenuItem(title: monitor.paused ? "Resume tracking" : "Pause tracking", action: #selector(togglePause), keyEquivalent: "")
+        pause.target = self; menu.addItem(pause)
+        let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settings.target = self; menu.addItem(settings)
+        let folder = NSMenuItem(title: "Open data folder", action: #selector(openDataFolder), keyEquivalent: "")
+        folder.target = self; menu.addItem(folder)
+
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "Quit TimeTracker", action: #selector(quit), keyEquivalent: "q")
+        quit.target = self; menu.addItem(quit)
+
+        statusItem.menu = menu
+    }
+
+    private func disabled(_ s: String) -> NSMenuItem {
+        let i = NSMenuItem(title: s, action: nil, keyEquivalent: ""); i.isEnabled = false; return i
+    }
+
+    private func ticketSubmenuItem(title: String, candidates: [TicketGuess]) -> NSMenuItem {
+        let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+
+        func add(_ key: String, _ label: String) {
+            let item = NSMenuItem(title: label, action: #selector(pickTicket(_:)), keyEquivalent: "")
+            item.representedObject = key; item.target = self; sub.addItem(item)
+        }
+
+        // Top semantic guesses first, with scores, so the likely ticket is one click away.
+        let guessKeys = Set(candidates.map { $0.key })
+        if !candidates.isEmpty {
+            sub.addItem(disabled("Best guesses"))
+            for g in candidates {
+                let summary = attribution.summary(for: g.key) ?? ""
+                add(g.key, String(format: "  %@ (%.2f) — %@", g.key, g.score, String(summary.prefix(44))))
+            }
+            sub.addItem(.separator())
+        }
+
+        // No-ticket sentinel.
+        add(config.noTicketLabel, "⃠ \(config.noTicketLabel)")
+
+        // Common / catch-all tickets — only here, never repeated under "All assigned".
+        let common = attribution.commonTickets
+        if !common.isEmpty {
+            sub.addItem(.separator()); sub.addItem(disabled("Common"))
+            for t in common { add(t.key, "\(t.key) — \(t.summary.prefix(50))") }
+        }
+
+        // Everything else assigned (excluding common + already-shown guesses).
+        sub.addItem(.separator()); sub.addItem(disabled("All assigned"))
+        for t in attribution.openTickets.prefix(80) where !t.common && !guessKeys.contains(t.key) {
+            add(t.key, "\(t.key) — \(t.summary.prefix(50))")
+        }
+        if attribution.sprint.isEmpty {
+            sub.addItem(disabled("(no tickets — Connect Atlassian, see README)"))
+        }
+        sub.addItem(.separator())
+        let manual = NSMenuItem(title: "Enter ticket manually…", action: #selector(enterTicketManually), keyEquivalent: "")
+        manual.target = self; sub.addItem(manual)
+        parent.submenu = sub
+        return parent
+    }
+
+    // MARK: - Actions
+
+    @objc private func pickTicket(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        monitor.overrideCurrentTicket(key)
+    }
+
+    @objc private func enterTicketManually() {
+        guard let key = promptForTicket(message: "Assign a ticket to the current activity") else { return }
+        monitor.overrideCurrentTicket(key)
+    }
+
+    /// Confirm the top suggestion — tags the current activity and (manual source) records a
+    /// correction the model learns from.
+    @objc private func acceptTopGuess() {
+        guard let key = monitor.currentState?.attribution.candidates.first?.key else { return }
+        monitor.overrideCurrentTicket(key)
+        abstainSince = nil
+        rebuildMenu(current: monitor.currentState)
+    }
+
+    /// Declare the current work non-billable: tag it (no ticket), learn the negative example, and
+    /// offer to make it a standing rule for this app/site.
+    @objc private func markCurrentNoTicket() {
+        guard let st = monitor.currentState, !st.idle else { return }
+        monitor.overrideCurrentTicket(config.noTicketLabel)   // source manual → records the negative
+        abstainSince = nil
+        offerNoTicketRule(for: st.context)
+        rebuildMenu(current: monitor.currentState)
+    }
+
+    /// After a no-ticket mark, offer a persistent "always no-ticket" rule for the best signature.
+    private func offerNoTicketRule(for ctx: WorkContext) {
+        guard let sig = attribution.noTicketRuleCandidate(for: ctx) else { return }
+        let a = NSAlert()
+        a.messageText = "Always treat this as no-ticket?"
+        a.informativeText = "Automatically mark “\(sig)” as no-ticket from now on? (Editable in Settings → Always-no-ticket signatures.)"
+        a.addButton(withTitle: "Always"); a.addButton(withTitle: "Just this time")
+        if a.runModal() == .alertFirstButtonReturn { attribution.addNoTicketRule(sig) }
+    }
+
+    @objc private func openDashboard() {
+        let view = makeDashboardView()
+        if let host = dashboardHost, let win = dashboardWindow {
+            host.rootView = view
+            NSApp.activate(ignoringOtherApps: true)
+            win.makeKeyAndOrderFront(nil)
+            return
+        }
+        let host = NSHostingController(rootView: view)
+        let win = NSWindow(contentViewController: host)
+        win.title = "TimeTracker Dashboard"
+        win.styleMask = [.titled, .closable, .resizable, .miniaturizable]
+        win.setContentSize(NSSize(width: 780, height: 780))
+        win.isReleasedWhenClosed = false
+        win.center()
+        dashboardHost = host
+        dashboardWindow = win
+        NSApp.activate(ignoringOtherApps: true)
+        win.makeKeyAndOrderFront(nil)
+    }
+
+    private func makeDashboardView() -> DashboardView {
+        let data = DashboardBuilder(store: store, summary: summary, config: config).build()
+        return DashboardView(data: data) { [weak self] in
+            guard let self else { return }
+            self.dashboardHost?.rootView = self.makeDashboardView()
+        }
+    }
+
+    @objc private func openReview() { presentReview(day: Date()) }
+
+    private func presentReview(day: Date) {
+        reviewDay = day
+        monitor.flush()   // persist the in-progress segment so today's latest work shows + can be learned
+        let view = makeReviewView(day: reviewDay)
+        if let host = reviewHost, let win = reviewWindow {
+            host.rootView = view
+            NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil)
+            return
+        }
+        let host = NSHostingController(rootView: view)
+        let win = NSWindow(contentViewController: host)
+        win.title = "TimeTracker Review"
+        win.styleMask = [.titled, .closable, .resizable]
+        win.setContentSize(NSSize(width: 600, height: 560))
+        win.isReleasedWhenClosed = false
+        win.center()
+        reviewHost = host; reviewWindow = win
+        NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil)
+    }
+
+    private func makeReviewView(day: Date) -> ReviewView {
+        let blocks = summary.dayReports(day).map { r -> ReviewBlock in
+            let alts = (r.contextDoc.map { attribution.explain(doc: $0) } ?? [])
+                .map { ReviewAlt(key: $0.key, summary: $0.summary, score: $0.score) }
+            var why: String?
+            if let src = r.guessSource {
+                why = Attribution.isExact(src) ? "from \(src)"
+                    : "\(src)" + (r.guessConfidence.map { String(format: " · %.2f", $0) } ?? "")
+            }
+            return ReviewBlock(
+                block: r.block,
+                rangeText: r.label,
+                activeSeconds: r.activeSeconds, idleSeconds: r.idleSeconds,
+                slices: r.byTicket.map { Slice(label: $0.ticket ?? "untracked", seconds: $0.seconds) },
+                recap: r.recap ?? "",
+                guessKey: r.guessKey,
+                guessSummary: r.guessKey.flatMap { attribution.summary(for: $0) },
+                guessWhy: why,
+                alternatives: alts,
+                originalGuess: r.guessKey ?? "",
+                ticket: r.effectiveTicket ?? "",
+                note: r.assignedNote ?? "")
+        }
+        let model = ReviewModel(dayText: TimeBlocks.dayString(day), blocks: blocks,
+                                tickets: attribution.pickerTickets, noTicketLabel: config.noTicketLabel)
+        reviewModel = model
+        return ReviewView(model: model,
+                          onSave: { [weak self] in self?.saveReview() },
+                          onShift: { [weak self] d in self?.shiftReview(d) },
+                          onSubmitTempo: { [weak self] in self?.submitToTempoFromReview() })
+    }
+
+    // MARK: - Housekeeping / pruning
+
+    private func housekeeping() {
+        let now = Date()
+        if config.segmentRetentionDays > 0 {
+            store.deleteSegments(before: now.addingTimeInterval(-config.segmentRetentionDays * 86400))
+        }
+        // Boxed (submitted) days get a shorter window.
+        if config.submittedRetentionDays > 0 {
+            let cutoff = now.addingTimeInterval(-config.submittedRetentionDays * 86400)
+            let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.calendar = .current
+            let submitted = UserDefaults.standard.stringArray(forKey: "submittedDays") ?? []
+            var remaining: [String] = []
+            for d in submitted {
+                if let date = f.date(from: d), date < cutoff {
+                    let (s, e) = TimeBlocks.dayBounds(date)
+                    store.deleteSegments(from: s, to: e)
+                } else { remaining.append(d) }
+            }
+            UserDefaults.standard.set(remaining, forKey: "submittedDays")
+        }
+        store.pruneLabels(max: config.labelMaxCount)
+        tempo.pruneWorklogMap(olderThanDays: 90)   // resubmission no longer realistic past this
+    }
+
+    private func markSubmitted(day: String) {
+        var s = UserDefaults.standard.stringArray(forKey: "submittedDays") ?? []
+        if !s.contains(day) { s.append(day); UserDefaults.standard.set(s, forKey: "submittedDays") }
+    }
+
+    // MARK: - Tempo submission (manual, review-gated, with preview)
+
+    private struct PlannedWorklog { var date: String; var block: String; var ticket: String; var startTime: String; var seconds: Int; var description: String }
+
+    private func submitToTempoFromReview() {
+        guard let model = reviewModel else { return }
+        let dayStr = TimeBlocks.dayString(reviewDay)
+        let blocks = TimeBlocks.blocks(for: reviewDay, config)
+        let seconds = Int(config.blockHours * 3600)
+        let planned: [PlannedWorklog] = model.blocks.compactMap { b in
+            let raw = b.ticket.trimmingCharacters(in: .whitespaces)
+            guard !raw.isEmpty else { return nil }
+            let ticket: String
+            if raw.caseInsensitiveCompare(config.noTicketLabel) == .orderedSame {
+                // "No ticket": map to the configured fallback, or skip Tempo for this block.
+                let fb = config.noTicketTempoTicket.trimmingCharacters(in: .whitespaces).uppercased()
+                guard !fb.isEmpty else { return nil }
+                ticket = fb
+            } else {
+                ticket = raw.uppercased()
+            }
+            let startHour = blocks.first { $0.id == b.block }?.nominalStartHour ?? config.dayStartHour
+            let startTime = String(format: "%02d:%02d:00", Int(startHour) % 24, Int((startHour - startHour.rounded(.down)) * 60))
+            let desc = b.note.trimmingCharacters(in: .whitespaces).isEmpty
+                ? "\(ticket) — \(dayStr) \(b.rangeText) (TimeTracker)" : b.note
+            return PlannedWorklog(date: dayStr, block: b.block, ticket: ticket, startTime: startTime, seconds: seconds, description: desc)
+        }
+        guard !planned.isEmpty else { showInfo("Nothing to submit — assign a ticket to a block first."); return }
+
+        // Preview exactly what will be posted.
+        NSApp.activate(ignoringOtherApps: true)
+        let preview = NSAlert()
+        preview.messageText = "Submit \(planned.count) worklog(s) to Tempo?"
+        preview.informativeText = planned.map { "• \($0.date) \($0.block) · \($0.ticket) · 4h\n   “\($0.description)”" }
+            .joined(separator: "\n") + "\n\nThis posts to your official Tempo timesheet."
+        preview.addButton(withTitle: "Submit to Tempo")
+        preview.addButton(withTitle: "Cancel")
+        guard preview.runModal() == .alertFirstButtonReturn else { return }
+
+        if !tempo.configured {
+            guard let token = promptForTempoToken() else { return }
+            tempo.connect(token: token)
+        }
+
+        Task { @MainActor in
+            guard let accountId = await atlassian.accountId() else {
+                showError(AtlassianError.notConfigured); return
+            }
+            var ok = 0
+            var fails: [String] = []
+            for p in planned {
+                var idStr = attribution.issueId(forKey: p.ticket)
+                if idStr == nil { idStr = await atlassian.fetchIssueId(forKey: p.ticket) }
+                guard let idStr, let id = Int(idStr) else { fails.append("\(p.ticket): couldn't resolve issue id"); continue }
+                // Idempotent: replace any worklog we previously posted for this (day, block).
+                if let old = tempo.worklogId(day: p.date, block: p.block) { await tempo.deleteWorklog(id: old) }
+                do {
+                    let newId = try await tempo.createWorklog(issueId: id, accountId: accountId, date: p.date,
+                                                              startTime: p.startTime, seconds: p.seconds, description: p.description)
+                    tempo.setWorklogId(day: p.date, block: p.block, id: newId)
+                    ok += 1
+                } catch {
+                    fails.append("\(p.ticket): " + ((error as? LocalizedError)?.errorDescription ?? "\(error)"))
+                }
+            }
+            if ok > 0 { self.markSubmitted(day: dayStr) }
+            let a = NSAlert()
+            a.messageText = "Tempo: \(ok) submitted" + (fails.isEmpty ? "" : ", \(fails.count) failed")
+            if !fails.isEmpty { a.alertStyle = .warning; a.informativeText = fails.joined(separator: "\n") }
+            a.runModal()
+        }
+    }
+
+    private func promptForTempoToken() -> String? {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Connect Tempo"
+        alert.informativeText = "Create a Tempo API token in Tempo → Settings → API integration, then paste it here. (Separate from your Jira token.)"
+        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Open Tempo settings")
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = "Tempo API token"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        let resp = alert.runModal()
+        if resp == .alertThirdButtonReturn {
+            NSWorkspace.shared.open(URL(string: "https://coveord.atlassian.net/plugins/servlet/ac/io.tempo.jira/tempo-app#!/configuration/api-integration")!)
+            return promptForTempoToken()
+        }
+        guard resp == .alertFirstButtonReturn else { return nil }
+        let t = field.stringValue.trimmingCharacters(in: .whitespaces)
+        return t.isEmpty ? nil : t
+    }
+
+    private func saveReview() {
+        guard let model = reviewModel else { return }
+        let dayStr = TimeBlocks.dayString(reviewDay)
+        var taught = 0
+        for b in model.blocks {
+            let raw = b.ticket.trimmingCharacters(in: .whitespaces)
+            // Normalize (pasted URL → key); the review stays authoritative for free-form keys.
+            let key = raw.isEmpty ? nil : (attribution.normalizeTicketEntry(raw) ?? raw.uppercased())
+            let note = b.note.trimmingCharacters(in: .whitespaces)
+            store.setBlockAssignment(day: dayStr, block: b.block,
+                                     ticket: key, note: note.isEmpty ? nil : note)
+
+            // Teach the guesser — but only from signal, never from silence: when the user changed
+            // the system's guess, or explicitly confirmed it. This is the primary labeling pipeline.
+            if let key, !key.isEmpty {
+                let changed = key.caseInsensitiveCompare(b.originalGuess) != .orderedSame
+                if changed || b.confirmed { taught += learnBlock(blockId: b.block, ticket: key) }
+            }
+        }
+        if taught > 0 { attribution.reloadMemory() }   // new labels feed content memory (k-NN)
+
+        let rows = summary.appendTimesheet(day: reviewDay)
+        let alert = NSAlert()
+        alert.messageText = rows.isEmpty ? "Nothing to export" : "Exported \(rows.count) row(s)"
+        var info = rows.joined(separator: "\n")
+        if taught > 0 { info += "\n\nLearned from \(taught) context\(taught == 1 ? "" : "s") this session." }
+        alert.informativeText = info
+        alert.runModal()
+    }
+
+    /// Turn a confirmed/corrected block into training examples from its REAL work contexts (the
+    /// persisted `context_doc` of its segments), capped to the few longest distinct contexts.
+    /// Returns how many labels were written.
+    @discardableResult
+    private func learnBlock(blockId: String, ticket: String) -> Int {
+        guard let bounds = TimeBlocks.bounds(day: reviewDay, id: blockId, config) else { return 0 }
+        let segs = store.segments(from: bounds.start, to: bounds.end).filter { !$0.idle }
+        guard !segs.isEmpty else { return 0 }
+        // Distinct rich contexts by total duration; fall back to a reconstructed app+title doc.
+        var byDoc: [String: Double] = [:]
+        for s in segs where !(s.contextDoc?.isEmpty ?? true) { byDoc[s.contextDoc!, default: 0] += s.duration }
+        var docs = byDoc.sorted { $0.value > $1.value }.prefix(3).map { $0.key }
+        if docs.isEmpty, let s = segs.max(by: { $0.duration < $1.duration }) {
+            docs = ["App: \(s.appName)" + (s.windowTitle.isEmpty ? "" : "\nWindow: \(s.windowTitle)")]
+        }
+        guard !docs.isEmpty else { return 0 }
+        // Signature bias from the dominant segment (repo/app), attached to the top context only.
+        let dominant = segs.max { $0.duration < $1.duration }
+        var sigs: [String] = []
+        if let s = dominant {
+            if !s.bundleId.isEmpty { sigs.append("app:\(s.bundleId)") }
+            if let d = s.contextDoc, let repo = Attribution.parseRepo(d) { sigs.append("repo:\(repo)") }
+        }
+        for (i, d) in docs.enumerated() {
+            attribution.recordTraining(contextDoc: d, ticket: ticket, signatures: i == 0 ? sigs : [])
+        }
+        return docs.count
+    }
+
+    private func shiftReview(_ delta: Int) {
+        reviewDay = Calendar.current.date(byAdding: .day, value: delta, to: reviewDay) ?? reviewDay
+        reviewHost?.rootView = makeReviewView(day: reviewDay)
+    }
+
+    private func clock(_ d: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f.string(from: d)
+    }
+
+    // MARK: - Scoped ticket assignment
+
+    @objc private func openAssign() {
+        let now = Date()
+        guard let block = TimeBlocks.block(for: now, config) else { return }
+        let report = summary.report(day: now, block: block)
+        let cands = monitor.currentState?.attribution.candidates.map { $0.key } ?? []
+        let view = AssignView(
+            tickets: attribution.pickerTickets,
+            candidates: cands,
+            blockName: "block \(block.id)",
+            blockRange: block.label,
+            blockActive: Summary.hm(report.activeSeconds),
+            currentlyPinned: monitor.pinnedTicket,
+            ticket: monitor.currentState?.attribution.ticket ?? (cands.first ?? ""),
+            onApply: { [weak self] t, scope in self?.applyAssignment(t, scope) },
+            onUnpin: { [weak self] in self?.unpinTicket(); self?.assignWindow?.close() },
+            onCancel: { [weak self] in self?.assignWindow?.close() })
+
+        assignWindow?.close()
+        let host = NSHostingController(rootView: view)
+        let win = NSWindow(contentViewController: host)
+        win.title = "Assign ticket"
+        win.styleMask = [.titled, .closable]
+        win.isReleasedWhenClosed = false
+        win.center()
+        assignHost = host; assignWindow = win
+        NSApp.activate(ignoringOtherApps: true)
+        win.makeKeyAndOrderFront(nil)
+    }
+
+    private func applyAssignment(_ ticket: String, _ scope: AssignScope) {
+        guard !ticket.isEmpty else { return }
+        let now = Date()
+        switch scope {
+        case .current:
+            monitor.overrideCurrentTicket(ticket)
+        case .lastHour:
+            store.retag(from: now.addingTimeInterval(-3600), to: now, ticket: ticket)
+            monitor.overrideCurrentTicket(ticket)
+        case .thisBlock:
+            if let block = TimeBlocks.block(for: now, config) {
+                store.retag(from: block.start, to: block.end, ticket: ticket)
+                store.setBlockAssignment(day: TimeBlocks.dayString(now), block: block.id, ticket: ticket, note: nil)
+            }
+            monitor.overrideCurrentTicket(ticket)
+        case .pin:
+            monitor.setPin(ticket)
+        }
+        assignWindow?.close()
+        rebuildMenu(current: monitor.currentState)
+    }
+
+    @objc private func unpinTicket() {
+        monitor.setPin(nil)
+        rebuildMenu(current: monitor.currentState)
+    }
+
+    // MARK: - Inspector (microscope)
+
+    @objc private func openInspector() {
+        let view = makeInspectorView()
+        if let host = inspectorHost, let win = inspectorWindow {
+            host.rootView = view
+            NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil)
+            return
+        }
+        let host = NSHostingController(rootView: view)
+        let win = NSWindow(contentViewController: host)
+        win.title = "TimeTracker Inspector"
+        win.styleMask = [.titled, .closable, .resizable]
+        win.isReleasedWhenClosed = false
+        win.center()
+        inspectorHost = host; inspectorWindow = win
+        NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil)
+    }
+
+    private func makeInspectorView() -> InspectorView {
+        InspectorView(data: makeInspectorData()) { [weak self] in
+            guard let self else { return }
+            self.inspectorHost?.rootView = self.makeInspectorView()
+        }
+    }
+
+    private func makeInspectorData() -> InspectorData {
+        var d = InspectorData()
+        guard let st = monitor.currentState, !st.idle else { return d }
+        d.hasState = true
+        let ctx = st.context
+        d.contextDoc = ctx.document
+        d.signatures = ctx.signatures()
+        d.finalTicket = st.attribution.ticket
+        d.finalSource = st.attribution.source
+        d.finalConfidence = st.attribution.confidence
+        d.category = st.attribution.category
+        d.pinned = monitor.pinnedTicket
+        d.lexical = attribution.lexicalRank(ctx)
+        d.memory = attribution.memoryNearest(ctx)
+        d.embedding = embedCandidates
+
+        // Ranking-weight breakdown for the top candidates (and the final pick).
+        var rkeys: [String] = d.lexical.prefix(4).map { $0.key }
+        if let f = d.finalTicket, !rkeys.contains(f) { rkeys.insert(f, at: 0) }
+        d.ranking = rkeys.compactMap { k in
+            attribution.priorBreakdown(forKey: k).map { (key: k, factors: $0.factors, total: $0.total) }
+        }
+
+        if let llm = lastLLM {
+            d.llmKey = llm.key; d.llmReason = llm.reason; d.llmConfidence = llm.confidence
+            d.llmAge = Summary.hm(Date().timeIntervalSince(llm.at))
+        }
+
+        // Mirror exactly the inputs llmRefine builds, so the prompt shown is the real one.
+        let arcText = buildArcSummary()
+        var keys = st.attribution.candidates.map { $0.key }
+        for g in embedCandidates where !keys.contains(g.key) { keys.append(g.key) }
+        let shortlist = (keys.isEmpty ? Array(attribution.guessTickets.prefix(12))
+                                      : attribution.tickets(for: keys)).filter { !$0.done }
+        let previous = gatedPreviousGuess(arc: arcText, shortlistKeys: shortlist.map { $0.key })
+        let hints = llmHints(st)
+        let examples = attribution.fewShot(context: ctx.document, k: config.llmFewShot)
+        d.llmPrompt = ollama.previewPrompt(arc: arcText, current: ctx.document, candidates: shortlist,
+                                           previous: previous, hints: hints, examples: examples)
+        return d
+    }
+
+    // MARK: - Settings
+
+    @objc private func openSettings() {
+        let model = SettingsModel(Config.load())   // reflect what's on disk
+        settingsModel = model
+        let view = SettingsView(model: model, onSave: { [weak self] in self?.saveSettings() })
+        if let host = settingsHost, let win = settingsWindow {
+            host.rootView = view
+            NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil)
+            return
+        }
+        let host = NSHostingController(rootView: view)
+        let win = NSWindow(contentViewController: host)
+        win.title = "TimeTracker Settings"
+        win.styleMask = [.titled, .closable]
+        win.isReleasedWhenClosed = false
+        win.center()
+        settingsHost = host; settingsWindow = win
+        NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil)
+    }
+
+    private func saveSettings() {
+        guard let model = settingsModel else { return }
+        model.config.save()
+        let alert = NSAlert()
+        alert.messageText = "Settings saved"
+        alert.informativeText = "Restart TimeTracker to apply the changes."
+        alert.addButton(withTitle: "Restart now")
+        alert.addButton(withTitle: "Later")
+        if alert.runModal() == .alertFirstButtonReturn { relaunch() }
+    }
+
+    private func relaunch() {
+        monitor.flush()
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        task.arguments = ["-n", Bundle.main.bundlePath]   // -n: new instance
+        try? task.run()
+        NSApp.terminate(nil)
+    }
+
+    // MARK: - Teaching (label examples → SQLite)
+
+    @objc private func openTeach() {
+        let view = makeTeachView()
+        if let host = teachHost, let win = teachWindow {
+            host.rootView = view
+            NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil)
+            return
+        }
+        let host = NSHostingController(rootView: view)
+        let win = NSWindow(contentViewController: host)
+        win.title = "Teach the guesser"
+        win.styleMask = [.titled, .closable, .resizable]
+        win.setContentSize(NSSize(width: 680, height: 580))
+        win.isReleasedWhenClosed = false
+        win.center()
+        teachHost = host; teachWindow = win
+        NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil)
+    }
+
+    private func makeTeachView() -> TeachView {
+        let cs = monitor.currentState
+        let hasCurrent = (cs != nil) && !(cs?.idle ?? true)
+        teachCurrentDoc = cs?.context.document ?? ""
+        teachCurrentSignatures = cs?.context.signatures() ?? []
+        let curSummary = cs.map { "\($0.appName)" + ($0.title.isEmpty ? "" : " · " + String($0.title.prefix(60))) } ?? "—"
+        let curTicket = cs?.attribution.ticket ?? (cs?.attribution.candidates.first?.key ?? "")
+
+        // Recent distinct segments (last ~2 days) to label. Active-learning order: the UNTAGGED
+        // (uncertain) ones come first — that's where a label adds the most signal — and each is
+        // pre-filled with the guesser's best suggestion so confirming is one click.
+        let start = Calendar.current.date(byAdding: .day, value: -1, to: TimeBlocks.dayBounds(Date()).start)!
+        let segs = store.segments(from: start, to: Date()).filter { !$0.idle && $0.duration >= 120 }
+        var seen = Set<String>(); var untaggedRows: [TeachRow] = []; var taggedRows: [TeachRow] = []
+        for seg in segs.reversed() {
+            let key = seg.appName + "|" + seg.windowTitle
+            guard seen.insert(key).inserted else { continue }
+            let summary = seg.appName + (seg.windowTitle.isEmpty ? "" : " · " + String(seg.windowTitle.prefix(50)))
+            // Prefer the rich persisted context (repo/files/commits/AI-session) over the bare
+            // app+title — both for a sharper suggestion and so the saved label captures real work.
+            let doc = seg.contextDoc ?? ("App: \(seg.appName)" + (seg.windowTitle.isEmpty ? "" : "\nWindow: \(seg.windowTitle)"))
+            let suggestion = seg.ticket ?? attribution.topGuess(forDoc: doc)
+            let row = TeachRow(timeText: clock(seg.start), summary: summary, doc: doc,
+                               guessed: suggestion ?? "?", ticket: suggestion ?? "")
+            if seg.ticket == nil { untaggedRows.append(row) } else { taggedRows.append(row) }
+            if untaggedRows.count + taggedRows.count >= 40 { break }
+        }
+        // Untagged first (highest learning value), each group newest-first (stable partition).
+        let rows = untaggedRows + taggedRows
+
+        let model = TeachModel(count: attribution.labelCount, currentSummary: curSummary,
+                               currentTicket: curTicket, hasCurrent: hasCurrent, rows: rows,
+                               tickets: attribution.pickerTickets)
+        teachModel = model
+        return TeachView(model: model,
+                         onSaveCurrent: { [weak self] t in self?.saveCurrentLabel(t) },
+                         onSaveRow: { [weak self] idx, t in self?.saveRowLabel(idx, t) },
+                         onRefresh: { [weak self] in
+                             guard let self else { return }
+                             self.teachHost?.rootView = self.makeTeachView()
+                         })
+    }
+
+    private func saveCurrentLabel(_ ticket: String) {
+        guard let key = attribution.normalizeTicketEntry(ticket), !teachCurrentDoc.isEmpty else { return }
+        attribution.recordTraining(contextDoc: teachCurrentDoc, ticket: key, signatures: teachCurrentSignatures)
+        teachModel?.count = attribution.labelCount
+        reindexEmbeddings()
+    }
+
+    private func saveRowLabel(_ index: Int, _ ticket: String) {
+        guard let model = teachModel, index < model.rows.count,
+              let key = attribution.normalizeTicketEntry(ticket) else { return }
+        attribution.recordTraining(contextDoc: model.rows[index].doc, ticket: key)
+        teachModel?.count = attribution.labelCount
+    }
+
+    @objc private func exportToday() {
+        let rows = summary.appendTimesheet(day: Date())
+        let alert = NSAlert()
+        alert.messageText = rows.isEmpty ? "No activity to export yet" : "Appended \(rows.count) row(s) to timesheet-log.md"
+        alert.informativeText = rows.joined(separator: "\n")
+        alert.runModal()
+    }
+
+    @objc private func refreshSprint() { runRefresh(silent: false) }
+
+    /// Refresh the Jira ticket list. Silent = no popup (used by the timer + launch).
+    private func runRefresh(silent: Bool) {
+        guard atlassian.configured, !refreshingJira else { return }
+        refreshingJira = true
+        Task { @MainActor in
+            defer { refreshingJira = false }
+            do {
+                let r = try await atlassian.refreshSprint()
+                attribution.reloadSprint()
+                reindexEmbeddings()
+                rebuildMenu(current: monitor.currentState)
+                if !silent { showInfo("Refreshed: \(r.open) open / \(r.total) total ticket(s).") }
+            } catch { if !silent { showError(error) } }
+        }
+    }
+
+    @objc private func connectAtlassian() {
+        guard let creds = promptForApiToken() else { return }
+        Task { @MainActor in
+            do {
+                let who = try await atlassian.connect(site: creds.site, email: creds.email, token: creds.token)
+                let r = try await atlassian.refreshSprint()
+                attribution.reloadSprint()
+                reindexEmbeddings()
+                rebuildMenu(current: monitor.currentState)
+                showInfo("Connected as \(who). Loaded \(r.open) open / \(r.total) total ticket(s).")
+            } catch {
+                atlassian.disconnect()   // don't keep bad credentials
+                rebuildMenu(current: monitor.currentState)
+                showError(error)
+            }
+        }
+    }
+
+    @objc private func disconnectAtlassian() {
+        atlassian.disconnect()
+        rebuildMenu(current: monitor.currentState)
+    }
+
+    private func showInfo(_ s: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert(); a.messageText = "TimeTracker"; a.informativeText = s; a.runModal()
+    }
+
+    private func showError(_ error: Error) {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert(); a.alertStyle = .warning
+        a.messageText = "Atlassian error"
+        a.informativeText = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+        a.runModal()
+    }
+
+    /// Collect site / email / API token. Token field is masked.
+    private func promptForApiToken() -> (site: String, email: String, token: String)? {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Connect Atlassian (API token)"
+        alert.informativeText = """
+        Create a token at id.atlassian.com → Security → API tokens, then enter:
+          • Site: your <site> (e.g. coveo, or coveo.atlassian.net)
+          • Email: your Atlassian account email
+          • API token: the token you created
+        """
+        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Open token page")
+
+        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 340, height: 84))
+        stack.orientation = .vertical; stack.spacing = 6
+        let siteField = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        siteField.placeholderString = "Site (e.g. coveo)"
+        let emailField = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        emailField.placeholderString = "you@company.com"
+        let tokenField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        tokenField.placeholderString = "API token"
+        stack.addArrangedSubview(siteField)
+        stack.addArrangedSubview(emailField)
+        stack.addArrangedSubview(tokenField)
+        alert.accessoryView = stack
+        alert.window.initialFirstResponder = siteField
+
+        let resp = alert.runModal()
+        if resp == .alertThirdButtonReturn {
+            NSWorkspace.shared.open(URL(string: "https://id.atlassian.com/manage-profile/security/api-tokens")!)
+            return promptForApiToken()   // re-show after opening the token page
+        }
+        guard resp == .alertFirstButtonReturn else { return nil }
+        let site = siteField.stringValue.trimmingCharacters(in: .whitespaces)
+        let email = emailField.stringValue.trimmingCharacters(in: .whitespaces)
+        let token = tokenField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !site.isEmpty, !email.isEmpty, !token.isEmpty else { return nil }
+        return (site, email, token)
+    }
+    @objc private func togglePause() { monitor.setPaused(!monitor.paused); updateStatus(monitor.currentState) }
+    @objc private func openDataFolder() { NSWorkspace.shared.open(AppPaths.dataDir) }
+    @objc private func openAccessibilitySettings() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+    }
+    @objc private func quit() { monitor.flush(); NSApplication.shared.terminate(nil) }
+
+    // MARK: - Accessibility
+
+    private func requestAccessibilityIfNeeded() {
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(opts)
+    }
+
+    // MARK: - Continuous embeddings (async, off the hot path)
+
+    private func reindexEmbeddings() {
+        guard embeddings.enabled else { return }
+        let tickets = attribution.guessTickets   // embeddings only over the guessable pool
+        Task.detached { [weak self] in await self?.embeddings.index(tickets) }
+    }
+
+    /// On context change, rank by embeddings async, then re-fuse all signals. Embedding is now a
+    /// feature inside the fusion ranker (not a standalone auto-tagger): it can only push a ticket
+    /// over the line in concert with a grounded signal. Never touches an exact/explicit segment.
+    private func maybeEmbed(_ state: LiveState?) {
+        guard embeddings.enabled, let st = state, !st.idle, !embedInFlight else { return }
+        if Attribution.isExact(st.attribution.source) { return }
+        let doc = st.context.document
+        guard doc != lastEmbedDoc, !doc.isEmpty else { return }
+        embedInFlight = true
+        lastEmbedDoc = doc
+        Task { @MainActor in
+            embedCandidates = await embeddings.rank(context: doc, max: config.semanticMaxCandidates)
+            embedInFlight = false
+            embedTop = embedCandidates.first
+            refineCurrent()
+            // Still ambiguous after the deterministic + embedding fusion? Ask the local LLM to
+            // break the tie (event-driven — no blind polling).
+            if let cur = monitor.currentState, cur.attribution.ticket == nil, !cur.attribution.candidates.isEmpty {
+                llmRefine()
+            }
+        }
+    }
+
+    /// Re-run the full fusion for the open segment with whatever async evidence we now have
+    /// (embedding ranks + the latest LLM vote) and apply the result.
+    private func refineCurrent() {
+        guard let st = monitor.currentState, !st.idle, !monitor.paused, monitor.pinnedTicket == nil else { return }
+        if Attribution.isExact(st.attribution.source) { return }
+        let embedding = Dictionary(embedCandidates.map { ($0.key, $0.score) }, uniquingKeysWith: max)
+        let result = attribution.decideAttribution(context: st.context, embedding: embedding, llm: currentLLMVote())
+        monitor.applyRefinement(result)
+        rebuildMenu(current: monitor.currentState)
+    }
+
+    /// The most recent LLM pick as a fusion vote, if it's fresh and still a guessable candidate.
+    private func currentLLMVote() -> (key: String, confidence: Double)? {
+        guard let l = lastLLM, Date().timeIntervalSince(l.at) < config.llmPreviousGuessTTLMinutes * 60 else { return nil }
+        return (l.key, l.confidence)
+    }
+
+    // MARK: - LLM refinement (event-driven tie-break; folded into fusion)
+
+    /// Dynamic, structured hints for the LLM (NOT raw vectors): scored candidates, what's
+    /// already logged today, and the local time.
+    private func llmHints(_ st: LiveState) -> String {
+        var lines: [String] = []
+        let lex = st.attribution.candidates.prefix(5).map { "\($0.key)=\(String(format: "%.2f", $0.score))" }
+        if !lex.isEmpty { lines.append("Lexical candidate scores: " + lex.joined(separator: ", ")) }
+        if !embedCandidates.isEmpty {
+            lines.append("Embedding candidate scores: " + embedCandidates.prefix(5).map { "\($0.key)=\(String(format: "%.2f", $0.score))" }.joined(separator: ", "))
+        }
+        let day = TimeBlocks.dayString(Date())
+        var logged: [String] = []
+        for b in TimeBlocks.blocks(for: Date(), config) {
+            if let t = store.blockAssignment(day: day, block: b.id)?.ticket { logged.append("\(b.label)=\(t)") }
+        }
+        if !logged.isEmpty { lines.append("Already logged today: " + logged.joined(separator: ", ")) }
+        let f = DateFormatter(); f.dateFormat = "EEE HH:mm"
+        lines.append("Local time: \(f.string(from: Date()))")
+        return lines.joined(separator: "\n")
+    }
+
+    private var lastLLMContext: String?
+
+    /// Ask the local LLM to pick from the shortlist, then fold its vote into the fusion. Only
+    /// fires when the deterministic+embedding fusion is still undecided, and skips a context it
+    /// already judged (the Ollama client also memoizes identical prompts). Never auto-tags on its
+    /// own — its pick is one weighted, agreement-trusted feature in `decideAttribution`.
+    private func llmRefine() {
+        guard config.ollamaEnabled, !monitor.paused, let st = monitor.currentState, !st.idle else { return }
+        if Attribution.isExact(st.attribution.source) { return }
+        let current = st.context.document
+        guard !current.isEmpty else { return }
+        // Dedupe: don't re-ask for a context we already have a fresh verdict on.
+        if current == lastLLMContext, currentLLMVote() != nil { return }
+
+        // Shortlist = current fused candidates ∪ embedding candidates, else the recent pool.
+        var keys = st.attribution.candidates.map { $0.key }
+        for g in embedCandidates where !keys.contains(g.key) { keys.append(g.key) }
+        let shortlist = (keys.isEmpty ? Array(attribution.guessTickets.prefix(12))
+                                      : attribution.tickets(for: keys)).filter { !$0.done }
+        guard !shortlist.isEmpty else { return }
+
+        let arcText = buildArcSummary()
+        let previous = gatedPreviousGuess(arc: arcText, shortlistKeys: shortlist.map { $0.key })
+        let hints = llmHints(st)
+        let examples = attribution.fewShot(context: current, k: config.llmFewShot)
+        lastLLMContext = current
+        Task { @MainActor in
+            guard let s = await self.ollama.suggest(arc: arcText, current: current, candidates: shortlist,
+                                                    previous: previous, hints: hints, examples: examples) else { return }
+            self.lastLLM = (s.key, s.reason, s.confidence ?? 0, Date())
+            self.refineCurrent()   // fusion decides whether the LLM vote (plus the rest) auto-tags
+        }
+    }
+
+    /// Record distinct work contexts into the rolling arc buffer (skips idle).
+    private func recordArc(_ state: LiveState?) {
+        guard let st = state, !st.idle else { return }
+        guard !st.context.document.isEmpty else { return }
+        if arc.last?.ctx.document != st.context.document { arc.append((Date(), st.context)) }
+        let cutoff = Date().addingTimeInterval(-config.llmArcWindowMinutes * 60)
+        arc.removeAll { $0.at < cutoff }
+        if arc.count > 60 { arc.removeFirst(arc.count - 60) }
+    }
+
+    /// Deterministic digest of the last hour aggregated by *logical activity* (repo, else app),
+    /// summing CUMULATIVE time across interleaved visits — so alternating between windows still
+    /// adds up correctly instead of fragmenting. Time is summed in seconds so sub-minute visits
+    /// aren't lost to rounding. Keeps the tags (files, AI-session meaning, URLs, meeting). No LLM.
+    private func buildArcSummary() -> String {
+        guard !arc.isEmpty else { return "(no recorded activity yet)" }
+        let now = Date()
+
+        struct Agg { var secs: Double = 0; var label: String; var files: [String] = []
+                     var sessions: [String] = []; var urls: [String] = []; var meeting: String? }
+        var byKey: [String: Agg] = [:]; var order: [String] = []
+        for (i, e) in arc.enumerated() {
+            let end = i + 1 < arc.count ? arc[i + 1].at : now
+            let secs = max(0, end.timeIntervalSince(e.at))
+            let c = e.ctx
+            let key = c.repo.map { "repo:\($0)" } ?? "app:\(c.app)"
+            if byKey[key] == nil { byKey[key] = Agg(label: c.repo ?? c.app); order.append(key) }
+            byKey[key]!.secs += secs
+            if let f = c.openFile, !byKey[key]!.files.contains(f) { byKey[key]!.files.append(f) }
+            for f in c.changedFiles where !byKey[key]!.files.contains(f) { byKey[key]!.files.append(f) }
+            if let s = c.aiSession, !byKey[key]!.sessions.contains(s) { byKey[key]!.sessions.append(s) }
+            if let h = c.url.flatMap({ URL(string: $0)?.host }), !byKey[key]!.urls.contains(h) { byKey[key]!.urls.append(h) }
+            if let m = c.meeting { byKey[key]!.meeting = m }
+        }
+
+        var lines: [String] = []
+        for a in byKey.values.sorted(by: { $0.secs > $1.secs }) where a.secs >= 30 {
+            var parts = [a.label]
+            if !a.files.isEmpty { parts.append("files: " + a.files.prefix(6).joined(separator: ", ")) }
+            if let s = a.sessions.first { parts.append("session: " + s.prefix(90)) }
+            if !a.urls.isEmpty { parts.append("urls: " + a.urls.prefix(2).joined(separator: ", ")) }
+            if let m = a.meeting { parts.append("meeting: " + m.prefix(40)) }
+            lines.append("- \(Summary.hm(a.secs)) total · " + parts.joined(separator: " · "))
+        }
+        return lines.prefix(12).joined(separator: "\n")
+    }
+
+    /// Feed the previous guess back ONLY if recent AND still supported by current evidence,
+    /// so a guess can't pin itself once work has moved on.
+    private func gatedPreviousGuess(arc: String, shortlistKeys: [String]) -> (key: String, reason: String)? {
+        guard let l = lastLLM,
+              Date().timeIntervalSince(l.at) < config.llmPreviousGuessTTLMinutes * 60 else { return nil }
+        let supported = shortlistKeys.contains(l.key) || arc.localizedCaseInsensitiveContains(l.key)
+        return supported ? (l.key, l.reason) : nil
+    }
+
+    // MARK: - Timesheet fill reminders
+
+    private func checkReminders() {
+        guard config.remindersEnabled, !monitor.paused, !promptOpen else { return }
+        let now = Date()
+        let cal = Calendar.current
+        let hour = Double(cal.component(.hour, from: now)) + Double(cal.component(.minute, from: now)) / 60
+        let today = TimeBlocks.dayString(now)
+        let defaults = UserDefaults.standard
+
+        // Morning: nudge once if the last active prior day isn't filled.
+        if hour >= config.morningReminderHour, defaults.string(forKey: "lastMorningDay") != today {
+            defaults.set(today, forKey: "lastMorningDay")   // checked once today either way
+            if let d = priorDayNeedingFill() {
+                remind(day: d, message: "\(TimeBlocks.dayString(d)) isn't filled in your timesheet. Review it?")
+                return
+            }
+        }
+        // Evening: nudge once to fill today (only if it actually needs it).
+        if hour >= config.eveningReminderHour, defaults.string(forKey: "lastEveningDay") != today,
+           dayNeedsFilling(now) {
+            defaults.set(today, forKey: "lastEveningDay")
+            remind(day: now, message: "Fill today's timesheet (\(today))?")
+        }
+    }
+
+    /// True if the day has activity but at least one active 4h block has no assignment yet.
+    private func dayNeedsFilling(_ day: Date) -> Bool {
+        for r in summary.dayReports(day) where r.hasActivity {
+            if store.blockAssignment(day: TimeBlocks.dayString(day), block: r.block) == nil { return true }
+        }
+        return false
+    }
+
+    /// The most recent prior day that had activity; returned only if it still needs filling.
+    private func priorDayNeedingFill() -> Date? {
+        let start = TimeBlocks.dayBounds(Date()).start
+        for back in 1...4 {
+            guard let day = Calendar.current.date(byAdding: .day, value: -back, to: start) else { continue }
+            if summary.dayReports(day).contains(where: { $0.hasActivity }) {
+                return dayNeedsFilling(day) ? day : nil   // first active day decides
+            }
+        }
+        return nil
+    }
+
+    private func remind(day: Date, message: String) {
+        promptOpen = true
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "TimeTracker"
+        a.informativeText = message
+        a.addButton(withTitle: "Review now")
+        a.addButton(withTitle: "Later")
+        let review = a.runModal() == .alertFirstButtonReturn
+        promptOpen = false
+        if review { presentReview(day: day) }
+    }
+
+    // MARK: - Real-time unknown prompt
+
+    /// Gentle nudge after sustained un-guessable work (fusion abstained — no candidate at all), so
+    /// a block doesn't silently go un-attributed. Shares the prompt cooldown; offers assign / no-ticket.
+    private func checkAbstainNudge() {
+        guard config.abstainNudgeMinutes > 0, !monitor.paused, !promptOpen,
+              let since = abstainSince, Date().timeIntervalSince(since) >= config.abstainNudgeMinutes * 60,
+              let st = monitor.currentState, !st.idle, st.attribution.ticket == nil else { return }
+        if let last = lastPromptDismissal, Date().timeIntervalSince(last) < config.promptCooldownMinutes * 60 { return }
+        promptOpen = true
+        abstainSince = nil   // reset so it won't immediately refire
+        let a = NSAlert()
+        a.messageText = "What are you working on?"
+        a.informativeText = "\(Summary.hm(Date().timeIntervalSince(since))) of un-attributed work in \(st.appName)"
+            + (st.title.isEmpty ? "" : " · \(st.title.prefix(50))") + ".\nAssign a ticket, or mark it no-ticket."
+        a.addButton(withTitle: "Assign…"); a.addButton(withTitle: "No ticket"); a.addButton(withTitle: "Snooze")
+        NSApp.activate(ignoringOtherApps: true)
+        let resp = a.runModal()
+        promptOpen = false
+        lastPromptDismissal = Date()
+        switch resp {
+        case .alertFirstButtonReturn:
+            if let key = promptForTicket(message: "Assign a ticket to the current activity") { monitor.overrideCurrentTicket(key) }
+        case .alertSecondButtonReturn:
+            markCurrentNoTicket()
+        default: break   // snooze
+        }
+        rebuildMenu(current: monitor.currentState)
+    }
+
+    private func checkUnknownBacklog() {
+        guard !monitor.paused, !promptOpen else { return }
+        if let last = lastPromptDismissal, Date().timeIntervalSince(last) < config.promptCooldownMinutes * 60 { return }
+        // Every block that has activity is already attributed → nothing to nag about.
+        let reports = summary.dayReports(Date())
+        if reports.allSatisfy({ !$0.hasActivity || $0.effectiveTicket != nil }) { return }
+        // The current block was already answered (assigned) → don't keep asking for it.
+        if let cur = TimeBlocks.block(for: Date(), config),
+           store.blockAssignment(day: TimeBlocks.dayString(Date()), block: cur.id)?.ticket?.isEmpty == false { return }
+        let unknown = summary.unknownActiveSeconds(inBlockContaining: Date())
+        guard unknown >= config.promptAfterUnknownMinutes * 60 else { return }
+        promptOpen = true
+
+        Task { @MainActor in
+            // Shortlist from the current lexical candidates (or recent tickets); LLM picks.
+            let candidates = monitor.currentState?.attribution.candidates ?? []
+            let shortlist = (candidates.isEmpty
+                ? Array(attribution.guessTickets.prefix(12))
+                : attribution.tickets(for: candidates.map { $0.key })).filter { !$0.done }
+            let current = monitor.currentState?.context.document ?? ""
+            let arcText = buildArcSummary()
+
+            var prefill = candidates.first?.key
+            var reason = ""
+            let hints = monitor.currentState.map { llmHints($0) } ?? ""
+            let examples = attribution.fewShot(context: current, k: config.llmFewShot)
+            if ollama.enabled, !shortlist.isEmpty,
+               let s = await ollama.suggest(arc: arcText, current: current, candidates: shortlist,
+                                            previous: gatedPreviousGuess(arc: arcText, shortlistKeys: shortlist.map { $0.key }),
+                                            hints: hints, examples: examples) {
+                prefill = s.key; reason = s.reason
+            }
+
+            var msg = "\(Summary.hm(unknown)) of this block has no ticket. What were you working on?"
+            if let p = prefill { msg += "\n\nSuggested: \(p)" + (reason.isEmpty ? "" : " — \(reason)") }
+
+            if let key = self.promptForTicket(message: msg, prefill: prefill),
+               let block = TimeBlocks.block(for: Date(), config) {
+                self.store.setBlockAssignment(day: TimeBlocks.dayString(Date()), block: block.id, ticket: key, note: nil)
+                // Re-tag the block's untracked segments so the unknown time actually clears
+                // (otherwise the prompt keeps firing on the same backlog).
+                self.store.retagUntracked(from: block.start, to: block.end, ticket: key)
+            }
+            self.lastPromptDismissal = Date()
+            self.promptOpen = false
+        }
+    }
+
+    /// Shared modal: a text field (optionally prefilled with a guess) plus a sprint picker.
+    private func promptForTicket(message: String, prefill: String? = nil) -> String? {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "TimeTracker"
+        alert.informativeText = message
+        alert.addButton(withTitle: "Assign")
+        alert.addButton(withTitle: "Skip")
+
+        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 300, height: 52))
+        stack.orientation = .vertical
+        stack.spacing = 6
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        field.placeholderString = "e.g. CLOUDINFRA-1234"
+        if let prefill { field.stringValue = prefill }
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        popup.addItem(withTitle: "— pick from sprint —")
+        for t in attribution.pickerTickets.prefix(60) { popup.addItem(withTitle: "\(t.key) — \(t.summary.prefix(40))") }
+        popup.target = self
+        // When a sprint item is chosen, copy its key into the field.
+        popup.action = #selector(popupChose(_:))
+        objc_setAssociatedObject(popup, &Self.fieldKey, field, .OBJC_ASSOCIATION_RETAIN)
+        stack.addArrangedSubview(field)
+        if !attribution.sprint.isEmpty { stack.addArrangedSubview(popup) }
+        alert.accessoryView = stack
+        alert.window.initialFirstResponder = field
+
+        let resp = alert.runModal()
+        guard resp == .alertFirstButtonReturn else { return nil }
+        let raw = field.stringValue.trimmingCharacters(in: .whitespaces)
+        if raw.isEmpty { return nil }
+        // Normalize (pasted URL → key, validate). Warn instead of silently storing garbage.
+        guard let key = attribution.normalizeTicketEntry(raw) else {
+            let warn = NSAlert()
+            warn.messageText = "Not a valid ticket"
+            warn.informativeText = "“\(raw)” isn’t a recognized ticket key (expected e.g. CLOUDINFRA-1234). Nothing was assigned."
+            warn.runModal()
+            return nil
+        }
+        return key
+    }
+
+    private static var fieldKey: UInt8 = 0
+    @objc private func popupChose(_ sender: NSPopUpButton) {
+        guard sender.indexOfSelectedItem > 0,
+              let field = objc_getAssociatedObject(sender, &Self.fieldKey) as? NSTextField,
+              let title = sender.titleOfSelectedItem else { return }
+        field.stringValue = String(title.split(separator: " ").first ?? "")
+    }
+}
+
+// Headless evaluation mode: measure the guesser without launching the menu-bar UI.
+if CommandLine.arguments.contains("--eval") {
+    EvalHarness.run()
+    exit(0)
+}
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.setActivationPolicy(.accessory)   // menu-bar only, no Dock icon
+app.run()

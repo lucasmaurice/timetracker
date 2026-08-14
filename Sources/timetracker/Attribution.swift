@@ -1,0 +1,545 @@
+import Foundation
+
+struct Ticket: Codable, Equatable {
+    var key: String
+    var summary: String
+    /// Rich text for matching: summary + epic + components + labels + description.
+    /// Optional for backward-compat with older sprint.json files.
+    var text: String?
+    var status: String?       // e.g. "In Progress", "In Review", "New"
+    var updated: String?      // ISO8601 timestamp of last update (changes on comments/edits)
+    var done: Bool = false    // statusCategory == done
+    var inSprint: Bool = false // member of the board's active sprint
+    var inQueue: Bool = false  // member of a watched service-desk queue
+    var common: Bool = false   // a configured catch-all ticket (always shown in pickers)
+    var issueId: String?      // numeric Jira id (Tempo worklogs key by this, not the key)
+
+    /// What the lexical/embedding matcher sees (rich, includes the description).
+    var matchText: String { (text?.isEmpty == false ? text! : summary) }
+
+    /// Leaner text for the LLM candidate list: type + summary + epic + components + labels, but
+    /// WITHOUT the description — which is mostly GitHub blob URLs with commit SHAs (pure token
+    /// noise for ticket selection). The discriminator between near-identical tickets is the
+    /// service name in the summary, not the URLs.
+    var llmText: String {
+        let t = matchText
+        if let r = t.range(of: " · desc:") { return String(t[..<r.lowerBound]) }
+        return t
+    }
+
+    /// Ranking prior: not-done + active-sprint + recently-touched + In-Progress rank higher,
+    /// so a large assigned backlog (incl. completed tickets kept for the data lake) doesn't
+    /// dilute current work. Weights are configurable (Settings → Ranking weights).
+    func priorWeight(now: Date, w: RankWeights) -> Double {
+        priorBreakdown(now: now, w: w).reduce(1.0) { $0 * $1.factor }
+    }
+
+    /// Labeled multiplicative factors (for the Inspector). Only non-neutral factors are listed.
+    func priorBreakdown(now: Date, w: RankWeights) -> [(label: String, factor: Double)] {
+        var out: [(String, Double)] = []
+        if done {
+            out.append(("done", w.donePenalty))
+        } else {
+            let s = (status ?? "").lowercased()
+            if s.contains("progress") { out.append(("In Progress", w.inProgressBoost)) }
+            else if s.contains("review") { out.append(("In Review", w.inReviewBoost)) }
+        }
+        if inSprint { out.append(("active sprint", w.sprintBoost)) }
+        if inQueue { out.append(("queue", w.queueBoost)) }
+        if let u = updated, let d = ISO8601DateFormatter().date(from: u) {
+            let days = now.timeIntervalSince(d) / 86400
+            if days < 3 { out.append(("updated <3d", w.recent3dBoost)) }
+            else if days < 14 { out.append(("updated <14d", w.recent14dBoost)) }
+            else if days > 60 { out.append(("stale >60d", w.stale60dPenalty)) }
+        }
+        return out
+    }
+}
+
+struct SprintFile: Codable {
+    var updated: String?
+    var tickets: [Ticket]
+}
+
+struct AttributionResult {
+    var ticket: String?
+    var source: String?   // "branch" | "title" | "semantic" | "manual" | nil
+    var category: String?
+    var confidence: Double?           // similarity of the top guess (semantic only)
+    var candidates: [TicketGuess] = []  // ranked guesses for the menu / prompt
+}
+
+/// Infers a JIRA ticket and coarse category from the foreground app + window title.
+/// Pure local logic: regex on titles, `git branch` on the active workspace repo,
+/// and a locally-synced sprint picklist. No network.
+final class Attribution {
+    private var config: Config
+    private let ticketRegex: NSRegularExpression
+    private(set) var sprint: [Ticket] = []
+    private var repoBranchCache: [String: (branch: String, at: Date)] = [:]
+    private let branchTTL: TimeInterval = 30
+    private let store: Store
+    private let matcher = TicketMatcher()
+    private let corrections = CorrectionStore()
+    private let labelMemory: LabelMemory
+    private let repoBridge = RepoTicketBridge()
+
+    private let excludeRegexes: [NSRegularExpression]
+
+    init(config: Config, store: Store) {
+        self.config = config
+        self.labelMemory = LabelMemory(store: store)
+        self.store = store
+        let prefixes = config.ticketPrefixes.map { NSRegularExpression.escapedPattern(for: $0) }.joined(separator: "|")
+        // Word-bounded <PREFIX>-<digits>, prefixes are case-insensitive.
+        self.ticketRegex = try! NSRegularExpression(pattern: "\\b(?:\(prefixes))-\\d+\\b", options: [.caseInsensitive])
+        // Exclusion patterns: glob `*` → `.*`, anchored, case-insensitive (e.g. "EXCL-*").
+        self.excludeRegexes = config.excludedTickets.compactMap { pat in
+            let escaped = pat.split(separator: "*", omittingEmptySubsequences: false)
+                .map { NSRegularExpression.escapedPattern(for: String($0)) }.joined(separator: ".*")
+            return try? NSRegularExpression(pattern: "^\(escaped)$", options: [.caseInsensitive])
+        }
+        reloadSprint()
+    }
+
+    /// Attribution sources that must never be overridden by an async refinement (embedding/LLM):
+    /// the exact-key matches plus explicit human/learned signals. Fused sources
+    /// (semantic/memory/repo/embed/llm/guess) are refinable as more evidence arrives.
+    static let exactSources: Set<String> = ["url", "branch", "title", "commit", "session", "learned", "manual", "pinned"]
+    static func isExact(_ source: String?) -> Bool { source.map { exactSources.contains($0) } ?? false }
+
+    /// True if a ticket key is on the exclusion list (exact or glob match).
+    func isExcluded(_ key: String) -> Bool {
+        let r = NSRange(key.startIndex..., in: key)
+        return excludeRegexes.contains { $0.firstMatch(in: key, range: r) != nil }
+    }
+
+    /// The pool the guesser may choose from (lexical/embedding/memory/LLM). Exact signals and
+    /// the manual picker are NOT limited to this.
+    private(set) var guessTickets: [Ticket] = []
+    private var guessKeys: Set<String> = []
+
+    func reloadSprint() {
+        guard let data = try? Data(contentsOf: AppPaths.sprintFile),
+              let f = try? JSONDecoder().decode(SprintFile.self, from: data) else { return }
+        sprint = f.tickets.filter { !isExcluded($0.key) }   // drop excluded from the whole corpus
+
+        // The guesser may only choose tickets whose project prefix is configured. `assignee =
+        // currentUser()` pulls EVERY assigned project (e.g. 41 auto-generated "TEMPA" temporary-
+        // access incident tickets) into the corpus; those are noise that the lexical matcher was
+        // spuriously auto-tagging. They stay in `sprint` (data lake / memory) but are barred from
+        // guessing. Common tickets are always allowed regardless of prefix.
+        let guessable = sprint.filter { hasGuessablePrefix($0.key) || $0.common }
+
+        // Guess pool: assigned + current board sprint when enabled; otherwise all not-done.
+        var pool = config.guessFromSprintOnly ? guessable.filter { $0.inSprint && !$0.done }
+                                              : guessable.filter { !$0.done }
+        if pool.isEmpty { pool = guessable.filter { !$0.done } }   // fallback if no sprint detected
+
+        // Widen with tickets you've actually worked on locally (mined from git history) that are in
+        // the corpus and still open — so a ticket you're clearly working in a repo is eligible even
+        // if it never landed in your assigned-open set.
+        let mined = repoBridge.allMinedKeys()
+        if !mined.isEmpty {
+            let have = Set(pool.map { $0.key })
+            pool += guessable.filter { !$0.done && !have.contains($0.key) && mined.contains($0.key) }
+        }
+
+        guessTickets = pool
+        guessKeys = Set(pool.map { $0.key })
+
+        if config.semanticEnabled { matcher.index(guessTickets, weights: config.rankWeights) }
+    }
+
+    /// True if a key's project prefix is one the guesser is configured to choose from.
+    private func hasGuessablePrefix(_ key: String) -> Bool {
+        let upper = key.uppercased()
+        return config.ticketPrefixes.contains { upper.hasPrefix($0.uppercased() + "-") }
+    }
+
+    // MARK: - Repo → ticket bridge (git history)
+
+    /// Extract a guessable, non-excluded ticket key from arbitrary text (branch / commit).
+    private func guessableExtract(_ text: String) -> String? {
+        guard let key = extractTicket(from: text), !isExcluded(key) else { return nil }
+        return key
+    }
+
+    /// Re-mine workspace git history into the repo→ticket bridge. Heavy (spawns git per repo);
+    /// call off the main thread. Thread-safe: the bridge guards its own state.
+    func rebuildRepoBridge(now: Date = Date()) {
+        repoBridge.rebuild(workspaceDirs: config.expandedWorkspaceDirs, now: now) { self.guessableExtract($0) }
+    }
+
+    /// Recency-decayed repo→ticket candidates for the current context, restricted to the
+    /// guessable pool. The single strongest grounded signal when the branch names no key.
+    func repoRank(_ ctx: WorkContext) -> [TicketGuess] { repoScore(repoName: ctx.repo) }
+
+    /// Repo→ticket candidates by repo name (used by `repoRank` and the offline evaluator).
+    func repoScore(repoName: String?) -> [TicketGuess] {
+        repoBridge.score(repo: repoName) { self.guessKeys.contains($0) }
+    }
+
+    /// Top mined repo→ticket mappings, for the eval harness / diagnostics.
+    func repoBridgeSummary(topPerRepo: Int = 3) -> [(repo: String, tickets: [(String, Double)])] {
+        repoBridge.summary(topPerRepo: topPerRepo)
+    }
+
+    /// Leakage-free temporal backtest of the repo signal (for the eval harness).
+    func repoBacktest(cutoffDays: Double, now: Date = Date())
+        -> (n: Int, top1: Int, top3: Int, recurring: Int, recurringTop1: Int) {
+        repoBridge.backtest(workspaceDirs: config.expandedWorkspaceDirs, cutoffDays: cutoffDays,
+                            now: now) { self.guessableExtract($0) }
+    }
+
+    /// Build the per-candidate fusion feature vectors from a context document. Shared by live
+    /// attribution and the offline evaluator. `excludingMemoryDoc` drops an exact label doc from
+    /// the memory lookup (leave-one-out evaluation).
+    private func buildFeatures(doc: String, repoName: String?, embedding: [String: Double],
+                               llm: (key: String, confidence: Double)?,
+                               learned: (ticket: String, count: Int)?,
+                               excludingMemoryDoc: String? = nil) -> [String: FusionRanker.Features] {
+        var feats: [String: FusionRanker.Features] = [:]
+        func upd(_ key: String, _ f: (inout FusionRanker.Features) -> Void) {
+            var x = feats[key] ?? FusionRanker.Features(); f(&x); feats[key] = x
+        }
+        let allow: (String) -> Bool = { !self.isExcluded($0) && (self.guessKeys.contains($0) || $0 == self.config.noTicketLabel) }
+
+        if config.semanticEnabled {
+            for g in matcher.rank(context: doc, max: 12) where allow(g.key) { upd(g.key) { $0.lexical = g.score } }
+        }
+        for m in labelMemory.nearest(context: doc, k: 8, excludingDoc: excludingMemoryDoc) where allow(m.ticket) {
+            upd(m.ticket) { $0.memory = Swift.max($0.memory, m.score) }
+        }
+        for g in repoScore(repoName: repoName) where allow(g.key) { upd(g.key) { $0.repo = g.score } }
+        for (k, s) in embedding where allow(k) { upd(k) { $0.embedding = s } }
+        if let llm, allow(llm.key) { upd(llm.key) { $0.llmAgrees = true; $0.llmConfidence = llm.confidence } }
+        if let l = learned, allow(l.ticket) { upd(l.ticket) { $0.correctionCount = Double(l.count) } }
+        for key in feats.keys { upd(key) { $0.statusRecency = self.normalizedPrior(forKey: key) } }
+        return feats
+    }
+
+    /// Offline evaluation of the text guesser on a labeled doc: lexical + leave-one-out memory +
+    /// repo (parsed from the doc). Returns whether the true ticket is the top pick / within top 3,
+    /// the fused probability, and whether the policy would auto-tag it. No embedding/LLM (those
+    /// aren't reproducible offline). Used by `EvalHarness`.
+    func evaluateDoc(_ doc: String, trueTicket: String) -> (top1: Bool, top3: Bool, p: Double, autoTagged: Bool) {
+        let feats = buildFeatures(doc: doc, repoName: Self.parseRepo(doc), embedding: [:],
+                                  llm: nil, learned: nil, excludingMemoryDoc: doc)
+        let ranked = feats.map { (key: $0.key, p: FusionRanker.fuse($0.value, config.fusionWeights)) }
+            .filter { $0.p > 0 }.sorted { $0.p > $1.p }
+        guard let top = ranked.first else { return (false, false, 0, false) }
+        let runner = ranked.dropFirst().first?.p ?? 0
+        let names = ranked.map { $0.key }
+        let decision = FusionRanker.decide(top: top.p, runnerUp: runner, tierFactor: 1.0, config.fusionWeights)
+        return (names.first == trueTicket, names.prefix(3).contains(trueTicket), top.p, decision == .autoTag)
+    }
+
+    /// Best fused guess for a raw context document — used to pre-fill the guided Teach UI so the
+    /// user can confirm with one click. Returns the top key when it clears the suggest threshold.
+    func topGuess(forDoc doc: String) -> String? {
+        let feats = buildFeatures(doc: doc, repoName: Self.parseRepo(doc), embedding: [:], llm: nil, learned: nil)
+        let ranked = feats.map { (key: $0.key, p: FusionRanker.fuse($0.value, config.fusionWeights)) }
+            .filter { $0.p > 0 }.sorted { $0.p > $1.p }
+        guard let top = ranked.first, top.p >= config.fusionWeights.suggestThreshold else { return nil }
+        return top.key
+    }
+
+    /// Pull the repo name out of a context document line "Repo: NAME (branch …)".
+    static func parseRepo(_ doc: String) -> String? {
+        for line in doc.split(separator: "\n") where line.hasPrefix("Repo: ") {
+            let rest = line.dropFirst("Repo: ".count)
+            return rest.split(separator: "(").first?.trimmingCharacters(in: .whitespaces)
+        }
+        return nil
+    }
+
+    /// Seed `labels` from git history: each (repo, ticket) mined from branches/commits becomes a
+    /// weak `backfill` example mapping a repo+commit-subject context to the ticket. Off-main
+    /// (git + store writes). Returns rows inserted. Caller reloads memory on the main thread.
+    @discardableResult
+    func backfillFromHistory() -> Int {
+        let examples = repoBridge.backfillExamples(workspaceDirs: config.expandedWorkspaceDirs) { self.guessableExtract($0) }
+        var inserted = 0
+        for e in examples where !isExcluded(e.ticket) {
+            var lines = ["Repo: \(e.repo)" + (e.branch.map { " (branch \($0))" } ?? "")]
+            if !e.subjects.isEmpty { lines.append("Recent commits: " + e.subjects.prefix(4).joined(separator: " | ")) }
+            store.insertLabel(contextDoc: lines.joined(separator: "\n"), ticket: e.ticket, kind: "backfill")
+            inserted += 1
+        }
+        return inserted
+    }
+
+    /// Rebuild the in-memory label index (call on the main thread after backfill/import).
+    func reloadMemory() { labelMemory.reload() }
+
+    /// Prior-weight breakdown for a ticket key (for the Inspector). Returns labeled factors + total.
+    func priorBreakdown(forKey key: String) -> (factors: [(label: String, factor: Double)], total: Double)? {
+        guard let t = sprint.first(where: { $0.key.caseInsensitiveCompare(key) == .orderedSame }) else { return nil }
+        let factors = t.priorBreakdown(now: Date(), w: config.rankWeights)
+        return (factors, factors.reduce(1.0) { $0 * $1.factor })
+    }
+
+    /// All assigned tickets (data lake / matcher corpus).
+    /// Not-completed tickets (plus configured common tickets even if done) — for UI/LLM.
+    var openTickets: [Ticket] { sprint.filter { !$0.done || $0.common } }
+
+    /// Configured catch-all tickets present in the corpus.
+    var commonTickets: [Ticket] { sprint.filter { $0.common } }
+
+    /// Ordered list for the manual pickers: "(no ticket)" first, then common, then assigned.
+    var pickerTickets: [Ticket] {
+        var out = [Ticket(key: config.noTicketLabel, summary: "this work has no JIRA")]
+        out += sprint.filter { $0.common }
+        out += sprint.filter { !$0.done && !$0.common }
+        return out
+    }
+
+    /// Numeric Jira issue id for a key, from the corpus (nil if not fetched).
+    func issueId(forKey key: String) -> String? {
+        sprint.first { $0.key.caseInsensitiveCompare(key) == .orderedSame }?.issueId
+    }
+
+    /// Ticket objects for a list of keys (preserving order), for the LLM/UI layers.
+    func tickets(for keys: [String]) -> [Ticket] {
+        keys.compactMap { key in sprint.first { $0.key.caseInsensitiveCompare(key) == .orderedSame } }
+    }
+
+    func extractTicket(from text: String) -> String? {
+        let range = NSRange(text.startIndex..., in: text)
+        guard let m = ticketRegex.firstMatch(in: text, range: range),
+              let r = Range(m.range, in: text) else { return nil }
+        return String(text[r]).uppercased()
+    }
+
+    /// Canonicalize a user/machine-supplied ticket string to a real key (or the no-ticket
+    /// sentinel), returning nil for anything that isn't a valid ticket. This is the single
+    /// chokepoint that keeps poison out of the store: a pasted Jira URL becomes "CLOUDINFRA-5119"
+    /// (not the whole URL), an empty/garbage entry is rejected so callers can ignore it.
+    /// Order: no-ticket sentinel → known corpus key (case-fixed) → key extracted from anywhere
+    /// in the string → reject.
+    func normalizeTicketEntry(_ raw: String) -> String? {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.isEmpty { return nil }
+        if t.caseInsensitiveCompare(config.noTicketLabel) == .orderedSame { return config.noTicketLabel }
+        if let known = sprint.first(where: { $0.key.caseInsensitiveCompare(t) == .orderedSame }) { return known.key }
+        if let key = extractTicket(from: t), !isExcluded(key) { return key }
+        return nil
+    }
+
+    /// Like extractTicket, but returns nil for excluded keys (never tracked).
+    private func exactTicket(from text: String) -> String? {
+        guard let t = extractTicket(from: text), !isExcluded(t) else { return nil }
+        return t
+    }
+
+    private func category(text: String) -> String? {
+        let hay = text.lowercased()
+        for rule in config.categoryRules {
+            if rule.anyOf.contains(where: { hay.contains($0.lowercased()) }) { return rule.category }
+        }
+        return nil
+    }
+
+    /// Attribute a moment of work from its enriched context, using only the synchronous
+    /// (deterministic) signals. The async layers (embedding, LLM) re-run `decideAttribution`
+    /// with their extra evidence once available.
+    /// Exact ticket keys (URL → branch → title → commit → session) always beat the fused guess.
+    func attribute(context ctx: WorkContext) -> AttributionResult {
+        decideAttribution(context: ctx, embedding: [:], llm: nil)
+    }
+
+    /// The full attribution decision: exact-key short-circuits, then a calibrated late-fusion
+    /// over every available signal. `embedding`/`llm` are the async corroborators, empty/nil on
+    /// the synchronous path and supplied when those layers complete.
+    func decideAttribution(context ctx: WorkContext,
+                           embedding: [String: Double],
+                           llm: (key: String, confidence: Double)?) -> AttributionResult {
+        let cat = category(text: "\(ctx.app) \(ctx.title) \(ctx.url ?? "") \(ctx.meeting ?? "")")
+
+        // 1) Exact keys — highest precision, always win.
+        if let t = ctx.url.flatMap(exactTicket(from:)) { return .init(ticket: t, source: "url", category: cat) }
+        if let t = ctx.branch.flatMap(exactTicket(from:)) { return .init(ticket: t, source: "branch", category: cat) }
+        if let t = exactTicket(from: ctx.title) { return .init(ticket: t, source: "title", category: cat) }
+        for c in ctx.commits where exactTicket(from: c) != nil {
+            return .init(ticket: exactTicket(from: c), source: "commit", category: cat)
+        }
+        // The commit message you're typing right now often names the ticket — strong + current.
+        if let t = ctx.scmMessage.flatMap(exactTicket(from:)) { return .init(ticket: t, source: "commit", category: cat) }
+        if let t = ctx.aiSession.flatMap(exactTicket(from:)) { return .init(ticket: t, source: "session", category: cat) }
+
+        // 1b) A standing "this context is non-billable" rule resolves to no-ticket (still logged).
+        // After exact keys, so an explicit key on a no-ticket app still wins.
+        if !config.noTicketRules.isEmpty {
+            let sigs = ctx.signatures()
+            if config.noTicketRules.contains(where: { sigs.contains($0) }) {
+                return .init(ticket: config.noTicketLabel, source: "rule", category: cat)
+            }
+        }
+
+        // 2) A repeatedly-confirmed correction for this context short-circuits fusion.
+        let learned = corrections.best(forSignatures: ctx.signatures())
+        if let l = learned, l.count >= 2, !isExcluded(l.ticket) {
+            return .init(ticket: l.ticket, source: "learned", category: cat,
+                         confidence: 1.0, candidates: [TicketGuess(key: l.ticket, score: 1.0)])
+        }
+
+        // 3) Gather every signal as per-candidate features.
+        let feats = buildFeatures(doc: ctx.document, repoName: ctx.repo, embedding: embedding,
+                                  llm: llm, learned: learned)
+        guard !feats.isEmpty else { return .init(ticket: nil, source: nil, category: cat) }
+
+        // 4) Fuse → rank. If we're in a repo that's entirely outside the ticket universe (no mined
+        // ticket history AND no ticket names it — e.g. a local no-Jira tool project), damp every
+        // candidate so ambient session text can't drive a confident wrong guess.
+        let damp = repoOutsideTicketUniverse(ctx.repo) ? config.fusionWeights.ungroundedRepoDamp : 1.0
+        let ranked = feats.map { (key: $0.key, p: FusionRanker.fuse($0.value, config.fusionWeights) * damp, f: $0.value) }
+            .filter { $0.p > 0 }
+            .sorted { $0.p > $1.p }
+        guard let top = ranked.first else { return .init(ticket: nil, source: nil, category: cat) }
+        let runner = ranked.dropFirst().first?.p ?? 0
+        let candidates = ranked.prefix(config.semanticMaxCandidates).map { TicketGuess(key: $0.key, score: $0.p) }
+
+        // 5) Precision-first decision, stricter in noisy contexts.
+        switch FusionRanker.decide(top: top.p, runnerUp: runner, tierFactor: tierFactor(ctx, cat), config.fusionWeights) {
+        case .autoTag:
+            return .init(ticket: top.key, source: dominantSource(top.f), category: cat,
+                         confidence: top.p, candidates: candidates)
+        case .suggest:
+            return .init(ticket: nil, source: nil, category: cat, confidence: top.p, candidates: candidates)
+        case .abstain:
+            return .init(ticket: nil, source: nil, category: cat)
+        }
+    }
+
+    /// Ticket prior (status/sprint/recency) mapped to a mild [0,1] fusion feature: 0 for a
+    /// neutral/penalized ticket, rising as boosts (In Progress, active sprint, recently updated)
+    /// stack. Kept small via its low reliability so it only breaks near-ties.
+    private func normalizedPrior(forKey key: String) -> Double {
+        guard let t = sprint.first(where: { $0.key.caseInsensitiveCompare(key) == .orderedSame }) else { return 0 }
+        return Swift.max(0, Swift.min(1, t.priorWeight(now: Date(), w: config.rankWeights) - 1.0))
+    }
+
+    /// Stiffen the auto-tag bar in noisy contexts: a workspace repo is trustworthy (1.0), web
+    /// pages a bit less, and browser/Slack/email with no repo should effectively only suggest.
+    private func tierFactor(_ ctx: WorkContext, _ cat: String?) -> Double {
+        if ctx.repo != nil { return 1.0 }
+        switch cat {
+        case "browsing", "messaging", "email", "meeting": return config.fusionWeights.tierBrowserMessaging
+        case "jira", "docs": return config.fusionWeights.tierWebDocs
+        default: return ctx.url != nil ? config.fusionWeights.tierWebDocs : 1.0
+        }
+    }
+
+    /// Name the signal that contributed most to a fused pick, for the segment's `ticket_source`
+    /// and the Inspector. Mirrors FusionRanker's reliabilities.
+    private func dominantSource(_ f: FusionRanker.Features) -> String {
+        let w = config.fusionWeights
+        var best = ("guess", 0.0)
+        func consider(_ name: String, _ v: Double) { if v > best.1 { best = (name, v) } }
+        consider("semantic", w.lexical * f.lexical)
+        consider("memory", w.memory * f.memory)
+        consider("repo", w.repo * f.repo)
+        consider("embed", w.embedding * f.embedding)
+        consider("llm", w.llm * (f.llmAgrees ? Swift.max(0.5, f.llmConfidence) : 0))
+        consider("learned", w.correction * (f.correctionCount > 0 ? 1 : 0))
+        return best.0
+    }
+
+    /// One-time data hygiene across labels, segments, and the correction store: repairs pasted
+    /// URLs to their key and drops un-parseable entries (the source of the poisoned
+    /// "HTTPS://…/BROWSE/CLOUDINFRA-5119" rows). Idempotent — safe to re-run.
+    @discardableResult
+    func runDataMigration() -> String {
+        let l = store.sanitizeLabels { self.normalizeTicketEntry($0) }
+        let s = store.sanitizeSegmentTickets { self.normalizeTicketEntry($0) }
+        let c = corrections.sanitize { self.normalizeTicketEntry($0) }
+        labelMemory.reload()
+        return "labels(deleted \(l.deleted), repaired \(l.repaired)) · segments(nulled \(s.nulled), repaired \(s.repaired)) · corrections(changed \(c))"
+    }
+
+    /// Mark a context as non-billable no-ticket and learn it (negative content example + signature
+    /// bias), so similar future work resolves to no-ticket instead of nagging.
+    func recordNoTicket(context: WorkContext) {
+        recordCorrection(context: context, ticket: config.noTicketLabel)
+    }
+
+    /// Add a persistent "always no-ticket" rule. Takes effect immediately (in-memory) and persists
+    /// to disk without clobbering unrelated settings edits made since launch.
+    func addNoTicketRule(_ signature: String) {
+        if !config.noTicketRules.contains(signature) { config.noTicketRules.append(signature) }
+        var disk = Config.load()
+        if !disk.noTicketRules.contains(signature) { disk.noTicketRules.append(signature); disk.save() }
+    }
+
+    /// The best signature to offer as a persistent "always no-ticket" rule. A repo with no ticket
+    /// history anywhere is the canonical no-Jira project, so offer it first; otherwise a URL host
+    /// or app. Nil if already covered / nothing fitting.
+    func noTicketRuleCandidate(for ctx: WorkContext) -> String? {
+        if let repo = ctx.repo, !repoBridge.has(repo: repo) {
+            let sig = "repo:\(repo)"
+            if !config.noTicketRules.contains(sig) { return sig }
+        }
+        let sigs = ctx.signatures()
+        let pick = sigs.first { $0.hasPrefix("host:") } ?? sigs.first { $0.hasPrefix("app:") }
+        guard let pick, !config.noTicketRules.contains(pick) else { return nil }
+        return pick
+    }
+
+    /// True if the active repo has no connection to any ticket: not in the mined git→ticket bridge
+    /// AND not named by any guessable ticket's text. Such work (a local tool, a no-Jira project)
+    /// shouldn't get a confident guess from ambient text.
+    private func repoOutsideTicketUniverse(_ repo: String?) -> Bool {
+        guard let repo, !repo.isEmpty else { return false }
+        if repoBridge.has(repo: repo) { return false }
+        let r = repo.lowercased()
+        guard r.count > 2 else { return true }
+        return !guessTickets.contains { $0.matchText.lowercased().contains(r) }
+    }
+
+    /// Ranked candidates for a context doc with descriptions + dominant signal — for the review's
+    /// "why / alternatives" UI. Deterministic signals only (embedding/LLM are live-only).
+    func explain(doc: String) -> [(key: String, summary: String, score: Double, source: String)] {
+        let feats = buildFeatures(doc: doc, repoName: Self.parseRepo(doc), embedding: [:], llm: nil, learned: nil)
+        return feats.map { (key: $0.key, p: FusionRanker.fuse($0.value, config.fusionWeights), f: $0.value) }
+            .filter { $0.p > 0 }.sorted { $0.p > $1.p }.prefix(5)
+            .map { (key: $0.key, summary: self.summary(for: $0.key) ?? "", score: $0.p, source: self.dominantSource($0.f)) }
+    }
+
+    /// Persist a user-confirmed (context → ticket) example: signature bias + content memory.
+    func recordCorrection(context: WorkContext, ticket: String) {
+        guard !ticket.isEmpty else { return }
+        corrections.record(signatures: context.signatures(), ticket: ticket)
+        store.insertLabel(contextDoc: context.document, ticket: ticket, kind: "correction")
+        labelMemory.reload()
+    }
+
+    /// Explicit teaching example (from the Teach UI). `signatures` optional for signature bias.
+    func recordTraining(contextDoc: String, ticket: String, signatures: [String] = []) {
+        guard !ticket.isEmpty else { return }
+        if !signatures.isEmpty { corrections.record(signatures: signatures, ticket: ticket) }
+        store.insertLabel(contextDoc: contextDoc, ticket: ticket, kind: "training")
+        labelMemory.reload()
+    }
+
+    var labelCount: Int { labelMemory.count }
+
+    // MARK: - Introspection (for the Inspector view)
+
+    func lexicalRank(_ ctx: WorkContext) -> [TicketGuess] {
+        matcher.rank(context: ctx.document, max: 8)
+    }
+    func memoryNearest(_ ctx: WorkContext, k: Int = 6) -> [(ticket: String, score: Double, doc: String)] {
+        labelMemory.nearest(context: ctx.document, k: k)
+    }
+
+    /// Few-shot examples (similar past labels) to ground the LLM.
+    func fewShot(context: String, k: Int) -> [(context: String, ticket: String)] {
+        labelMemory.fewShot(context: context, k: k)
+    }
+
+    /// Resolve a key to a sprint summary if known.
+    func summary(for key: String) -> String? {
+        sprint.first { $0.key.caseInsensitiveCompare(key) == .orderedSame }?.summary
+    }
+}
