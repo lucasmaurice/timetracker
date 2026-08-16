@@ -145,9 +145,11 @@ A clock icon appears in the menu bar showing the current ticket (or category / `
 ## Sprint picklist
 
 The app reads `~/Library/Application Support/TimeTracker/sprint.json` for its ticket
-picklist and validation. There are two ways to populate it.
+picklist and validation. Which issue tracker fills it is set by **Settings → Provider → Issue
+tracker** (`config.issueProvider`: `jira` or `azureDevOps`) — switching needs a restart, like every
+other setting. Jira has two ways to populate it; Azure DevOps has one.
 
-### In-app API token (recommended)
+### In-app API token (Jira, recommended)
 
 The app authenticates to Jira with **Basic auth** (your email + a personal API token) routed
 through the `api.atlassian.com/ex/jira/{cloudId}` gateway, fetches your open tickets, and writes
@@ -186,15 +188,44 @@ export ATLASSIAN_SITE=yourcompany ATLASSIAN_EMAIL=you@company.com ATLASSIAN_API_
 Either way, the file format is:
 
 ```json
-{ "updated": "2026-06-01T12:00:00Z",
+{ "provider": "jira", "updated": "2026-06-01T12:00:00Z",
   "tickets": [ { "key": "CLOUDINFRA-1234", "summary": "Fix node draining" } ] }
 ```
+
+### Azure DevOps work items
+
+With **Settings → Provider → Issue tracker = Azure DevOps**, the app authenticates with a
+**Personal Access Token** (HTTP Basic) instead of Jira's gateway, fetches work items assigned to
+you (`[System.AssignedTo] = @Me`), and writes the same `sprint.json` (stamped
+`"provider": "azureDevOps"` so a stale Jira file is never reused after switching).
+
+Setup:
+
+1. Create a token at `https://dev.azure.com/<org>/_usersSettings/tokens` with scopes **Work Items
+   (Read)** and **Code (Read)** (the second is for the Azure Repos PR→work-item bridge).
+2. In the menu bar: **Connect Azure DevOps (PAT)…** (has an "Open token page" button) → enter your
+   organization and the token.
+3. It validates against a cheap org-level call, then loads your work items. Use **Refresh sprint
+   list** anytime. **Disconnect Azure DevOps** removes the stored credentials.
+
+Notes:
+- The credential lives in the login Keychain, never in `config.json`. Bad credentials aren't saved.
+- Work items are queried **org-wide by default** (`azureProject` empty) — most people work across
+  more than one Azure DevOps project, the same way `ticketPrefixes` already spans multiple Jira
+  projects. Set `azureProject` in Settings to restrict to one.
+- Keys are shown/stored as `AB#12345` (Azure Boards' own commit-linking syntax). A bare number
+  (as Azure DevOps shows everywhere in its own UI) is still recognized when it matches an open
+  work item's id — see `azureBranchKeyPattern` in Settings if your team's branch naming needs a
+  different capture pattern than the default `feature/12345-fix-thing`.
+- `done`/ranking-boost state is resolved from each work item type's *live* state category, not a
+  fixed list — process templates vary per project and per type.
 
 ## Configuration
 
 `~/Library/Application Support/TimeTracker/config.json` (created on first run). Notable keys:
 `idleSeconds`, `blockSplitHour`, `promptAfterUnknownMinutes`, `abstainNudgeMinutes`, `noTicketRules`, `promptCooldownMinutes`,
-`sampleSeconds`, `ticketPrefixes`, `workspaceGlobs`, `categoryRules`.
+`sampleSeconds`, `ticketPrefixes`, `workspaceGlobs`, `categoryRules`, `issueProvider`, `worklogProvider`,
+`azureOrg`, `azureProject`, `azureTeam`, `sevenPaceOrg`, `sevenPaceActivityTypeId`.
 
 ## Files
 
@@ -203,6 +234,9 @@ Either way, the file format is:
 | `Sources/timetracker/Store.swift` | SQLite schema + reads/writes + data-hygiene migration |
 | `Sources/timetracker/FocusMonitor.swift` | NSWorkspace events + AX title + idle, segmentation |
 | `Sources/timetracker/Attribution.swift` | exact-key + fusion attribution, normalization, repo bridge wiring |
+| `Sources/timetracker/Providers.swift` | `TicketKeyFormat` key-shape seam + `IssueProvider`/`WorklogProvider` protocols |
+| `Sources/timetracker/Atlassian.swift` / `AzureDevOps.swift` | Jira / Azure DevOps issue providers |
+| `Sources/timetracker/TempoClient.swift` / `SevenPaceClient.swift` | Tempo / 7pace worklog providers |
 | `Sources/timetracker/FusionRanker.swift` | calibrated late-fusion (per-signal squash + noisy-OR + policy) |
 | `Sources/timetracker/RepoTicketBridge.swift` | git-history repo→ticket mining (recency-decayed) |
 | `Sources/timetracker/LabelMemory.swift` | k-NN over your labeled examples (kind-weighted) |
@@ -219,3 +253,9 @@ Either way, the file format is:
 - Sprint sync uses `assignee = currentUser()`, not literal `openSprints()` — adjust the JQL if you want true sprint scope.
 - Ad-hoc signature: a clean rebuild keeps the same identity, but if macOS ever drops the
   Accessibility grant after an update, re-toggle it in System Settings.
+- Azure DevOps has no Azure Repos PR→work-item bridge yet, so the git-mined repo→ticket signal
+  stays empty unless work items are named directly in branches/commits (`AB#1234`) — Jira gets this
+  signal for free from branch/commit ticket keys.
+- 7pace's exact worklog-create response shape and whether it requires an explicit `userId` weren't
+  verifiable against a real tenant while this was built — the first real submit may need a small
+  fix in `SevenPaceClient.swift` if your tenant's response differs.

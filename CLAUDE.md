@@ -6,8 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A local-only macOS menu-bar app (SwiftPM executable, no Xcode project) that samples the focused
 app/window, enriches it with local signals (git, browser URL, AI-session transcripts, kube, editor
-heartbeat), infers the Jira ticket being worked on, and builds a block-based daily timesheet that
-can be exported to `~/timesheet-log.md` or posted to Tempo.
+heartbeat), infers the Jira ticket (or Azure DevOps work item) being worked on, and builds a
+block-based daily timesheet that can be exported to `~/timesheet-log.md` or posted to Tempo (or
+7pace).
 
 `README.md` documents the user-facing behaviour and the signal inventory in detail — read it for
 *what* the app does. This file covers *how the code is put together*.
@@ -79,6 +80,7 @@ Signal producers, each independently indexable and all local:
 | [EmbeddingMatcher.swift](Sources/timetracker/EmbeddingMatcher.swift) | Ollama `nomic-embed-text` cosine (async) |
 | [Ollama.swift](Sources/timetracker/Ollama.swift) | local LLM vote (async, event-driven) |
 | [CorrectionStore.swift](Sources/timetracker/CorrectionStore.swift) | signature (repo:/host:/app:) → ticket confirmation counts |
+| [Providers.swift](Sources/timetracker/Providers.swift) | `TicketKeyFormat` (key-shape seam) + `IssueProvider`/`WorklogProvider` protocols |
 
 [FusionRanker.swift](Sources/timetracker/FusionRanker.swift) squashes each raw signal to `[0,1]`
 at its own calibrated centre, then combines by noisy-OR, then applies a precision-first policy
@@ -126,6 +128,42 @@ mined from local git history. Exact-key signals and the manual pickers are delib
 restricted to the pool; `buildFeatures`'s local `allow()` closure enforces the restriction for
 every fused signal. `reloadSprint()` rebuilds both and re-indexes the lexical matcher.
 
+### Provider abstraction (Jira/Tempo vs Azure DevOps/7pace)
+
+`config.issueProvider` (`jira` | `azureDevOps`) and `config.worklogProvider` (`tempo` | `sevenPace`)
+select which concrete client backs `IssueProvider`/`WorklogProvider` ([Providers.swift](Sources/timetracker/Providers.swift)).
+`main.swift` never hardcodes a concrete type on a provider-generic path (menu build, refresh,
+connect/disconnect, submit) — it dispatches through the `issueProvider`/`worklogProvider` computed
+properties, which resolve to `atlassian`/`azureDevOps` and `tempo`/`sevenPace` based on config. Like
+every other setting, switching providers needs a restart — `Attribution` builds its `keyFormat` once
+in `init` from `config.issueProvider`.
+
+The `PREFIX-1234` vs `AB#1234` key-shape difference is isolated behind `TicketKeyFormat`: `extract`
+is parameterized by `KeySource` (url/branch/title/commit/session/freeText) because a bare number is
+safe to trust from a work-item URL but not from a window title — `AzureBoardsKeyFormat` only allows
+it through `Attribution`'s corpus-gated fallback (`exactTicket`), never as a blind regex match.
+`isGuessable` replaces the old hardcoded `prefix + "-"` check; **never** re-hardcode a key shape
+assumption outside this file, or a new provider silently breaks pool membership (an early version of
+this did — an empty guess pool kills every fusion signal with no visible error, just a permanent
+abstain nudge).
+
+`SprintFile.provider` stamps which provider wrote `sprint.json`; `reloadSprint()` treats a
+foreign-provider file as empty rather than silently reusing stale cross-provider tickets after a
+switch. `CorrectionStore` lookups are gated by `guessKeys` for the same reason — a correction learned
+under one provider must never resolve as an exact, never-overridden match under another.
+
+`AzureDevOps.swift` resolves `done`/prior-boost from each work item **type's live state category**
+(`wit/workitemtypes/{type}/states`), never a hardcoded state-name list — state vocabularies are
+customized per process template and per type (verified: a real org's Task/User Story states include
+a non-standard `"Dev"` state, and `"Resolved"` categorizes as `InProgress`, not a distinct category).
+WIQL project scoping is optional (empty `azureProject` = org-wide `@Me` query) since real usage
+spans multiple AzDO projects, the same way `ticketPrefixes` already spans multiple Jira projects.
+
+**Known gap:** there is no Azure Repos PR→work-item bridge yet, so the git-mined repo→ticket signal
+(`RepoTicketBridge`) stays empty for Azure DevOps unless work items are named directly in branch
+names or commit messages (`AB#1234`). Jira gets this signal from branch/commit ticket keys; Azure
+Repos orgs that complete PRs via merge commits (not squash) carry no such text by default.
+
 ### The learning loop
 
 Labels are training data, and only *explicit* user action creates them:
@@ -151,8 +189,11 @@ starting at `dayStartHour`; the first block absorbs early activity and the last 
 nothing is lost). Each block becomes a `BlockReport` carrying both the inferred guess *and* any
 manual `block_assignments` override, plus the representative `context_doc` and a human recap.
 `effectiveTicket` resolves override-then-inference. Output goes to `~/timesheet-log.md` or, via
-`TempoClient`, to Tempo — where `tempo-worklogs.json` maps `(day|block) → worklogId` so
-re-submitting replaces rather than duplicates.
+whichever `WorklogProvider` is active, to Tempo or 7pace — each keeps its **own**
+`(day|block) → worklogId` map file (`tempo-worklogs.json` is `[String: Int]`, 7pace's ids are UUID
+strings) so re-submitting replaces rather than duplicates. Don't merge them into one shared file —
+`TempoClient`'s decode is `try?`-and-silently-empty on a shape mismatch, which would turn a format
+change into duplicate worklogs on the next submit.
 
 ## Conventions and constraints
 
@@ -177,9 +218,10 @@ need a restart (the Settings window says so). `addNoTicketRule` re-reads from di
 specifically to avoid clobbering unrelated in-flight edits. Every field in `Config` should have a
 comment explaining what it does — `SettingsView` surfaces essentially all of them with that help text.
 
-**Network boundary.** Only three things touch the network: Atlassian connect/refresh, Tempo submit,
-and localhost Ollama. Focus logging is entirely offline. Keep it that way — it is the app's central
-promise, restated in the README, the Info.plist usage strings, and the `Store` header comment.
+**Network boundary.** Only the active issue provider's connect/refresh, the active worklog
+provider's submit, and localhost Ollama touch the network. Focus logging is entirely offline. Keep
+it that way — it is the app's central promise, restated in the README, the Info.plist usage
+strings, and the `Store` header comment.
 
 **Privacy layers are distinct.** `excludedApps`/`excludedWindowPatterns` record *nothing* (the
 window title isn't even read); `noTicketRules` still log the time but resolve it to no-ticket. Idle
@@ -199,10 +241,11 @@ All under `~/Library/Application Support/TimeTracker/` (`AppPaths.dataDir`):
 |------|----------|
 | `timetracker.sqlite` | `segments`, `labels`, `block_assignments` (WAL mode; schema + `ALTER TABLE` migrations in `Store.createSchema`, which intentionally ignores "column exists" errors) |
 | `config.json` | the `Config` struct |
-| `sprint.json` | ticket corpus written by Atlassian refresh or `sync-sprint.sh` (gitignored) |
+| `sprint.json` | ticket/work-item corpus written by the active `IssueProvider`'s refresh or `sync-sprint.sh` (gitignored); stamped with `provider` so a stale cross-provider file is ignored, not reused |
 | `corrections.json` | signature → ticket counts |
 | `repo-tickets.json` | mined repo→ticket bridge |
-| `tempo-worklogs.json` | `(day\|block) → worklogId`, deliberately *not* pruned with segments |
+| `tempo-worklogs.json` | Tempo's `(day\|block) → worklogId` (`Int`), deliberately *not* pruned with segments |
+| `sevenpace-worklogs.json` | 7pace's own `(day\|block) → worklogId` (UUID string) — kept separate from Tempo's, see Timesheet output above |
 | `editor-context/*.json` | heartbeats written by the editor extension, read when an editor is frontmost |
 
 Plus `~/timesheet-log.md` for exported rows. Migration and run-once state lives in UserDefaults:
