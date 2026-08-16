@@ -22,6 +22,25 @@ struct Ticket: Codable, Equatable {
     /// What the lexical/embedding matcher sees (rich, includes the description).
     var matchText: String { (text?.isEmpty == false ? text! : summary) }
 
+    /// Shared text builder for every `IssueProvider`: joins the pieces each provider's own fields
+    /// map onto (Jira: type/epic/components/labels/description; Azure Boards: work item type/
+    /// parent title/area path/tags/description) into one `matchText`/`llmText` source. The
+    /// `" · desc:"` marker `llmText` (below) strips on is produced HERE, in exactly one place, so
+    /// a provider can't accidentally leak its description back into the LLM prompt by building the
+    /// text a different way.
+    static func buildMatchText(summary: String?, type: String?, epic: String?,
+                               components: [String], labels: [String], description: String) -> String {
+        var parts: [String] = []
+        if let t = type { parts.append("[\(t)]") }
+        if let s = summary { parts.append(s) }
+        if let epic { parts.append("epic: \(epic)") }
+        if !components.isEmpty { parts.append("components: \(components.joined(separator: ", "))") }
+        if !labels.isEmpty { parts.append("labels: \(labels.joined(separator: ", "))") }
+        let desc = description.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !desc.isEmpty { parts.append("desc: \(desc.prefix(600))") }
+        return parts.joined(separator: " · ")
+    }
+
     /// Leaner text for the LLM candidate list: type + summary + epic + components + labels, but
     /// WITHOUT the description — which is mostly GitHub blob URLs with commit SHAs (pure token
     /// noise for ticket selection). The discriminator between near-identical tickets is the

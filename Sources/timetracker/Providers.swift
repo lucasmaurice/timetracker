@@ -111,3 +111,37 @@ struct AzureBoardsKeyFormat: TicketKeyFormat {
         return nil
     }
 }
+
+/// Result of a full corpus refresh — how many tickets/work items total, and how many are open.
+struct RefreshResult { var total: Int; var open: Int }
+
+/// A source of tickets/work items: fetches the corpus into `sprint.json` and resolves a key to
+/// its numeric issue id (for worklog submission). `connect`/disconnect dialogs stay on the
+/// concrete type in main.swift — this protocol only covers what `Attribution`'s callers need
+/// generically, so the same menu/refresh/submit code paths work regardless of which is active.
+protocol IssueProvider: AnyObject {
+    var displayName: String { get }
+    var configured: Bool { get }
+    func preload()
+    func disconnect()
+    func refreshSprint() async throws -> RefreshResult
+    func fetchIssueId(forKey: String) async -> String?
+}
+
+/// A destination for worklogs. `resolveAuthor` puts "whose identity does this worklog need" on
+/// the provider that owns that identity (Tempo: the paired Jira account; 7pace: its own user)
+/// instead of hard-coding one provider's accountId call at the main.swift submit site.
+protocol WorklogProvider: AnyObject {
+    var displayName: String { get }
+    var configured: Bool { get }
+    func preload()
+    func disconnect()
+    func connect(token: String)
+    func resolveAuthor() async -> String?
+    func worklogId(day: String, block: String) -> String?
+    func setWorklogId(day: String, block: String, id: String?)
+    func pruneWorklogMap(olderThanDays: Double)
+    func createWorklog(issueId: String, author: String?, date: String, startTime: String,
+                       seconds: Int, description: String) async throws -> String?
+    func deleteWorklog(id: String) async
+}

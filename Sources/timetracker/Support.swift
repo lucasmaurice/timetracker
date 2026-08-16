@@ -30,9 +30,6 @@ struct Config: Codable {
     var issueProvider: IssueProviderKind = .jira
     /// Where worklogs are submitted. See `WorklogProviderKind`.
     var worklogProvider: WorklogProviderKind = .tempo
-    /// Azure Boards only: regex (first capture group = the numeric work-item id) recognizing a
-    /// work item id embedded in a branch name, e.g. the default matches "feature/48210-fix-thing".
-    var azureBranchKeyPattern: String = "(?:^|/)(\\d+)[-_]"
 
     /// User is "idle" after this many seconds with no input.
     var idleSeconds: Double = 300
@@ -89,6 +86,36 @@ struct Config: Codable {
     var jiraRefreshMinutes: Double = 20
     /// Don't fetch tickets untouched (no update/comment) in more than this many days. 0 = no limit.
     var jiraMaxAgeDays: Double = 180
+
+    // MARK: Azure DevOps (used when issueProvider == .azureDevOps)
+
+    /// Your Azure DevOps organization, e.g. the <org> in https://dev.azure.com/<org>.
+    var azureOrg: String = ""
+    /// Restrict work-item queries to one project. Empty = org-wide (assignee = @Me across every
+    /// project you have access to) — most people work across more than one AzDO project, the same
+    /// way ticketPrefixes already spans multiple Jira projects.
+    var azureProject: String = ""
+    /// Team used for iteration/sprint lookups (Settings → team name, not the project name). Empty
+    /// disables active-sprint detection for Azure Boards (inSprint stays false) rather than guessing.
+    var azureTeam: String = ""
+    /// Override the default "assigned to me, not done" WIQL entirely. Empty = use the built-in query.
+    var azureWiql: String = ""
+    /// Area paths to exclude from the corpus (prefix match), e.g. a noisy service-desk area with no
+    /// real project prefix to filter by the way Jira's excludedTickets globs can.
+    var azureExcludedAreas: [String] = []
+    /// Regex (first capture group = the numeric work-item id) recognizing a work item id embedded
+    /// in a branch name, e.g. the default matches "feature/48210-fix-thing".
+    var azureBranchKeyPattern: String = "(?:^|/)(\\d+)[-_]"
+    /// Mine Azure Repos PR→work-item links to seed the repo→ticket bridge (the git-mined signal Jira
+    /// gets for free from branch/commit ticket keys). Needs the PAT's Code (read) scope.
+    var azurePRBridgeEnabled: Bool = true
+
+    // MARK: 7pace (used when worklogProvider == .sevenPace)
+
+    /// Your 7pace/Azure DevOps organization for the Timetracker API host, https://<org>.timehub.7pace.com.
+    var sevenPaceOrg: String = ""
+    /// Activity type id (UUID) attached to every submitted worklog. Empty = omit the field.
+    var sevenPaceActivityTypeId: String = ""
 
     // MARK: Housekeeping / pruning
 
