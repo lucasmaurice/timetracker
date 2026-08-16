@@ -14,6 +14,19 @@ struct SettingsView: View {
     var body: some View {
         VStack(spacing: 0) {
             Form {
+                Section("Provider") {
+                    Picker("Issue tracker", selection: $model.config.issueProvider) {
+                        Text("Jira").tag(IssueProviderKind.jira)
+                        Text("Azure DevOps").tag(IssueProviderKind.azureDevOps)
+                    }
+                    Picker("Time tracking", selection: $model.config.worklogProvider) {
+                        Text("Tempo").tag(WorklogProviderKind.tempo)
+                        Text("7pace").tag(WorklogProviderKind.sevenPace)
+                    }
+                    Text("Changes here need a restart to take effect — Config is copied into every component at launch.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+
                 Section("Tracking") {
                     num("Idle after (seconds)", \.idleSeconds, "No activity for this long counts as idle (excluded from billable time).")
                     num("Sample cadence (seconds)", \.sampleSeconds, "How often the focused window is sampled. App switches are caught instantly regardless.")
@@ -38,20 +51,42 @@ struct SettingsView: View {
                     num("Prompt cooldown (minutes)", \.promptCooldownMinutes, "Minimum gap between prompts/nudges.")
                 }
 
-                Section("Jira") {
-                    text("Board ids", intCSV(\.jiraBoardIds), "Comma-separated board numbers (from each board URL) for active-sprint detection.")
-                    text("Service-desk queues", csv(\.jiraQueues), "Comma-separated PROJECT/queueId, e.g. PES/246. Treated like an active sprint (boost + include).")
-                    num("Auto-refresh every (minutes)", \.jiraRefreshMinutes, "Re-pull tickets this often (and once on launch). 0 = manual only.")
-                    num("Ignore tickets older than (days)", \.jiraMaxAgeDays, "Don't fetch tickets untouched beyond this; next refresh skips them. 0 = no limit.")
-                    toggle("Guess only from current sprint", $model.config.guessFromSprintOnly, "Restrict guesses to assigned tickets in the active board sprint. Off by default (sprint detection is unreliable and this starves the pool). The sprint still boosts ranking; this only limits eligibility.")
-                    text("Ticket prefixes", csv(\.ticketPrefixes), "Comma-separated keys to recognize, e.g. CLOUDINFRA, PES, GEN.")
+                if model.config.issueProvider == .jira {
+                    Section("Jira") {
+                        text("Board ids", intCSV(\.jiraBoardIds), "Comma-separated board numbers (from each board URL) for active-sprint detection.")
+                        text("Service-desk queues", csv(\.jiraQueues), "Comma-separated PROJECT/queueId, e.g. PES/246. Treated like an active sprint (boost + include).")
+                        num("Auto-refresh every (minutes)", \.jiraRefreshMinutes, "Re-pull tickets this often (and once on launch). 0 = manual only.")
+                        num("Ignore tickets older than (days)", \.jiraMaxAgeDays, "Don't fetch tickets untouched beyond this; next refresh skips them. 0 = no limit.")
+                        text("Ticket prefixes", csv(\.ticketPrefixes), "Comma-separated keys to recognize, e.g. CLOUDINFRA, PES, GEN.")
+                    }
+                } else {
+                    Section("Azure DevOps") {
+                        text("Organization", $model.config.azureOrg, "Your Azure DevOps org — the <org> in https://dev.azure.com/<org>.")
+                        text("Project", $model.config.azureProject, "Restrict work-item queries to one project. Empty = org-wide (assignee = @Me across every project you have access to) — most people work across more than one AzDO project.")
+                        text("Team", $model.config.azureTeam, "Team name (not project name) used for active-iteration detection. Empty disables it — inSprint stays false rather than guessing.")
+                        text("WIQL override", $model.config.azureWiql, "Replace the built-in \"assigned to me, not done\" query entirely. Empty = use the default.")
+                        text("Excluded areas", csv(\.azureExcludedAreas), "Area-path prefixes to drop from the corpus, e.g. a noisy service-desk area with no project prefix to filter by the way Jira's excluded tickets can.")
+                        text("Branch key pattern", $model.config.azureBranchKeyPattern, "Regex (1st capture group = the work-item id) recognizing an id in a branch name. Default matches feature/48210-fix-thing.")
+                        toggle("Mine PR→work-item links", $model.config.azurePRBridgeEnabled, "Resolve Azure Repos pull requests to work items to seed the repo→ticket bridge — the grounded signal Jira gets for free from branch/commit ticket keys. Needs the PAT's Code (read) scope.")
+                    }
+                }
+
+                Section("Tickets — shared") {
                     text("Workspace folders", csv(\.workspaceGlobs), "Where your git repos live (for branch/commit/cwd detection).")
-                    text("Excluded tickets", csv(\.excludedTickets), "Never track/suggest these. Exact keys or globs, e.g. EXCL-*, CLOUDINFRA-9999.")
+                    text("Excluded tickets", csv(\.excludedTickets), "Never track/suggest these. Exact keys or globs, e.g. EXCL-*, CLOUDINFRA-9999. Jira only — Azure DevOps has no project prefix to glob against; use Excluded areas above instead.")
                     text("Common / catch-all tickets", csv(\.commonTickets), "Always shown in the pickers even if unassigned/old, e.g. the quarterly CLOUDINFRA-6081. Manual-pick only.")
-                    text("Common tickets JQL", $model.config.commonTicketsJQL, "Auto-pull common tickets via JQL, e.g. parent = PES-204 (epics under it). Updates as epics rotate.")
-                    text("'No ticket' label", $model.config.noTicketLabel, "Shown in pickers for work with no JIRA. Fills the block (no nagging) and reads in the timesheet.")
+                    text("Common tickets JQL", $model.config.commonTicketsJQL, "Auto-pull common tickets via JQL, e.g. parent = PES-204 (epics under it). Updates as epics rotate. Jira only.")
+                    text("'No ticket' label", $model.config.noTicketLabel, "Shown in pickers for work with no ticket. Fills the block (no nagging) and reads in the timesheet.")
                     text("Always-no-ticket signatures", csv(\.noTicketRules), "Contexts that always resolve to no-ticket (still logged, non-billable), e.g. app:com.spotify.client, host:news.ycombinator.com. Built up via 'Mark as no-ticket'.")
-                    text("'No ticket' → Tempo ticket", $model.config.noTicketTempoTicket, "Where to log no-ticket time in Tempo. Empty = skip those blocks (don't submit).")
+                    text("'No ticket' → billing ticket", $model.config.noTicketTempoTicket, "Where to log no-ticket time in Tempo/7pace. Empty = skip those blocks (don't submit).")
+                    toggle("Guess only from current sprint", $model.config.guessFromSprintOnly, "Restrict guesses to assigned tickets in the active sprint/iteration. Off by default (sprint detection is unreliable and this starves the pool). It still boosts ranking; this only limits eligibility.")
+                }
+
+                if model.config.worklogProvider == .sevenPace {
+                    Section("7pace") {
+                        text("Organization", $model.config.sevenPaceOrg, "Your 7pace/Azure DevOps org for the Timetracker API host, https://<org>.timehub.7pace.com.")
+                        text("Activity type id", $model.config.sevenPaceActivityTypeId, "UUID attached to every submitted worklog. Empty = omit the field (many orgs make it mandatory — check 7pace → Settings → Activity Types if submits fail).")
+                    }
                 }
 
                 Section("Guessing — fusion ranker") {
