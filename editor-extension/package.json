@@ -2,7 +2,7 @@
   "name": "timetracker-context",
   "displayName": "TimeTracker Context",
   "description": "Feeds rich editor context (repo, branch, file, symbol, terminal commands, task) to the local TimeTracker app for better ticket inference. 100% local — no network calls. Over Remote-SSH/Codespaces/WSL, pair with 'TimeTracker Context Bridge' (installed locally) so the heartbeat still reaches your machine.",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "publisher": "JusteReseau",
   "repository": {
     "type": "git",
@@ -25,7 +25,17 @@
         "command": "timetracker.status",
         "title": "TimeTracker: Show context status"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "TimeTracker Context",
+      "properties": {
+        "timetracker.captureTerminalCommands": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Capture recent integrated-terminal commands (e.g. `terraform`, `kubectl`) into the heartbeat TimeTracker reads for ticket attribution. **Off by default**: a command line can contain secrets typed inline — tokens in `export FOO=...`, passwords in connection strings, `curl -H \"Authorization: Bearer ...\"`. Turning this on sends that text into TimeTracker's local heartbeat file (and, over Remote-SSH, through the Bridge extension to your local machine) — still never over the network, but worth the tradeoff being explicit rather than default-on."
+        }
+      }
+    }
   },
   "scripts": {
     "compile": "tsc -p ./",

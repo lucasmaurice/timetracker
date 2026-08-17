@@ -40,6 +40,23 @@ function isRemote(): boolean {
   return vscode.env.remoteName !== undefined;
 }
 
+// Off by default: a command line can carry secrets typed inline (tokens in `export FOO=...`,
+// passwords in connection strings, `curl -H "Authorization: Bearer ..."`). Read live (not cached)
+// so toggling the setting takes effect immediately, no reload needed.
+function terminalCaptureEnabled(): boolean {
+  return vscode.workspace.getConfiguration('timetracker').get<boolean>('captureTerminalCommands', false);
+}
+
+let warnedTerminalCapture = false;
+function maybeWarnTerminalCapture() {
+  if (!terminalCaptureEnabled() || warnedTerminalCapture) { return; }
+  warnedTerminalCapture = true;
+  void vscode.window.showWarningMessage(
+    'TimeTracker Context: terminal command capture is ON. Command lines can contain secrets ' +
+    '(tokens, passwords) typed inline — this text goes into TimeTracker\'s local heartbeat file. ' +
+    'Turn off "timetracker.captureTerminalCommands" in Settings if you don\'t want that.');
+}
+
 export async function activate(ctx: vscode.ExtensionContext) {
   // Local-write path only matters for non-remote sessions; harmless (and ignored) otherwise.
   try { fs.mkdirSync(CONTEXT_DIR, { recursive: true }); } catch { /* TimeTracker not installed yet, or remote */ }
@@ -56,6 +73,8 @@ export async function activate(ctx: vscode.ExtensionContext) {
 
   const sched = debounce(write, 400);
 
+  maybeWarnTerminalCapture();   // reminder if it was already left on from a previous session
+
   ctx.subscriptions.push(
     vscode.window.onDidChangeActiveTextEditor((e) => { if (e) { pushRecent(e.document.uri.fsPath); } void sched(); }),
     vscode.window.onDidChangeTextEditorSelection(() => void sched()),
@@ -64,13 +83,21 @@ export async function activate(ctx: vscode.ExtensionContext) {
     vscode.tasks.onDidEndTask(() => { activeTask = undefined; }),
     vscode.debug.onDidChangeActiveDebugSession(() => void sched()),
     vscode.commands.registerCommand('timetracker.status', showStatus),
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (!e.affectsConfiguration('timetracker.captureTerminalCommands')) { return; }
+      if (terminalCaptureEnabled()) { maybeWarnTerminalCapture(); }
+      else { terminalCmds.length = 0; }   // purge whatever was captured while it was on
+    }),
   );
 
   // Integrated-terminal command capture (shell integration; VS Code 1.93+, present in recent
-  // forks). Gated at runtime so the extension still loads on older bases.
+  // forks). Always registered so a live setting toggle takes effect without a reload — gated
+  // inside the handler (terminalCaptureEnabled(), checked fresh on every command) rather than at
+  // registration time.
   const anyWin = vscode.window as any;
   if (typeof anyWin.onDidStartTerminalShellExecution === 'function') {
     ctx.subscriptions.push(anyWin.onDidStartTerminalShellExecution((e: any) => {
+      if (!terminalCaptureEnabled()) { return; }
       const cmd: string | undefined = e?.execution?.commandLine?.value;
       if (cmd && cmd.trim()) {
         terminalCmds.push(cmd.trim().slice(0, 160));
@@ -134,7 +161,11 @@ async function write() {
     recentFiles: recentFiles.slice(-MAX_RECENT).map((p) => rel(p)).filter(Boolean),  // repo-relative (dir context)
     changes,                                  // files you're actually modifying (relative paths)
     scmMessage,                               // commit-in-progress — often names the ticket
-    terminalCmds: terminalCmds.slice(-MAX_CMDS),
+    // Re-checked here too (not just at capture time): if the setting was disabled mid-session,
+    // this stops SENDING whatever was already captured while it was on, immediately — not just
+    // stopping new capture. See maybeWarnTerminalCapture's config-change handler for the memory-
+    // clearing counterpart.
+    terminalCmds: terminalCaptureEnabled() ? terminalCmds.slice(-MAX_CMDS) : [],
     task: activeTask,
     debugSession: vscode.debug.activeDebugSession?.name,
     // Only gathered when remote — the Mac process (SessionReader.swift) already reads Claude

@@ -9,11 +9,22 @@ accurately. It writes one small JSON "heartbeat" per workspace describing the li
 - **files you're modifying** (`changes`, working-tree + staged) and recent files, as repo-relative
   paths (the directories carry service/component names that match ticket summaries)
 - recent integrated-**terminal commands** (`terraform`, `kubectl`, `helm`, …) via shell integration
+  — **off by default**, see below
 - the active **task** / **debug session**, and whether this window is focused
 
 **100% local, no network calls, ever.** If TimeTracker isn't installed, the heartbeat is simply
 never read. TimeTracker reads the freshest *focused* heartbeat when a VS Code / Kiro window is
 frontmost, and merges it into the work context.
+
+## Terminal command capture is opt-in
+
+A command line can carry secrets typed inline — tokens in `export FOO=...`, passwords in
+connection strings, `curl -H "Authorization: Bearer ..."`. Setting `timetracker.captureTerminalCommands`
+to `true` (Settings, or `settings.json`) turns this signal on; you'll get a one-time warning
+notification whenever it's on at startup or gets toggled on live, as a standing reminder rather
+than a one-off you can forget. Turning it off (live, no reload needed) also purges anything
+already captured this session — it stops appearing in the next heartbeat immediately, not just
+going forward.
 
 ## If you use Remote-SSH / Codespaces / WSL: install the Bridge too
 
