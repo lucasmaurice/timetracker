@@ -15,9 +15,6 @@
   "categories": [
     "Other"
   ],
-  "extensionDependencies": [
-    "JusteReseau.timetracker-context-bridge"
-  ],
   "activationEvents": [
     "onStartupFinished"
   ],
