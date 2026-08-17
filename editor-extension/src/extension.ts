@@ -137,6 +137,10 @@ async function write() {
     terminalCmds: terminalCmds.slice(-MAX_CMDS),
     task: activeTask,
     debugSession: vscode.debug.activeDebugSession?.name,
+    // Only gathered when remote — the Mac process (SessionReader.swift) already reads Claude
+    // Code / Copilot state directly for a local session; it has no local path to state that
+    // lives on a remote host, which is exactly where THIS process is running in that case.
+    aiSession: isRemote() ? aiSessionRemote(root) : undefined,
   };
   lastPayload = payload;
 
@@ -157,6 +161,138 @@ async function write() {
     return;
   }
   try { if (outFile) { fs.writeFileSync(outFile, JSON.stringify(payload)); } } catch { /* ignore */ }
+}
+
+// AI-session detection for a REMOTE host — a TypeScript port of the same reads
+// SessionReader.swift already does for a local Mac session (Claude Code JSONL transcripts,
+// Copilot Chat's workspaceStorage), pointed at the remote host's own equivalent paths instead:
+// `~/.claude/projects` (same encoding either way — Claude Code's cwd-encoding is platform-
+// independent) and `~/.vscode-server/data/User/workspaceStorage` (VS Code Server's documented
+// remote data directory, vs. desktop VS Code's `Library/Application Support/Code/User/...`).
+// Reads only — never modifies anything, same 100%-local-reads posture as the Swift side.
+let aiSessionCache: { repoPath: string | undefined; value: string | undefined; at: number } | undefined;
+const AI_SESSION_TTL_MS = 60000;
+
+function aiSessionRemote(repoPath: string | undefined): string | undefined {
+  const now = Date.now();
+  if (aiSessionCache && aiSessionCache.repoPath === repoPath && now - aiSessionCache.at < AI_SESSION_TTL_MS) {
+    return aiSessionCache.value;
+  }
+  const parts: string[] = [];
+  if (repoPath) {
+    const claude = claudeCodeForRepo(repoPath);
+    if (claude) { parts.push(`Claude Code: ${claude}`); }
+    const copilot = copilotForRepo(repoPath);
+    if (copilot) { parts.push(`Copilot: ${copilot}`); }
+  }
+  const value = parts.length ? parts.join(' ⏐ ') : undefined;
+  aiSessionCache = { repoPath, value, at: now };
+  return value;
+}
+
+function newestFile(dir: string, exts: string[]): string | undefined {
+  let names: string[];
+  try { names = fs.readdirSync(dir); } catch { return undefined; }
+  let best: { full: string; mtime: number } | undefined;
+  for (const name of names) {
+    if (!exts.includes(path.extname(name).slice(1))) { continue; }
+    const full = path.join(dir, name);
+    let mtime: number;
+    try { mtime = fs.statSync(full).mtimeMs; } catch { continue; }
+    if (!best || mtime > best.mtime) { best = { full, mtime }; }
+  }
+  return best?.full;
+}
+
+// Claude Code encodes the cwd by replacing "/" and "." with "-" — same on every platform.
+function encodeCwd(p: string): string {
+  return p.split('').map((c) => (c === '/' || c === '.' ? '-' : c)).join('');
+}
+
+function claudeCodeForRepo(repoPath: string): string | undefined {
+  const dir = path.join(os.homedir(), '.claude', 'projects', encodeCwd(repoPath));
+  const f = newestFile(dir, ['jsonl']);
+  return f ? summarizeClaudeJSONL(f) : undefined;
+}
+
+function summarizeClaudeJSONL(file: string): string | undefined {
+  let content: string;
+  try { content = fs.readFileSync(file, 'utf8'); } catch { return undefined; }
+  let title: string | undefined;
+  const userMsgs: string[] = [];
+  for (const line of content.split('\n')) {
+    if (!line.trim()) { continue; }
+    let obj: any;
+    try { obj = JSON.parse(line); } catch { continue; }
+    if (obj?.type === 'ai-title' && typeof obj.aiTitle === 'string') {
+      title = obj.aiTitle;
+    } else if (obj?.type === 'user') {
+      const t = claudeUserText(obj.message);
+      if (t) { userMsgs.push(t); }
+    }
+  }
+  const parts: string[] = [];
+  if (title) { parts.push(title); }
+  parts.push(...userMsgs.filter((m) => m.length > 4).slice(-3).map((m) => m.slice(0, 200)));
+  return parts.length ? parts.join(' · ') : undefined;
+}
+
+function claudeUserText(message: any): string | undefined {
+  if (!message || typeof message !== 'object') { return undefined; }
+  if (typeof message.content === 'string') { return message.content; }
+  if (Array.isArray(message.content)) {
+    const texts = message.content
+      .filter((c: any) => c?.type === 'text' && typeof c.text === 'string')
+      .map((c: any) => c.text as string);
+    return texts.length ? texts.join(' ') : undefined;
+  }
+  return undefined;
+}
+
+function vscodeServerDataDir(): string {
+  const override = process.env.VSCODE_SERVER_DIR;
+  return override ? path.join(override, 'data') : path.join(os.homedir(), '.vscode-server', 'data');
+}
+
+function copilotForRepo(repoPath: string): string | undefined {
+  const base = path.join(vscodeServerDataDir(), 'User', 'workspaceStorage');
+  const hashDir = workspaceDirMatching(base, repoPath);
+  if (!hashDir) { return undefined; }
+  // Modern Copilot Chat writes single-object .jsonl; older builds used .json.
+  const f = newestFile(path.join(hashDir, 'chatSessions'), ['jsonl', 'json']);
+  return f ? copilotChatSummary(f) : undefined;
+}
+
+// Find the workspaceStorage hash dir whose workspace.json folder == repoPath.
+function workspaceDirMatching(base: string, repoPath: string): string | undefined {
+  let names: string[];
+  try { names = fs.readdirSync(base); } catch { return undefined; }
+  const want = 'file://' + repoPath;
+  for (const name of names) {
+    const wj = path.join(base, name, 'workspace.json');
+    let obj: any;
+    try { obj = JSON.parse(fs.readFileSync(wj, 'utf8')); } catch { continue; }
+    const folder = obj?.folder;
+    if (typeof folder === 'string' && (folder === want || folder.endsWith(repoPath))) {
+      return path.join(base, name);
+    }
+  }
+  return undefined;
+}
+
+// Targeted parse of a Copilot Chat session: pull the user's recent prompt text from
+// `v.requests[].message.text` (avoids scooping up model/UI noise a generic harvester would catch).
+function copilotChatSummary(file: string): string | undefined {
+  let obj: any;
+  try { obj = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return undefined; }
+  const v = obj?.v ?? obj;
+  const requests = v?.requests;
+  if (!Array.isArray(requests)) { return undefined; }
+  const texts = requests
+    .map((r: any) => r?.message?.text)
+    .filter((t: any) => typeof t === 'string' && t.length > 4) as string[];
+  const recent = texts.slice(-3).map((t) => t.slice(0, 200));
+  return recent.length ? recent.join(' · ') : undefined;
 }
 
 async function symbolAtCursor(ed?: vscode.TextEditor): Promise<string | undefined> {
