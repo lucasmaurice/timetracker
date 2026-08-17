@@ -77,6 +77,7 @@ Signal producers, each independently indexable and all local:
 | [Semantic.swift](Sources/timetracker/Semantic.swift) (`TicketMatcher`) | lexical TF-IDF cosine over the ticket corpus |
 | [LabelMemory.swift](Sources/timetracker/LabelMemory.swift) | k-NN over your labeled examples, trust-weighted by provenance |
 | [RepoTicketBridge.swift](Sources/timetracker/RepoTicketBridge.swift) | git-mined repo→ticket history, recency-decayed (42d half-life) |
+| [AzurePRBridge.swift](Sources/timetracker/AzurePRBridge.swift) | Azure Repos PR→work-item resolution, feeds `RepoTicketBridge` |
 | [EmbeddingMatcher.swift](Sources/timetracker/EmbeddingMatcher.swift) | Ollama `nomic-embed-text` cosine (async) |
 | [Ollama.swift](Sources/timetracker/Ollama.swift) | local LLM vote (async, event-driven) |
 | [CorrectionStore.swift](Sources/timetracker/CorrectionStore.swift) | signature (repo:/host:/app:) → ticket confirmation counts |
@@ -159,10 +160,13 @@ a non-standard `"Dev"` state, and `"Resolved"` categorizes as `InProgress`, not 
 WIQL project scoping is optional (empty `azureProject` = org-wide `@Me` query) since real usage
 spans multiple AzDO projects, the same way `ticketPrefixes` already spans multiple Jira projects.
 
-**Known gap:** there is no Azure Repos PR→work-item bridge yet, so the git-mined repo→ticket signal
-(`RepoTicketBridge`) stays empty for Azure DevOps unless work items are named directly in branch
-names or commit messages (`AB#1234`). Jira gets this signal from branch/commit ticket keys; Azure
-Repos orgs that complete PRs via merge commits (not squash) carry no such text by default.
+Azure Repos orgs that complete PRs via merge commits (not squash) carry no ticket-key text in
+commit subjects at all — [AzurePRBridge.swift](Sources/timetracker/AzurePRBridge.swift) restores
+the git-mined repo→ticket signal for those orgs by resolving PRs to their linked work items
+(one list-PRs call per repo, falling back to a per-PR `/workitems` lookup for the unresolved
+remainder) and merging the result into `RepoTicketBridge` via `ingestResolvedKeys`. This runs
+**after** `rebuildRepoBridge` in the same background pass — that call replaces the bridge's map
+wholesale, so merging first would be silently wiped. Toggle with `azurePRBridgeEnabled`.
 
 ### The learning loop
 

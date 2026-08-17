@@ -253,9 +253,6 @@ Notes:
 - Sprint sync uses `assignee = currentUser()`, not literal `openSprints()` — adjust the JQL if you want true sprint scope.
 - Ad-hoc signature: a clean rebuild keeps the same identity, but if macOS ever drops the
   Accessibility grant after an update, re-toggle it in System Settings.
-- Azure DevOps has no Azure Repos PR→work-item bridge yet, so the git-mined repo→ticket signal
-  stays empty unless work items are named directly in branches/commits (`AB#1234`) — Jira gets this
-  signal for free from branch/commit ticket keys.
 - 7pace's exact worklog-create response shape and whether it requires an explicit `userId` weren't
   verifiable against a real tenant while this was built — the first real submit may need a small
   fix in `SevenPaceClient.swift` if your tenant's response differs.
