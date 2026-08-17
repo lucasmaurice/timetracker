@@ -10,9 +10,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var monitor: FocusMonitor!
     private var summary: Summary!
     private var atlassian: Atlassian!
+    private var azureDevOps: AzureDevOps!
+    private var azurePRBridge: AzurePRBridge!
     private var ollama: Ollama!
     private var tempo: TempoClient!
+    private var sevenPace: SevenPaceClient!
     private var embeddings: EmbeddingMatcher!
+    /// The active issue/worklog provider per `config.issueProvider`/`worklogProvider`. Switching
+    /// providers needs a restart (like every other setting), so these are simple dispatch, not
+    /// mutable state — but every menu/refresh/submit path goes through them so both providers
+    /// share one code path instead of duplicating it per concrete type.
+    private var issueProvider: IssueProvider { config.issueProvider == .jira ? atlassian : azureDevOps }
+    private var worklogProvider: WorklogProvider { config.worklogProvider == .tempo ? tempo : sevenPace }
     private var dashboardWindow: NSWindow?
     private var dashboardHost: NSHostingController<DashboardView>?
     private var reviewWindow: NSWindow?
@@ -47,14 +56,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var embedCandidates: [TicketGuess] = []
     private var embedInFlight = false
     private var lastEmbedDoc: String?
+    private var prReviewInFlight: Set<Int> = []
 
     func applicationDidFinishLaunching(_ note: Notification) {
         store = Store()
         attribution = Attribution(config: config, store: store)
         summary = Summary(store: store, config: config, attribution: attribution)
         atlassian = Atlassian(config: config)
+        azureDevOps = AzureDevOps(config: config)
+        azurePRBridge = AzurePRBridge()
         ollama = Ollama(config: config)
-        tempo = TempoClient(config: config)
+        tempo = TempoClient(config: config, atlassian: atlassian)
+        sevenPace = SevenPaceClient(config: config)
         embeddings = EmbeddingMatcher(config: config)
         let enricher = ContextEnricher(config: config, sessions: SessionReader())
         monitor = FocusMonitor(store: store, attribution: attribution, enricher: enricher, config: config)
@@ -67,17 +80,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         monitor.onUpdate = { [weak self] state in
             DispatchQueue.main.async {
-                self?.updateStatus(state); self?.recordArc(state); self?.maybeEmbed(state)
+                self?.updateStatus(state); self?.recordArc(state); self?.maybeEmbed(state); self?.maybeResolvePRReview(state)
             }
         }
         monitor.start()
-        // Read the Keychain off-main (it can block on a permission prompt), then refresh.
+        // Read the Keychain off-main (it can block on a permission prompt), then refresh. The
+        // repo-bridge pass (which now also checks azureDevOps.configured, for the PR bridge) is
+        // chained inside this same completion instead of independently scheduled, so it can't
+        // race the preload and see credentials as "not configured" simply because it ran first.
         DispatchQueue.global(qos: .utility).async { [weak self] in
             self?.atlassian.preload()
             self?.tempo.preload()
+            self?.azureDevOps.preload()
+            self?.sevenPace.preload()
             DispatchQueue.main.async {
                 self?.rebuildMenu(current: self?.monitor.currentState)
-                self?.runRefresh(silent: true)   // freshen Jira on launch if connected
+                self?.runRefresh(silent: true)   // freshen the ticket corpus on launch if connected
+                self?.buildRepoBridgeAndBackfill()
             }
         }
         reindexEmbeddings()
@@ -89,7 +108,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         DispatchQueue.global(qos: .background).async { [weak self] in self?.housekeeping() }
-        buildRepoBridgeAndBackfill()
 
         promptTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.checkAbstainNudge()
@@ -111,16 +129,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Mine workspace git history into the repo→ticket bridge (every launch), and on first run
-    /// seed `labels` from that history (warm-start). All git/store work is off the main thread;
-    /// the in-memory label index is reloaded on main. Mirrors the housekeeping pattern.
+    /// seed `labels` from that history (warm-start). All git/store/network work is off the main
+    /// thread; the in-memory label index is reloaded on main. Mirrors the housekeeping pattern.
     private func buildRepoBridgeAndBackfill() {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             self.attribution.rebuildRepoBridge()
+            // MUST run after rebuildRepoBridge (above): that call replaces the bridge's map
+            // wholesale, so merging PR results first would have them silently wiped.
+            if self.config.issueProvider == .azureDevOps, self.config.azurePRBridgeEnabled, self.azureDevOps.configured {
+                let results = await self.azurePRBridge.resolve(
+                    workspaceDirs: self.config.expandedWorkspaceDirs, azureDevOps: self.azureDevOps, now: Date())
+                self.attribution.ingestPRBridgeResults(results)
+            }
             let firstRun = !UserDefaults.standard.bool(forKey: "ttBackfilledV1")
             let inserted = firstRun ? self.attribution.backfillFromHistory() : 0
             if firstRun { UserDefaults.standard.set(true, forKey: "ttBackfilledV1") }
-            DispatchQueue.main.async {
+            await MainActor.run {
                 // The bridge was (re)built after init's reloadSprint, so reload to widen the guess
                 // pool with freshly-mined keys and re-index the matcher/embeddings.
                 self.attribution.reloadSprint()
@@ -284,15 +309,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let export = NSMenuItem(title: "Export today to timesheet-log.md", action: #selector(exportToday), keyEquivalent: "e")
         export.target = self; menu.addItem(export)
         let refresh = NSMenuItem(title: "Refresh sprint list", action: #selector(refreshSprint), keyEquivalent: "")
-        refresh.target = self; refresh.isEnabled = atlassian.configured; menu.addItem(refresh)
+        refresh.target = self; refresh.isEnabled = issueProvider.configured; menu.addItem(refresh)
 
         menu.addItem(.separator())
-        if atlassian.configured {
-            let logout = NSMenuItem(title: "Disconnect Atlassian", action: #selector(disconnectAtlassian), keyEquivalent: "")
-            logout.target = self; menu.addItem(logout)
-        } else {
-            let connect = NSMenuItem(title: "Connect Atlassian (API token)…", action: #selector(connectAtlassian), keyEquivalent: "")
-            connect.target = self; menu.addItem(connect)
+        switch config.issueProvider {
+        case .jira:
+            if atlassian.configured {
+                let logout = NSMenuItem(title: "Disconnect Atlassian", action: #selector(disconnectAtlassian), keyEquivalent: "")
+                logout.target = self; menu.addItem(logout)
+            } else {
+                let connect = NSMenuItem(title: "Connect Atlassian (API token)…", action: #selector(connectAtlassian), keyEquivalent: "")
+                connect.target = self; menu.addItem(connect)
+            }
+        case .azureDevOps:
+            if azureDevOps.configured {
+                let logout = NSMenuItem(title: "Disconnect Azure DevOps", action: #selector(disconnectAzureDevOps), keyEquivalent: "")
+                logout.target = self; menu.addItem(logout)
+            } else {
+                let connect = NSMenuItem(title: "Connect Azure DevOps (PAT)…", action: #selector(connectAzureDevOps), keyEquivalent: "")
+                connect.target = self; menu.addItem(connect)
+            }
         }
 
         menu.addItem(.separator())
@@ -350,7 +386,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             add(t.key, "\(t.key) — \(t.summary.prefix(50))")
         }
         if attribution.sprint.isEmpty {
-            sub.addItem(disabled("(no tickets — Connect Atlassian, see README)"))
+            sub.addItem(disabled("(no tickets — Connect \(issueProvider.displayName), see README)"))
         }
         sub.addItem(.separator())
         let manual = NSMenuItem(title: "Enter ticket manually…", action: #selector(enterTicketManually), keyEquivalent: "")
@@ -505,7 +541,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             UserDefaults.standard.set(remaining, forKey: "submittedDays")
         }
         store.pruneLabels(max: config.labelMaxCount)
-        tempo.pruneWorklogMap(olderThanDays: 90)   // resubmission no longer realistic past this
+        worklogProvider.pruneWorklogMap(olderThanDays: 90)   // resubmission no longer realistic past this
     }
 
     private func markSubmitted(day: String) {
@@ -545,34 +581,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Preview exactly what will be posted.
         NSApp.activate(ignoringOtherApps: true)
         let preview = NSAlert()
-        preview.messageText = "Submit \(planned.count) worklog(s) to Tempo?"
+        preview.messageText = "Submit \(planned.count) worklog(s) to \(worklogProvider.displayName)?"
         preview.informativeText = planned.map { "• \($0.date) \($0.block) · \($0.ticket) · 4h\n   “\($0.description)”" }
-            .joined(separator: "\n") + "\n\nThis posts to your official Tempo timesheet."
-        preview.addButton(withTitle: "Submit to Tempo")
+            .joined(separator: "\n") + "\n\nThis posts to your official \(worklogProvider.displayName) timesheet."
+        preview.addButton(withTitle: "Submit to \(worklogProvider.displayName)")
         preview.addButton(withTitle: "Cancel")
         guard preview.runModal() == .alertFirstButtonReturn else { return }
 
-        if !tempo.configured {
-            guard let token = promptForTempoToken() else { return }
-            tempo.connect(token: token)
+        if !worklogProvider.configured {
+            guard let token = promptForWorklogToken() else { return }
+            worklogProvider.connect(token: token)
         }
 
         Task { @MainActor in
-            guard let accountId = await atlassian.accountId() else {
-                showError(AtlassianError.notConfigured); return
-            }
+            // The author is resolved by whichever worklog provider is active — Tempo needs the
+            // paired Jira accountId, 7pace needs its own identity; neither is hard-gated here.
+            let author = await worklogProvider.resolveAuthor()
             var ok = 0
             var fails: [String] = []
             for p in planned {
                 var idStr = attribution.issueId(forKey: p.ticket)
-                if idStr == nil { idStr = await atlassian.fetchIssueId(forKey: p.ticket) }
-                guard let idStr, let id = Int(idStr) else { fails.append("\(p.ticket): couldn't resolve issue id"); continue }
+                if idStr == nil { idStr = await issueProvider.fetchIssueId(forKey: p.ticket) }
+                guard let idStr else { fails.append("\(p.ticket): couldn't resolve issue id"); continue }
                 // Idempotent: replace any worklog we previously posted for this (day, block).
-                if let old = tempo.worklogId(day: p.date, block: p.block) { await tempo.deleteWorklog(id: old) }
+                if let old = worklogProvider.worklogId(day: p.date, block: p.block) { await worklogProvider.deleteWorklog(id: old) }
                 do {
-                    let newId = try await tempo.createWorklog(issueId: id, accountId: accountId, date: p.date,
-                                                              startTime: p.startTime, seconds: p.seconds, description: p.description)
-                    tempo.setWorklogId(day: p.date, block: p.block, id: newId)
+                    let newId = try await worklogProvider.createWorklog(issueId: idStr, author: author, date: p.date,
+                                                                        startTime: p.startTime, seconds: p.seconds, description: p.description)
+                    worklogProvider.setWorklogId(day: p.date, block: p.block, id: newId)
                     ok += 1
                 } catch {
                     fails.append("\(p.ticket): " + ((error as? LocalizedError)?.errorDescription ?? "\(error)"))
@@ -580,10 +616,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             if ok > 0 { self.markSubmitted(day: dayStr) }
             let a = NSAlert()
-            a.messageText = "Tempo: \(ok) submitted" + (fails.isEmpty ? "" : ", \(fails.count) failed")
+            a.messageText = "\(worklogProvider.displayName): \(ok) submitted" + (fails.isEmpty ? "" : ", \(fails.count) failed")
             if !fails.isEmpty { a.alertStyle = .warning; a.informativeText = fails.joined(separator: "\n") }
             a.runModal()
         }
+    }
+
+    private func promptForWorklogToken() -> String? {
+        switch config.worklogProvider {
+        case .tempo: return promptForTempoToken()
+        case .sevenPace: return promptForSevenPaceToken()
+        }
+    }
+
+    private func promptForSevenPaceToken() -> String? {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Connect 7pace"
+        alert.informativeText = "Create a token in Timetracker Settings → Reporting and API → Reporting & API, "
+            + "then paste it here. Requires sevenPaceOrg to already be set in Settings."
+        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = "7pace API token"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let t = field.stringValue.trimmingCharacters(in: .whitespaces)
+        return t.isEmpty ? nil : t
     }
 
     private func promptForTempoToken() -> String? {
@@ -593,18 +653,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.informativeText = "Create a Tempo API token in Tempo → Settings → API integration, then paste it here. (Separate from your Jira token.)"
         alert.addButton(withTitle: "Connect")
         alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Open Tempo settings")
+
+        let stack = NSStackView(); stack.orientation = .vertical; stack.spacing = 6
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
         field.placeholderString = "Tempo API token"
-        alert.accessoryView = field
-        alert.window.initialFirstResponder = field
-        let resp = alert.runModal()
-        if resp == .alertThirdButtonReturn {
-            let site = atlassian.site ?? "id.atlassian.com"
+        let openButton = linkButton("Open Tempo settings") { [weak self] in
+            let site = self?.atlassian.site ?? "id.atlassian.com"
             NSWorkspace.shared.open(URL(string: "https://\(site)/plugins/servlet/ac/io.tempo.jira/tempo-app#!/configuration/api-integration")!)
-            return promptForTempoToken()
         }
-        guard resp == .alertFirstButtonReturn else { return nil }
+        stack.addArrangedSubview(field)
+        stack.addArrangedSubview(openButton)
+        stack.frame = NSRect(x: 0, y: 0, width: 320, height: 56)
+        alert.accessoryView = stack
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         let t = field.stringValue.trimmingCharacters(in: .whitespaces)
         return t.isEmpty ? nil : t
     }
@@ -931,14 +993,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func refreshSprint() { runRefresh(silent: false) }
 
-    /// Refresh the Jira ticket list. Silent = no popup (used by the timer + launch).
+    /// Refresh the ticket/work-item corpus via whichever issue provider is configured. Silent =
+    /// no popup (used by the timer + launch). `issueProvider` already dispatches on
+    /// `config.issueProvider`, so checking `.configured` here can't clobber the other provider's
+    /// sprint.json even if stale credentials for it are still sitting in the Keychain.
     private func runRefresh(silent: Bool) {
-        guard atlassian.configured, !refreshingJira else { return }
+        guard issueProvider.configured, !refreshingJira else { return }
         refreshingJira = true
         Task { @MainActor in
             defer { refreshingJira = false }
             do {
-                let r = try await atlassian.refreshSprint()
+                let r = try await issueProvider.refreshSprint()
                 attribution.reloadSprint()
                 reindexEmbeddings()
                 rebuildMenu(current: monitor.currentState)
@@ -965,6 +1030,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func connectAzureDevOps() {
+        guard let creds = promptForAzureDevOpsPAT() else { return }
+        Task { @MainActor in
+            do {
+                let who = try await azureDevOps.connect(org: creds.org, pat: creds.pat)
+                let r = try await azureDevOps.refreshSprint()
+                attribution.reloadSprint()
+                reindexEmbeddings()
+                rebuildMenu(current: monitor.currentState)
+                showInfo("Connected to \(who). Loaded \(r.open) open / \(r.total) total work item(s).")
+            } catch {
+                azureDevOps.disconnect()   // don't keep bad credentials
+                rebuildMenu(current: monitor.currentState)
+                showError(error)
+            }
+        }
+    }
+
+    @objc private func disconnectAzureDevOps() {
+        azureDevOps.disconnect()
+        rebuildMenu(current: monitor.currentState)
+    }
+
+    private func promptForAzureDevOpsPAT() -> (org: String, pat: String)? {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Connect Azure DevOps (Personal Access Token)"
+        alert.informativeText = """
+        Enter your organization, then use “Open token page” below to create a token. Azure \
+        DevOps has no way to preselect scopes via link — on the page, choose "Custom defined" \
+        and check exactly:
+          • Work Items — Read
+          • Code — Read
+        """
+        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "Cancel")
+
+        let stack = NSStackView(); stack.orientation = .vertical; stack.spacing = 6
+        let orgField = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        orgField.placeholderString = "Organization (e.g. contoso)"
+        orgField.stringValue = config.azureOrg
+        let openButton = linkButton("Open token page") { [orgField] in
+            let org = orgField.stringValue.trimmingCharacters(in: .whitespaces)
+            let path = org.isEmpty ? "https://dev.azure.com/_usersSettings/tokens" : "https://dev.azure.com/\(org)/_usersSettings/tokens"
+            if let url = URL(string: path) { NSWorkspace.shared.open(url) }
+        }
+        let scopesLabel = NSTextField(labelWithString: "Required scopes: Work Items (Read), Code (Read)")
+        scopesLabel.font = .boldSystemFont(ofSize: NSFont.smallSystemFontSize)
+        let patField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        patField.placeholderString = "Personal Access Token"
+        stack.addArrangedSubview(orgField)
+        stack.addArrangedSubview(openButton)
+        stack.addArrangedSubview(scopesLabel)
+        stack.addArrangedSubview(patField)
+        stack.frame = NSRect(x: 0, y: 0, width: 340, height: 110)
+        alert.accessoryView = stack
+        alert.window.initialFirstResponder = orgField
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let org = orgField.stringValue.trimmingCharacters(in: .whitespaces)
+        let pat = patField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !org.isEmpty, !pat.isEmpty else { return nil }
+        return (org, pat)
+    }
+
+    /// A plain button inside an alert's accessory view, as opposed to one of `NSAlert`'s own
+    /// `addButton`s — clicking one of THOSE always ends the modal session (that's how
+    /// `runModal()` returns), which is what made "Open token page" close the whole connect
+    /// dialog and lose anything already typed. A button that isn't wired through
+    /// `addButton`/`runModal`'s return value can be clicked without ending the modal at all.
+    /// NSButton needs an Objective-C target/action, not a Swift closure, hence the trampoline.
+    private final class ActionTrampoline: NSObject {
+        let action: () -> Void
+        init(_ action: @escaping () -> Void) { self.action = action }
+        @objc func invoke() { action() }
+    }
+    private static var trampolineKey: UInt8 = 0
+    private func linkButton(_ title: String, action: @escaping () -> Void) -> NSButton {
+        let trampoline = ActionTrampoline(action)
+        let button = NSButton(title: title, target: trampoline, action: #selector(ActionTrampoline.invoke))
+        button.bezelStyle = .inline
+        // Retain the trampoline for as long as the button exists — NSButton's `target` is unowned.
+        objc_setAssociatedObject(button, &Self.trampolineKey, trampoline, .OBJC_ASSOCIATION_RETAIN)
+        return button
+    }
+
     @objc private func disconnectAtlassian() {
         atlassian.disconnect()
         rebuildMenu(current: monitor.currentState)
@@ -978,7 +1128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showError(_ error: Error) {
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert(); a.alertStyle = .warning
-        a.messageText = "Atlassian error"
+        a.messageText = "Error"
         a.informativeText = (error as? LocalizedError)?.errorDescription ?? "\(error)"
         a.runModal()
     }
@@ -989,35 +1139,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.messageText = "Connect Atlassian (API token)"
         alert.informativeText = """
-        Create a token at id.atlassian.com → Security → API tokens, then enter:
+        Use “Open token page” below to create a token, then enter:
           • Site: your <site> (e.g. acme, or acme.atlassian.net)
           • Email: your Atlassian account email
           • API token: the token you created
         """
         alert.addButton(withTitle: "Connect")
         alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Open token page")
 
-        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 340, height: 84))
-        stack.orientation = .vertical; stack.spacing = 6
+        let stack = NSStackView(); stack.orientation = .vertical; stack.spacing = 6
         let siteField = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
         siteField.placeholderString = "Site (e.g. acme)"
         let emailField = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
         emailField.placeholderString = "you@company.com"
+        let openButton = linkButton("Open token page") {
+            NSWorkspace.shared.open(URL(string: "https://id.atlassian.com/manage-profile/security/api-tokens")!)
+        }
+        let scopesLabel = NSTextField(labelWithString: "Required scopes: read:jira-work, read:jira-user (or read:me)")
+        scopesLabel.font = .boldSystemFont(ofSize: NSFont.smallSystemFontSize)
         let tokenField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
         tokenField.placeholderString = "API token"
         stack.addArrangedSubview(siteField)
         stack.addArrangedSubview(emailField)
+        stack.addArrangedSubview(openButton)
+        stack.addArrangedSubview(scopesLabel)
         stack.addArrangedSubview(tokenField)
+        stack.frame = NSRect(x: 0, y: 0, width: 340, height: 140)
         alert.accessoryView = stack
         alert.window.initialFirstResponder = siteField
 
-        let resp = alert.runModal()
-        if resp == .alertThirdButtonReturn {
-            NSWorkspace.shared.open(URL(string: "https://id.atlassian.com/manage-profile/security/api-tokens")!)
-            return promptForApiToken()   // re-show after opening the token page
-        }
-        guard resp == .alertFirstButtonReturn else { return nil }
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         let site = siteField.stringValue.trimmingCharacters(in: .whitespaces)
         let email = emailField.stringValue.trimmingCharacters(in: .whitespaces)
         let token = tokenField.stringValue.trimmingCharacters(in: .whitespaces)
@@ -1066,6 +1217,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let cur = monitor.currentState, cur.attribution.ticket == nil, !cur.attribution.candidates.isEmpty {
                 llmRefine()
             }
+        }
+    }
+
+    /// If the focused window is a PR you're reviewing (title "Pull request NNNN: ... - Repos")
+    /// and its linked work item hasn't been resolved yet this session, fetch it live regardless of
+    /// who it's assigned to — a code review is real work on someone else's ticket, not something
+    /// the "assigned to me" corpus should have to already contain. Guarded so this doesn't touch
+    /// the network on every sample: `prReviewInFlight` avoids a duplicate request while one is
+    /// outstanding, and `!Attribution.isExact` skips it entirely once resolved (from then on the
+    /// exact-match check in `decideAttribution` fires purely from Attribution's in-memory cache).
+    private func maybeResolvePRReview(_ state: LiveState?) {
+        guard config.issueProvider == .azureDevOps, config.azurePRBridgeEnabled, azureDevOps.configured,
+              let st = state, !st.idle, !Attribution.isExact(st.attribution.source),
+              let prId = attribution.extractPRNumber(fromTitle: st.context.title),
+              !prReviewInFlight.contains(prId)
+        else { return }
+        prReviewInFlight.insert(prId)
+        Task { @MainActor in
+            defer { self.prReviewInFlight.remove(prId) }
+            guard let ticket = await self.azureDevOps.resolveWorkItem(forPullRequestId: prId) else { return }
+            self.attribution.cachePRReviewTicket(prId: prId, ticket: ticket)
+            self.refineCurrent()
         }
     }
 
@@ -1348,11 +1521,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stack.orientation = .vertical
         stack.spacing = 6
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
-        field.placeholderString = "e.g. CLOUDINFRA-1234"
+        field.placeholderString = "e.g. \(attribution.keyFormat.placeholderExample)"
         if let prefill { field.stringValue = prefill }
         let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
         popup.addItem(withTitle: "— pick from sprint —")
-        for t in attribution.pickerTickets.prefix(60) { popup.addItem(withTitle: "\(t.key) — \(t.summary.prefix(40))") }
+        for t in attribution.pickerTickets.prefix(60) {
+            popup.addItem(withTitle: "\(t.key) — \(t.summary.prefix(40))")
+            popup.lastItem?.representedObject = t.key
+        }
         popup.target = self
         // When a sprint item is chosen, copy its key into the field.
         popup.action = #selector(popupChose(_:))
@@ -1370,7 +1546,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let key = attribution.normalizeTicketEntry(raw) else {
             let warn = NSAlert()
             warn.messageText = "Not a valid ticket"
-            warn.informativeText = "“\(raw)” isn’t a recognized ticket key (expected e.g. CLOUDINFRA-1234). Nothing was assigned."
+            warn.informativeText = "“\(raw)” isn’t a recognized ticket key (expected e.g. \(attribution.keyFormat.placeholderExample)). Nothing was assigned."
             warn.runModal()
             return nil
         }
@@ -1381,8 +1557,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func popupChose(_ sender: NSPopUpButton) {
         guard sender.indexOfSelectedItem > 0,
               let field = objc_getAssociatedObject(sender, &Self.fieldKey) as? NSTextField,
-              let title = sender.titleOfSelectedItem else { return }
-        field.stringValue = String(title.split(separator: " ").first ?? "")
+              let key = sender.selectedItem?.representedObject as? String else { return }
+        field.stringValue = key
     }
 }
 

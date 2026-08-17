@@ -13,9 +13,33 @@ struct Ticket: Codable, Equatable {
     var inQueue: Bool = false  // member of a watched service-desk queue
     var common: Bool = false   // a configured catch-all ticket (always shown in pickers)
     var issueId: String?      // numeric Jira id (Tempo worklogs key by this, not the key)
+    /// Provider-normalized status category, when the provider has one (Azure Boards: Proposed/
+    /// InProgress/Resolved/Completed/Removed). Jira's own statusCategory (new/indeterminate/done)
+    /// doesn't distinguish "in review" from "in progress", so Jira tickets leave this nil and fall
+    /// back to the name-based heuristic below — this only takes over where it adds precision.
+    var statusCategory: String?
 
     /// What the lexical/embedding matcher sees (rich, includes the description).
     var matchText: String { (text?.isEmpty == false ? text! : summary) }
+
+    /// Shared text builder for every `IssueProvider`: joins the pieces each provider's own fields
+    /// map onto (Jira: type/epic/components/labels/description; Azure Boards: work item type/
+    /// parent title/area path/tags/description) into one `matchText`/`llmText` source. The
+    /// `" · desc:"` marker `llmText` (below) strips on is produced HERE, in exactly one place, so
+    /// a provider can't accidentally leak its description back into the LLM prompt by building the
+    /// text a different way.
+    static func buildMatchText(summary: String?, type: String?, epic: String?,
+                               components: [String], labels: [String], description: String) -> String {
+        var parts: [String] = []
+        if let t = type { parts.append("[\(t)]") }
+        if let s = summary { parts.append(s) }
+        if let epic { parts.append("epic: \(epic)") }
+        if !components.isEmpty { parts.append("components: \(components.joined(separator: ", "))") }
+        if !labels.isEmpty { parts.append("labels: \(labels.joined(separator: ", "))") }
+        let desc = description.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !desc.isEmpty { parts.append("desc: \(desc.prefix(600))") }
+        return parts.joined(separator: " · ")
+    }
 
     /// Leaner text for the LLM candidate list: type + summary + epic + components + labels, but
     /// WITHOUT the description — which is mostly GitHub blob URLs with commit SHAs (pure token
@@ -30,23 +54,36 @@ struct Ticket: Codable, Equatable {
     /// Ranking prior: not-done + active-sprint + recently-touched + In-Progress rank higher,
     /// so a large assigned backlog (incl. completed tickets kept for the data lake) doesn't
     /// dilute current work. Weights are configurable (Settings → Ranking weights).
-    func priorWeight(now: Date, w: RankWeights) -> Double {
-        priorBreakdown(now: now, w: w).reduce(1.0) { $0 * $1.factor }
+    /// `preferredStates` — pre-lowercased, from Config.preferredTicketStates — is checked against
+    /// the raw status name, one level more specific than `statusCategory` below can be.
+    func priorWeight(now: Date, w: RankWeights, preferredStates: Set<String> = []) -> Double {
+        priorBreakdown(now: now, w: w, preferredStates: preferredStates).reduce(1.0) { $0 * $1.factor }
     }
 
     /// Labeled multiplicative factors (for the Inspector). Only non-neutral factors are listed.
-    func priorBreakdown(now: Date, w: RankWeights) -> [(label: String, factor: Double)] {
+    func priorBreakdown(now: Date, w: RankWeights, preferredStates: Set<String> = []) -> [(label: String, factor: Double)] {
         var out: [(String, Double)] = []
         if done {
             out.append(("done", w.donePenalty))
+        } else if let cat = statusCategory {
+            if cat == "InProgress" { out.append(("In Progress", w.inProgressBoost)) }
+            else if cat == "Resolved" { out.append(("In Review", w.inReviewBoost)) }
         } else {
             let s = (status ?? "").lowercased()
             if s.contains("progress") { out.append(("In Progress", w.inProgressBoost)) }
             else if s.contains("review") { out.append(("In Review", w.inReviewBoost)) }
         }
+        // A raw-state-name preference, distinct from (and finer-grained than) the category boost
+        // above: two states can share a category — e.g. Azure Boards' "Dev" and "Active" both
+        // categorize as InProgress — but only one of them might actually mean "someone's coding
+        // this right now" for your team. Not applied to a done ticket even if its literal state
+        // name happens to match, so a preference never overrides the done penalty.
+        if !done, let status, preferredStates.contains(status.lowercased()) {
+            out.append(("preferred state (\(status))", w.preferredStateBoost))
+        }
         if inSprint { out.append(("active sprint", w.sprintBoost)) }
         if inQueue { out.append(("queue", w.queueBoost)) }
-        if let u = updated, let d = ISO8601DateFormatter().date(from: u) {
+        if let u = updated, let d = Self.parseUpdated(u) {
             let days = now.timeIntervalSince(d) / 86400
             if days < 3 { out.append(("updated <3d", w.recent3dBoost)) }
             else if days < 14 { out.append(("updated <14d", w.recent14dBoost)) }
@@ -54,9 +91,29 @@ struct Ticket: Codable, Equatable {
         }
         return out
     }
+
+    /// Jira's `updated` (and Azure Boards' `ChangedDate`) include fractional seconds
+    /// ("2026-08-14T12:33:21.190-0400"), which the default `ISO8601DateFormatter` — configured for
+    /// `.withInternetDateTime` only — silently fails to parse (`date(from:)` returns nil). That
+    /// means the recency boosts above have never actually fired. Try the strict format first, then
+    /// fall back to fractional seconds.
+    private static let isoStrict = ISO8601DateFormatter()
+    private static let isoFractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static func parseUpdated(_ s: String) -> Date? {
+        isoStrict.date(from: s) ?? isoFractional.date(from: s)
+    }
 }
 
 struct SprintFile: Codable {
+    /// Which `IssueProviderKind` wrote this file. Nil = predates this field (treated as "jira",
+    /// the only provider that existed before). `reloadSprint` ignores a file stamped for a
+    /// different provider than the one currently configured, instead of silently reusing stale
+    /// cross-provider tickets after a switch.
+    var provider: String?
     var updated: String?
     var tickets: [Ticket]
 }
@@ -74,7 +131,9 @@ struct AttributionResult {
 /// and a locally-synced sprint picklist. No network.
 final class Attribution {
     private var config: Config
-    private let ticketRegex: NSRegularExpression
+    /// Provider-specific key extraction/validation — see Providers.swift. Built once at init from
+    /// `config.issueProvider`; switching providers needs a restart, same as every other setting.
+    let keyFormat: TicketKeyFormat
     private(set) var sprint: [Ticket] = []
     private var repoBranchCache: [String: (branch: String, at: Date)] = [:]
     private let branchTTL: TimeInterval = 30
@@ -90,9 +149,10 @@ final class Attribution {
         self.config = config
         self.labelMemory = LabelMemory(store: store)
         self.store = store
-        let prefixes = config.ticketPrefixes.map { NSRegularExpression.escapedPattern(for: $0) }.joined(separator: "|")
-        // Word-bounded <PREFIX>-<digits>, prefixes are case-insensitive.
-        self.ticketRegex = try! NSRegularExpression(pattern: "\\b(?:\(prefixes))-\\d+\\b", options: [.caseInsensitive])
+        switch config.issueProvider {
+        case .jira: self.keyFormat = JiraKeyFormat(prefixes: config.ticketPrefixes)
+        case .azureDevOps: self.keyFormat = AzureBoardsKeyFormat(branchPattern: config.azureBranchKeyPattern)
+        }
         // Exclusion patterns: glob `*` → `.*`, anchored, case-insensitive (e.g. "EXCL-*").
         self.excludeRegexes = config.excludedTickets.compactMap { pat in
             let escaped = pat.split(separator: "*", omittingEmptySubsequences: false)
@@ -105,7 +165,7 @@ final class Attribution {
     /// Attribution sources that must never be overridden by an async refinement (embedding/LLM):
     /// the exact-key matches plus explicit human/learned signals. Fused sources
     /// (semantic/memory/repo/embed/llm/guess) are refinable as more evidence arrives.
-    static let exactSources: Set<String> = ["url", "branch", "title", "commit", "session", "learned", "manual", "pinned"]
+    static let exactSources: Set<String> = ["url", "branch", "title", "commit", "session", "learned", "manual", "pinned", "prReview"]
     static func isExact(_ source: String?) -> Bool { source.map { exactSources.contains($0) } ?? false }
 
     /// True if a ticket key is on the exclusion list (exact or glob match).
@@ -122,6 +182,17 @@ final class Attribution {
     func reloadSprint() {
         guard let data = try? Data(contentsOf: AppPaths.sprintFile),
               let f = try? JSONDecoder().decode(SprintFile.self, from: data) else { return }
+        // A file predating the `provider` field is treated as "jira" (the only provider that
+        // existed before). A file stamped for a DIFFERENT provider than the one configured now is
+        // stale cross-provider data — clear the corpus instead of silently reusing it (it would
+        // otherwise still validate through `normalizeTicketEntry`'s corpus branch and get written
+        // into new segments under the wrong provider).
+        let fileProvider = f.provider ?? IssueProviderKind.jira.rawValue
+        guard fileProvider == config.issueProvider.rawValue else {
+            sprint = []; guessTickets = []; guessKeys = []
+            if config.semanticEnabled { matcher.index([], weights: config.rankWeights, preferredStates: config.preferredTicketStatesLower) }
+            return
+        }
         sprint = f.tickets.filter { !isExcluded($0.key) }   // drop excluded from the whole corpus
 
         // The guesser may only choose tickets whose project prefix is configured. `assignee =
@@ -129,7 +200,7 @@ final class Attribution {
         // access incident tickets) into the corpus; those are noise that the lexical matcher was
         // spuriously auto-tagging. They stay in `sprint` (data lake / memory) but are barred from
         // guessing. Common tickets are always allowed regardless of prefix.
-        let guessable = sprint.filter { hasGuessablePrefix($0.key) || $0.common }
+        let guessable = sprint.filter { keyFormat.isGuessable($0.key) || $0.common }
 
         // Guess pool: assigned + current board sprint when enabled; otherwise all not-done.
         var pool = config.guessFromSprintOnly ? guessable.filter { $0.inSprint && !$0.done }
@@ -148,27 +219,34 @@ final class Attribution {
         guessTickets = pool
         guessKeys = Set(pool.map { $0.key })
 
-        if config.semanticEnabled { matcher.index(guessTickets, weights: config.rankWeights) }
-    }
-
-    /// True if a key's project prefix is one the guesser is configured to choose from.
-    private func hasGuessablePrefix(_ key: String) -> Bool {
-        let upper = key.uppercased()
-        return config.ticketPrefixes.contains { upper.hasPrefix($0.uppercased() + "-") }
+        if config.semanticEnabled { matcher.index(guessTickets, weights: config.rankWeights, preferredStates: config.preferredTicketStatesLower) }
     }
 
     // MARK: - Repo → ticket bridge (git history)
 
     /// Extract a guessable, non-excluded ticket key from arbitrary text (branch / commit).
+    /// Strict extraction only — no corpus-gated bare-number fallback here, since that would bias
+    /// history mining toward tickets that happen to be currently assigned rather than what the
+    /// history actually shows. The text could be either a branch name or a commit subject (the
+    /// bridge scans both through this same closure), so try both source-specific rules.
     private func guessableExtract(_ text: String) -> String? {
-        guard let key = extractTicket(from: text), !isExcluded(key) else { return nil }
-        return key
+        for source: KeySource in [.commit, .branch] {
+            if let key = keyFormat.extract(from: text, source: source), !isExcluded(key) { return key }
+        }
+        return nil
     }
 
     /// Re-mine workspace git history into the repo→ticket bridge. Heavy (spawns git per repo);
     /// call off the main thread. Thread-safe: the bridge guards its own state.
     func rebuildRepoBridge(now: Date = Date()) {
         repoBridge.rebuild(workspaceDirs: config.expandedWorkspaceDirs, now: now) { self.guessableExtract($0) }
+    }
+
+    /// Merge `AzurePRBridge`-resolved (repo, [(key, ts)]) pairs into the repo→ticket bridge. MUST
+    /// be called after `rebuildRepoBridge` in the same pass — that call replaces the bridge's map
+    /// wholesale, which would silently wipe an earlier merge.
+    func ingestPRBridgeResults(_ results: [(repo: String, keys: [(key: String, ts: Double)])], now: Date = Date()) {
+        for r in results { repoBridge.ingestResolvedKeys(repo: r.repo, keys: r.keys, now: now) }
     }
 
     /// Recency-decayed repo→ticket candidates for the current context, restricted to the
@@ -276,7 +354,7 @@ final class Attribution {
     /// Prior-weight breakdown for a ticket key (for the Inspector). Returns labeled factors + total.
     func priorBreakdown(forKey key: String) -> (factors: [(label: String, factor: Double)], total: Double)? {
         guard let t = sprint.first(where: { $0.key.caseInsensitiveCompare(key) == .orderedSame }) else { return nil }
-        let factors = t.priorBreakdown(now: Date(), w: config.rankWeights)
+        let factors = t.priorBreakdown(now: Date(), w: config.rankWeights, preferredStates: config.preferredTicketStatesLower)
         return (factors, factors.reduce(1.0) { $0 * $1.factor })
     }
 
@@ -305,32 +383,53 @@ final class Attribution {
         keys.compactMap { key in sprint.first { $0.key.caseInsensitiveCompare(key) == .orderedSame } }
     }
 
+    /// Free-text extraction (no source hint) — used by `normalizeTicketEntry` and the data
+    /// migration, where the caller has an arbitrary user/machine-supplied string, not a specific
+    /// context field.
     func extractTicket(from text: String) -> String? {
-        let range = NSRange(text.startIndex..., in: text)
-        guard let m = ticketRegex.firstMatch(in: text, range: range),
-              let r = Range(m.range, in: text) else { return nil }
-        return String(text[r]).uppercased()
+        keyFormat.extract(from: text, source: .freeText)
     }
 
     /// Canonicalize a user/machine-supplied ticket string to a real key (or the no-ticket
     /// sentinel), returning nil for anything that isn't a valid ticket. This is the single
     /// chokepoint that keeps poison out of the store: a pasted Jira URL becomes "CLOUDINFRA-5119"
     /// (not the whole URL), an empty/garbage entry is rejected so callers can ignore it.
-    /// Order: no-ticket sentinel → known corpus key (case-fixed) → key extracted from anywhere
-    /// in the string → reject.
+    /// Order: no-ticket sentinel → known corpus key (case-fixed) → format-canonicalized corpus
+    /// match (e.g. a bare "48210" typed against an Azure Boards corpus) → key extracted from
+    /// anywhere in the string → reject.
     func normalizeTicketEntry(_ raw: String) -> String? {
         let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.isEmpty { return nil }
         if t.caseInsensitiveCompare(config.noTicketLabel) == .orderedSame { return config.noTicketLabel }
         if let known = sprint.first(where: { $0.key.caseInsensitiveCompare(t) == .orderedSame }) { return known.key }
+        if let canon = keyFormat.canonicalize(t),
+           let known = sprint.first(where: { $0.key.caseInsensitiveCompare(canon) == .orderedSame }) {
+            return known.key
+        }
         if let key = extractTicket(from: t), !isExcluded(key) { return key }
         return nil
     }
 
-    /// Like extractTicket, but returns nil for excluded keys (never tracked).
-    private func exactTicket(from text: String) -> String? {
-        guard let t = extractTicket(from: text), !isExcluded(t) else { return nil }
-        return t
+    /// Strict source-aware extraction, non-excluded. When the format allows it, also accepts a
+    /// bare number IFF it canonicalizes to a key that's actually in the live guess pool — this is
+    /// what recovers e.g. a window title "48210: Fix the thing - Boards" without opening up bare
+    /// numbers as a general false-positive magnet (a random number that isn't one of your open
+    /// work items is simply ignored).
+    private static let bareNumberRegex = try! NSRegularExpression(pattern: "\\d{3,7}")
+    private func exactTicket(from text: String, source: KeySource) -> String? {
+        if let strict = keyFormat.extract(from: text, source: source), !isExcluded(strict) { return strict }
+        guard keyFormat.allowsBareNumberFallback else { return nil }
+        // Try every bare number in the text (not just the first) against the live guess pool, so
+        // e.g. "Q3 2026 Planning — 48210: Fix the thing" still resolves on the second number.
+        let range = NSRange(text.startIndex..., in: text)
+        for m in Self.bareNumberRegex.matches(in: text, range: range) {
+            guard let r = Range(m.range, in: text) else { continue }
+            let bare = String(text[r])
+            if let canon = keyFormat.canonicalize(bare), !isExcluded(canon), guessKeys.contains(canon) {
+                return canon
+            }
+        }
+        return nil
     }
 
     private func category(text: String) -> String? {
@@ -339,6 +438,38 @@ final class Attribution {
             if rule.anyOf.contains(where: { hay.contains($0.lowercased()) }) { return rule.category }
         }
         return nil
+    }
+
+    /// Matches Azure Repos' PR-review window title ("Pull request 32068: Add new php7.4 node 24
+    /// image - Repos"), both the web UI and VS Code use this format. Only the PR number matters
+    /// here — the resolved work item is a DIFFERENT id space than a ticket key, so this can't
+    /// reuse `keyFormat.extract`.
+    private static let prTitleRegex = try! NSRegularExpression(pattern: "(?i)pull request (\\d+)")
+    func extractPRNumber(fromTitle title: String) -> Int? {
+        let range = NSRange(title.startIndex..., in: title)
+        guard let m = Self.prTitleRegex.firstMatch(in: title, range: range),
+              let r = Range(m.range(at: 1), in: title) else { return nil }
+        return Int(title[r])
+    }
+
+    /// PR id -> its linked work item, resolved live and kept only for this run (never persisted
+    /// to sprint.json — it's a narrow, moment-specific exception, not a corpus widening). Set by
+    /// the async resolver in main.swift once the network round trip completes; from then on the
+    /// exact-match check in `decideAttribution` below fires purely from this in-memory map, no
+    /// further network on the hot attribution path.
+    private var prReviewTickets: [Int: Ticket] = [:]
+
+    /// Called once a PR's linked work item is fetched. Merges the ticket into the live guess pool
+    /// too (not just the PR-id cache) so ranking/lexical-match/priorBreakdown treat it like any
+    /// other candidate if it also turns up via other signals — e.g. its own title/branch.
+    func cachePRReviewTicket(prId: Int, ticket: Ticket) {
+        prReviewTickets[prId] = ticket
+        if !guessKeys.contains(ticket.key) {
+            guessKeys.insert(ticket.key)
+            guessTickets.append(ticket)
+            if config.semanticEnabled { matcher.index(guessTickets, weights: config.rankWeights, preferredStates: config.preferredTicketStatesLower) }
+        }
+        if !sprint.contains(where: { $0.key == ticket.key }) { sprint.append(ticket) }
     }
 
     /// Attribute a moment of work from its enriched context, using only the synchronous
@@ -358,15 +489,23 @@ final class Attribution {
         let cat = category(text: "\(ctx.app) \(ctx.title) \(ctx.url ?? "") \(ctx.meeting ?? "")")
 
         // 1) Exact keys — highest precision, always win.
-        if let t = ctx.url.flatMap(exactTicket(from:)) { return .init(ticket: t, source: "url", category: cat) }
-        if let t = ctx.branch.flatMap(exactTicket(from:)) { return .init(ticket: t, source: "branch", category: cat) }
-        if let t = exactTicket(from: ctx.title) { return .init(ticket: t, source: "title", category: cat) }
-        for c in ctx.commits where exactTicket(from: c) != nil {
-            return .init(ticket: exactTicket(from: c), source: "commit", category: cat)
+        if let t = ctx.url.flatMap({ exactTicket(from: $0, source: .url) }) { return .init(ticket: t, source: "url", category: cat) }
+        if let t = ctx.branch.flatMap({ exactTicket(from: $0, source: .branch) }) { return .init(ticket: t, source: "branch", category: cat) }
+        if let t = exactTicket(from: ctx.title, source: .title) { return .init(ticket: t, source: "title", category: cat) }
+        for c in ctx.commits {
+            if let t = exactTicket(from: c, source: .commit) { return .init(ticket: t, source: "commit", category: cat) }
         }
         // The commit message you're typing right now often names the ticket — strong + current.
-        if let t = ctx.scmMessage.flatMap(exactTicket(from:)) { return .init(ticket: t, source: "commit", category: cat) }
-        if let t = ctx.aiSession.flatMap(exactTicket(from:)) { return .init(ticket: t, source: "session", category: cat) }
+        if let t = ctx.scmMessage.flatMap({ exactTicket(from: $0, source: .commit) }) { return .init(ticket: t, source: "commit", category: cat) }
+        if let t = ctx.aiSession.flatMap({ exactTicket(from: $0, source: .session) }) { return .init(ticket: t, source: "session", category: cat) }
+
+        // 1a) Reviewing someone else's PR (window title "Pull request NNNN: ... - Repos") is an
+        // exception to "only your own assigned tickets get exact treatment" — the work item was
+        // resolved live via the AzDO API (see main.swift's PR-review resolver) specifically
+        // because you're looking at it right now, regardless of who it's assigned to.
+        if let prId = extractPRNumber(fromTitle: ctx.title), let t = prReviewTickets[prId] {
+            return .init(ticket: t.key, source: "prReview", category: cat)
+        }
 
         // 1b) A standing "this context is non-billable" rule resolves to no-ticket (still logged).
         // After exact keys, so an explicit key on a no-ticket app still wins.
@@ -377,9 +516,13 @@ final class Attribution {
             }
         }
 
-        // 2) A repeatedly-confirmed correction for this context short-circuits fusion.
+        // 2) A repeatedly-confirmed correction for this context short-circuits fusion. Gated by
+        // guessKeys/noTicketLabel like every other signal (buildFeatures' `allow`, below) — without
+        // this, a correction learned under a PREVIOUSLY configured provider would resolve as an
+        // exact, never-overridden attribution to a key the current corpus can't even recognize.
         let learned = corrections.best(forSignatures: ctx.signatures())
-        if let l = learned, l.count >= 2, !isExcluded(l.ticket) {
+        if let l = learned, l.count >= 2, !isExcluded(l.ticket),
+           guessKeys.contains(l.ticket) || l.ticket == config.noTicketLabel {
             return .init(ticket: l.ticket, source: "learned", category: cat,
                          confidence: 1.0, candidates: [TicketGuess(key: l.ticket, score: 1.0)])
         }
@@ -417,7 +560,7 @@ final class Attribution {
     /// stack. Kept small via its low reliability so it only breaks near-ties.
     private func normalizedPrior(forKey key: String) -> Double {
         guard let t = sprint.first(where: { $0.key.caseInsensitiveCompare(key) == .orderedSame }) else { return 0 }
-        return Swift.max(0, Swift.min(1, t.priorWeight(now: Date(), w: config.rankWeights) - 1.0))
+        return Swift.max(0, Swift.min(1, t.priorWeight(now: Date(), w: config.rankWeights, preferredStates: config.preferredTicketStatesLower) - 1.0))
     }
 
     /// Stiffen the auto-tag bar in noisy contexts: a workspace repo is trustworthy (1.0), web

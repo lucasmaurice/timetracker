@@ -13,8 +13,24 @@ enum AppPaths {
     }
 }
 
+/// Which issue tracker supplies the ticket/work-item corpus (`sprint.json`). Changing this needs
+/// a restart — `Config` is loaded once at launch and copied by value into every component.
+enum IssueProviderKind: String, Codable, CaseIterable {
+    case jira, azureDevOps
+}
+
+/// Which time-tracking system worklogs are submitted to. Changing this needs a restart.
+enum WorklogProviderKind: String, Codable, CaseIterable {
+    case tempo, sevenPace
+}
+
 /// User-tunable settings, loaded from config.json with sane defaults.
 struct Config: Codable {
+    /// Where tickets/work items come from. See `IssueProviderKind`.
+    var issueProvider: IssueProviderKind = .jira
+    /// Where worklogs are submitted. See `WorklogProviderKind`.
+    var worklogProvider: WorklogProviderKind = .tempo
+
     /// User is "idle" after this many seconds with no input.
     var idleSeconds: Double = 300
     /// Timesheet block model: a workday of `workdayHours` starting at `dayStartHour`, divided
@@ -71,6 +87,36 @@ struct Config: Codable {
     /// Don't fetch tickets untouched (no update/comment) in more than this many days. 0 = no limit.
     var jiraMaxAgeDays: Double = 180
 
+    // MARK: Azure DevOps (used when issueProvider == .azureDevOps)
+
+    /// Your Azure DevOps organization, e.g. the <org> in https://dev.azure.com/<org>.
+    var azureOrg: String = ""
+    /// Restrict work-item queries to one project. Empty = org-wide (assignee = @Me across every
+    /// project you have access to) — most people work across more than one AzDO project, the same
+    /// way ticketPrefixes already spans multiple Jira projects.
+    var azureProject: String = ""
+    /// Team used for iteration/sprint lookups (Settings → team name, not the project name). Empty
+    /// disables active-sprint detection for Azure Boards (inSprint stays false) rather than guessing.
+    var azureTeam: String = ""
+    /// Override the default "assigned to me, not done" WIQL entirely. Empty = use the built-in query.
+    var azureWiql: String = ""
+    /// Area paths to exclude from the corpus (prefix match), e.g. a noisy service-desk area with no
+    /// real project prefix to filter by the way Jira's excludedTickets globs can.
+    var azureExcludedAreas: [String] = []
+    /// Regex (first capture group = the numeric work-item id) recognizing a work item id embedded
+    /// in a branch name, e.g. the default matches "feature/48210-fix-thing".
+    var azureBranchKeyPattern: String = "(?:^|/)(\\d+)[-_]"
+    /// Mine Azure Repos PR→work-item links to seed the repo→ticket bridge (the git-mined signal Jira
+    /// gets for free from branch/commit ticket keys). Needs the PAT's Code (read) scope.
+    var azurePRBridgeEnabled: Bool = true
+
+    // MARK: 7pace (used when worklogProvider == .sevenPace)
+
+    /// Your 7pace/Azure DevOps organization for the Timetracker API host, https://<org>.timehub.7pace.com.
+    var sevenPaceOrg: String = ""
+    /// Activity type id (UUID) attached to every submitted worklog. Empty = omit the field.
+    var sevenPaceActivityTypeId: String = ""
+
     // MARK: Housekeeping / pruning
 
     /// Delete raw focus segments older than this many days. 0 = keep forever.
@@ -81,6 +127,15 @@ struct Config: Codable {
     var labelMaxCount: Int = 2000
     /// Tickets/patterns to NEVER track or suggest. Exact keys or globs, e.g. "EXCL-*", "GEN-9".
     var excludedTickets: [String] = []
+    /// Exact ticket/work-item STATE names (case-insensitive) that should rank above tickets in
+    /// any other state, even ones sharing the same broad category — e.g. an Azure Boards "Dev"
+    /// state, which usually categorizes as InProgress the same as "Active"/"Resolved" but means
+    /// something more specific. Empty = off. See rankWeights.preferredStateBoost for how much.
+    var preferredTicketStates: [String] = []
+    /// `preferredTicketStates`, pre-lowercased for direct comparison against a ticket's raw
+    /// status. Not stored — `Config` is copied by value at launch, so this stays cheap to compute
+    /// per call site rather than a second field that could drift out of sync with the list above.
+    var preferredTicketStatesLower: Set<String> { Set(preferredTicketStates.map { $0.lowercased() }) }
     /// Catch-all / common tickets always shown in the pickers (even if unassigned/old/done),
     /// e.g. the quarterly Continuous-Improvement epic "CLOUDINFRA-6081". Manual-pick only.
     var commonTickets: [String] = []
@@ -174,8 +229,26 @@ struct Config: Codable {
     var embeddingAutoTagThreshold: Double = 0.62
 
     static func load() -> Config {
-        guard let data = try? Data(contentsOf: AppPaths.configFile),
-              let cfg = try? JSONDecoder().decode(Config.self, from: data) else {
+        guard let data = try? Data(contentsOf: AppPaths.configFile) else {
+            let cfg = Config()
+            cfg.saveIfAbsent()
+            return cfg
+        }
+        // JSONDecoder throws on ANY missing key, even when the Swift property has a default value
+        // (`decode(Config.self, ...)` alone would have silently discarded every existing setting
+        // the first time a new field like `issueProvider` was added and an older config.json on
+        // disk didn't have it). Layer the on-disk JSON over a freshly-serialized default Config's
+        // JSON first, so old files pick up new fields' defaults without losing anything else.
+        if let defaultsData = try? JSONEncoder().encode(Config()),
+           var merged = try? JSONSerialization.jsonObject(with: defaultsData) as? [String: Any],
+           let onDisk = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            for (k, v) in onDisk { merged[k] = v }
+            if let mergedData = try? JSONSerialization.data(withJSONObject: merged),
+               let cfg = try? JSONDecoder().decode(Config.self, from: mergedData) {
+                return cfg
+            }
+        }
+        guard let cfg = try? JSONDecoder().decode(Config.self, from: data) else {
             let cfg = Config()
             cfg.saveIfAbsent()
             return cfg
@@ -239,6 +312,12 @@ struct RankWeights: Codable {
     var recent3dBoost: Double = 1.3     // updated in last 3 days
     var recent14dBoost: Double = 1.1    // updated in last 14 days
     var stale60dPenalty: Double = 0.8   // untouched > 60 days
+    /// Boost for a ticket whose raw status NAME (not just its broader category — see
+    /// Config.preferredTicketStates) is one you've flagged as "actively being worked". Exists
+    /// because a custom process template can have several states sharing one category: e.g. an
+    /// Azure Boards "Dev" state categorizes as InProgress, same as "Active" and "Resolved", but
+    /// means something more specific day to day that the category alone can't distinguish.
+    var preferredStateBoost: Double = 1.3
 }
 
 struct CategoryRule: Codable {

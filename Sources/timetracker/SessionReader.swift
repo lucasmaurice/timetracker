@@ -34,9 +34,15 @@ final class SessionReader {
 
     private var claudeProjects: URL { fm.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects") }
 
-    /// Claude Code encodes the cwd by replacing "/" and "." with "-".
+    /// Claude Code encodes the cwd by replacing every non-alphanumeric character with "-" — NOT
+    /// just "/" and "." as originally assumed here. Confirmed against a real path containing "@"
+    /// (a domain-joined remote account, "lmaurice@progi.local"): the real encoded directory name
+    /// had no "@" in it, which a "/"-and-"."-only replacement would have left in place, silently
+    /// missing every session for that path. Doesn't change behavior for typical Mac paths (no
+    /// special characters beyond "/" and "."), which is why this went unnoticed until a path with
+    /// an unusual character actually hit it.
     private func encodeCwd(_ path: String) -> String {
-        String(path.map { $0 == "/" || $0 == "." ? "-" : $0 })
+        String(path.map { $0.isASCII && ($0.isLetter || $0.isNumber) ? $0 : "-" })
     }
 
     private func claudeCodeForRepo(_ repoPath: String) -> String? {
@@ -75,10 +81,26 @@ final class SessionReader {
         }
         var parts: [String] = []
         if let title { parts.append(title) }
-        // Last 3 prompts, skipping our own one-word controls.
-        let recent = userMsgs.filter { $0.count > 4 }.suffix(3).map { String($0.prefix(200)) }
+        // Last 3 REAL prompts: skip one-word controls and Claude Code's own command/skill
+        // scaffolding, which is injected as synthetic "user" turns (slash-command wrappers, whole
+        // skill files loaded as "Base directory for this skill: ..."). Without this, those
+        // synthetic turns crowd the actual prompt out of the last-3 window — confirmed on a real
+        // transcript where a /commit-push-pr invocation buried the real request under its own
+        // command wrapper and the full skill file content.
+        let recent = userMsgs.filter { $0.count > 4 && !Self.looksSynthetic($0) }.suffix(3).map { String($0.prefix(200)) }
         parts.append(contentsOf: recent)
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// True for Claude Code's own injected scaffolding (slash-command wrappers, skill-file
+    /// content, hook/system output) rather than something you actually typed.
+    private static let syntheticMarkers = [
+        "<command-message>", "<command-name>", "<command-args>",
+        "<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>",
+        "<system-reminder>", "Base directory for this skill:",
+    ]
+    private static func looksSynthetic(_ text: String) -> Bool {
+        syntheticMarkers.contains { text.contains($0) }
     }
 
     private static func userText(_ message: Any?) -> String? {

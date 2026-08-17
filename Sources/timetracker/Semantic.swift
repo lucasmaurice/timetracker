@@ -20,10 +20,10 @@ final class TicketMatcher {
 
     var isAvailable: Bool { !ticketVecs.isEmpty }
 
-    func index(_ tickets: [Ticket], weights: RankWeights) {
+    func index(_ tickets: [Ticket], weights: RankWeights, preferredStates: Set<String> = []) {
         cache.removeAll()
         let now = Date()
-        let docs = tickets.map { (key: $0.key, toks: Self.tokens($0.matchText), prior: $0.priorWeight(now: now, w: weights)) }
+        let docs = tickets.map { (key: $0.key, toks: Self.tokens($0.matchText), prior: $0.priorWeight(now: now, w: weights, preferredStates: preferredStates)) }
         var df: [String: Int] = [:]
         for d in docs { for t in Set(d.toks) { df[t, default: 0] += 1 } }
         let n = Double(max(docs.count, 1))

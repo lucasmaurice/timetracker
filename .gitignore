@@ -12,10 +12,13 @@ DerivedData/
 *.perspectivev3
 xcuserdata/
 
-# Node / VSCode extension (editor-extension)
+# Node / VSCode extensions (editor-extension, editor-extension-bridge)
 editor-extension/node_modules/
 editor-extension/out/
 editor-extension/*.vsix
+editor-extension-bridge/node_modules/
+editor-extension-bridge/out/
+editor-extension-bridge/*.vsix
 node_modules/
 
 # Build output

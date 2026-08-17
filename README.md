@@ -70,7 +70,7 @@ AI-session text (so an explicit key in any of them wins immediately):
 | Frontmost app + window title | NSWorkspace + Accessibility | Accessibility |
 | **Browser active-tab URL** | AppleScript to Chrome/Safari/Arc (skips Chrome incognito) | Automation |
 | **AI-session prompts** | Claude Code (`~/.claude/projects`, incl. `aiTitle`), Copilot (`workspaceStorage/*/chatSessions/*.jsonl` → `v.requests[].message.text`), Kiro (`workspace-sessions/<base64 path>` → newest session's history) | none (reads your own local files) |
-| **Editor extension** (optional) | VS Code / Kiro heartbeat: repo, branch, file, **symbol at cursor**, **commit-message draft**, **modified/recent files** (relative paths), **integrated-terminal commands**, active task / debug session. See [`editor-extension/`](editor-extension/) | none (extension writes a local file) |
+| **Editor extension** (optional) | VS Code / Kiro heartbeat: repo, branch, file, **symbol at cursor**, **commit-message draft**, **modified/recent files** (relative paths), **integrated-terminal commands** (off by default — `timetracker.captureTerminalCommands`, since a command line can carry secrets), active task / debug session. See [`editor-extension/`](editor-extension/) (+ [`editor-extension-bridge/`](editor-extension-bridge/) for Remote-SSH/Codespaces/WSL) | none (extension writes a local file, or hands it to the local Bridge extension over VS Code's own command bus — no network call either way) |
 | Git depth | branch + `git log -8` subjects + `git status` changed files + open file | none |
 | Kubernetes context | `kubectl config current-context` (+ namespace) | none |
 | Dev processes | `pgrep` for terraform/kubectl/helm/k9s/vault/… | none |
@@ -83,7 +83,14 @@ The optional **[editor extension](editor-extension/)** (VS Code / Kiro) sharpens
 signals: it writes a local heartbeat with the exact repo/branch/file (no title parsing), the
 symbol you're editing, and the `terraform`/`kubectl` commands you run in the integrated terminal.
 TimeTracker reads it when an editor is frontmost; without it, everything still works from titles +
-git. Build/install: `cd editor-extension && npm install && npm run package`, then install the VSIX.
+git. Build/install (both this and its Remote-SSH companion, see below): `./scripts/build-editor-extensions.sh`.
+
+**Remote-SSH / Codespaces / WSL:** also needs **[`editor-extension-bridge`](editor-extension-bridge/)**
+installed locally — it's what actually gets the heartbeat off the remote host and onto your Mac,
+over VS Code's own command-routing bridge (no SSH config, no new network surface). The build
+script above installs it locally automatically; it prints the one remaining manual step (copying
+the collector's VSIX onto the remote host itself, which the script can't reach). See that
+extension's README for why the collector alone isn't enough for a remote workspace.
 
 The LLM (`qwen3:4b` via local Ollama) is **event-driven**: it fires when the deterministic
 fusion (lexical + memory + repo + embeddings) is still undecided for the current context, and
@@ -145,9 +152,11 @@ A clock icon appears in the menu bar showing the current ticket (or category / `
 ## Sprint picklist
 
 The app reads `~/Library/Application Support/TimeTracker/sprint.json` for its ticket
-picklist and validation. There are two ways to populate it.
+picklist and validation. Which issue tracker fills it is set by **Settings → Provider → Issue
+tracker** (`config.issueProvider`: `jira` or `azureDevOps`) — switching needs a restart, like every
+other setting. Jira has two ways to populate it; Azure DevOps has one.
 
-### In-app API token (recommended)
+### In-app API token (Jira, recommended)
 
 The app authenticates to Jira with **Basic auth** (your email + a personal API token) routed
 through the `api.atlassian.com/ex/jira/{cloudId}` gateway, fetches your open tickets, and writes
@@ -186,15 +195,50 @@ export ATLASSIAN_SITE=yourcompany ATLASSIAN_EMAIL=you@company.com ATLASSIAN_API_
 Either way, the file format is:
 
 ```json
-{ "updated": "2026-06-01T12:00:00Z",
+{ "provider": "jira", "updated": "2026-06-01T12:00:00Z",
   "tickets": [ { "key": "CLOUDINFRA-1234", "summary": "Fix node draining" } ] }
 ```
+
+### Azure DevOps work items
+
+With **Settings → Provider → Issue tracker = Azure DevOps**, the app authenticates with a
+**Personal Access Token** (HTTP Basic) instead of Jira's gateway, fetches work items assigned to
+you (`[System.AssignedTo] = @Me`), and writes the same `sprint.json` (stamped
+`"provider": "azureDevOps"` so a stale Jira file is never reused after switching).
+
+Setup:
+
+1. Create a token at `https://dev.azure.com/<org>/_usersSettings/tokens` with scopes **Work Items
+   (Read)** and **Code (Read)** (the second is for the Azure Repos PR→work-item bridge).
+2. In the menu bar: **Connect Azure DevOps (PAT)…** (has an "Open token page" button) → enter your
+   organization and the token.
+3. It validates against a cheap org-level call, then loads your work items. Use **Refresh sprint
+   list** anytime. **Disconnect Azure DevOps** removes the stored credentials.
+
+Notes:
+- The credential lives in the login Keychain, never in `config.json`. Bad credentials aren't saved.
+- Work items are queried **org-wide by default** (`azureProject` empty) — most people work across
+  more than one Azure DevOps project, the same way `ticketPrefixes` already spans multiple Jira
+  projects. Set `azureProject` in Settings to restrict to one.
+- Keys are shown/stored as `AB#12345` (Azure Boards' own commit-linking syntax). A bare number
+  (as Azure DevOps shows everywhere in its own UI) is still recognized when it matches an open
+  work item's id — see `azureBranchKeyPattern` in Settings if your team's branch naming needs a
+  different capture pattern than the default `feature/12345-fix-thing`.
+- `done`/ranking-boost state is resolved from each work item type's *live* state category, not a
+  fixed list — process templates vary per project and per type.
+- **Reviewing a teammate's PR is recognized too.** When the focused window title looks like Azure
+  Repos' PR page ("Pull request 32068: … - Repos"), the app resolves that PR's linked work item
+  live and treats it as an exact match for as long as you're on that window — regardless of who
+  it's assigned to. This is the one deliberate exception to the "focus logging never touches the
+  network" rule; it's scoped narrowly (only while that specific PR window is focused, cached 10
+  minutes) rather than widening the guess pool to your whole team's backlog.
 
 ## Configuration
 
 `~/Library/Application Support/TimeTracker/config.json` (created on first run). Notable keys:
 `idleSeconds`, `blockSplitHour`, `promptAfterUnknownMinutes`, `abstainNudgeMinutes`, `noTicketRules`, `promptCooldownMinutes`,
-`sampleSeconds`, `ticketPrefixes`, `workspaceGlobs`, `categoryRules`.
+`sampleSeconds`, `ticketPrefixes`, `workspaceGlobs`, `categoryRules`, `issueProvider`, `worklogProvider`,
+`azureOrg`, `azureProject`, `azureTeam`, `sevenPaceOrg`, `sevenPaceActivityTypeId`.
 
 ## Files
 
@@ -203,6 +247,9 @@ Either way, the file format is:
 | `Sources/timetracker/Store.swift` | SQLite schema + reads/writes + data-hygiene migration |
 | `Sources/timetracker/FocusMonitor.swift` | NSWorkspace events + AX title + idle, segmentation |
 | `Sources/timetracker/Attribution.swift` | exact-key + fusion attribution, normalization, repo bridge wiring |
+| `Sources/timetracker/Providers.swift` | `TicketKeyFormat` key-shape seam + `IssueProvider`/`WorklogProvider` protocols |
+| `Sources/timetracker/Atlassian.swift` / `AzureDevOps.swift` | Jira / Azure DevOps issue providers |
+| `Sources/timetracker/TempoClient.swift` / `SevenPaceClient.swift` | Tempo / 7pace worklog providers |
 | `Sources/timetracker/FusionRanker.swift` | calibrated late-fusion (per-signal squash + noisy-OR + policy) |
 | `Sources/timetracker/RepoTicketBridge.swift` | git-history repo→ticket mining (recency-decayed) |
 | `Sources/timetracker/LabelMemory.swift` | k-NN over your labeled examples (kind-weighted) |
@@ -219,3 +266,6 @@ Either way, the file format is:
 - Sprint sync uses `assignee = currentUser()`, not literal `openSprints()` — adjust the JQL if you want true sprint scope.
 - Ad-hoc signature: a clean rebuild keeps the same identity, but if macOS ever drops the
   Accessibility grant after an update, re-toggle it in System Settings.
+- 7pace's exact worklog-create response shape and whether it requires an explicit `userId` weren't
+  verifiable against a real tenant while this was built — the first real submit may need a small
+  fix in `SevenPaceClient.swift` if your tenant's response differs.

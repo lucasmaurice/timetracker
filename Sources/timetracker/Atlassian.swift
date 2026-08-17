@@ -11,7 +11,8 @@ import Foundation
 ///
 /// Credentials live in the login Keychain, never in config.json. Network calls happen only
 /// on Connect (cloud-id resolve + validate) and Refresh; focus logging stays fully offline.
-final class Atlassian {
+final class Atlassian: IssueProvider {
+    var displayName: String { "Jira" }
     struct Credentials: Codable { var site: String; var email: String; var token: String; var cloudId: String }
 
     private static let account = "api_credentials"
@@ -134,18 +135,6 @@ final class Atlassian {
         return ""
     }
 
-    private static func buildText(summary: String?, type: String?, epic: String?,
-                                  components: [String], labels: [String], description: String) -> String {
-        var parts: [String] = []
-        if let t = type { parts.append("[\(t)]") }
-        if let s = summary { parts.append(s) }
-        if let epic { parts.append("epic: \(epic)") }
-        if !components.isEmpty { parts.append("components: \(components.joined(separator: ", "))") }
-        if !labels.isEmpty { parts.append("labels: \(labels.joined(separator: ", "))") }
-        let desc = description.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !desc.isEmpty { parts.append("desc: \(desc.prefix(600))") }
-        return parts.joined(separator: " · ")
-    }
 
     /// Issue keys in the board's ACTIVE sprint(s), via the Jira Agile API — more reliable
     /// than sniffing the Sprint custom field. Empty set if the board has no active sprint
@@ -193,8 +182,8 @@ final class Atlassian {
         let done = ((statusObj?["statusCategory"] as? [String: Any])?["key"] as? String) == "done"
         let updated = f["updated"] as? String
         let desc = Self.flattenADF(f["description"])
-        let text = Self.buildText(summary: summary, type: type, epic: epic,
-                                  components: components, labels: labels, description: desc)
+        let text = Ticket.buildMatchText(summary: summary, type: type, epic: epic,
+                                        components: components, labels: labels, description: desc)
         // inSprint = in a board's active sprint (Agile API) OR the issue's Sprint custom field has
         // an active sprint (fallback for boards where the Agile sprint endpoint returns nothing).
         let inSprint = sprintKeys.contains(key) || Self.hasActiveSprint(f[sprintFieldId ?? ""])
@@ -229,8 +218,6 @@ final class Atlassian {
         cachedSprintFieldId = .some(id)
         return id
     }
-
-    struct RefreshResult { var total: Int; var open: Int }
 
     /// Fetch ALL tickets assigned to the user, paginating to completion (the data lake),
     /// and (over)write sprint.json. Returns total and not-done counts.
@@ -345,7 +332,7 @@ final class Atlassian {
         }
 
         let f = ISO8601DateFormatter()
-        let file = SprintFile(updated: f.string(from: Date()), tickets: all)
+        let file = SprintFile(provider: IssueProviderKind.jira.rawValue, updated: f.string(from: Date()), tickets: all)
         let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         try FileManager.default.createDirectory(at: AppPaths.dataDir, withIntermediateDirectories: true)
         try enc.encode(file).write(to: AppPaths.sprintFile)

@@ -3,10 +3,14 @@ import Foundation
 /// Minimal Tempo Cloud REST client (https://api.tempo.io/4) for posting worklogs.
 /// Tempo auth is SEPARATE from Jira — a Tempo API token (Settings → API integration in Tempo),
 /// stored in the Keychain. Read off-main via preload() to avoid blocking the UI on the prompt.
-final class TempoClient {
+/// Tempo's worklog author is a Jira accountId, so this client is handed the connected `Atlassian`
+/// instance to resolve it — `resolveAuthor()` is the only WorklogProvider method that needs it.
+final class TempoClient: WorklogProvider {
+    var displayName: String { "Tempo" }
     private static let account = "tempo_token"
     private static let base = "https://api.tempo.io/4"
     private let config: Config
+    private let atlassian: Atlassian
 
     private var loaded = false
     private var cachedToken: String?
@@ -16,22 +20,28 @@ final class TempoClient {
     private var worklogMap: [String: Int] = [:]
     private var mapFile: URL { AppPaths.dataDir.appendingPathComponent("tempo-worklogs.json") }
 
-    init(config: Config) {
+    init(config: Config, atlassian: Atlassian) {
         self.config = config
+        self.atlassian = atlassian
         if let data = try? Data(contentsOf: mapFile),
            let m = try? JSONDecoder().decode([String: Int].self, from: data) { worklogMap = m }
     }
 
     private func mapKey(day: String, block: String) -> String { "\(day)|\(block)" }
-    func worklogId(day: String, block: String) -> Int? { worklogMap[mapKey(day: day, block: block)] }
+    func worklogId(day: String, block: String) -> String? {
+        worklogMap[mapKey(day: day, block: block)].map(String.init)
+    }
+
+    /// The Tempo worklog author is your Jira account — Tempo has no separate identity of its own.
+    func resolveAuthor() async -> String? { await atlassian.accountId() }
 
     private func saveMap() {
         try? FileManager.default.createDirectory(at: AppPaths.dataDir, withIntermediateDirectories: true)
         if let data = try? JSONEncoder().encode(worklogMap) { try? data.write(to: mapFile, options: [.atomic]) }
     }
 
-    func setWorklogId(day: String, block: String, id: Int?) {
-        if let id { worklogMap[mapKey(day: day, block: block)] = id }
+    func setWorklogId(day: String, block: String, id: String?) {
+        if let id, let intId = Int(id) { worklogMap[mapKey(day: day, block: block)] = intId }
         else { worklogMap.removeValue(forKey: mapKey(day: day, block: block)) }
         saveMap()
     }
@@ -71,21 +81,23 @@ final class TempoClient {
     /// mandatory work attribute), which the caller surfaces so you see exactly what Tempo wants.
     /// Create a worklog; returns the tempoWorklogId (for later update/delete) when present.
     @discardableResult
-    func createWorklog(issueId: Int, accountId: String, date: String, startTime: String,
-                       seconds: Int, description: String) async throws -> Int? {
+    func createWorklog(issueId: String, author: String?, date: String, startTime: String,
+                       seconds: Int, description: String) async throws -> String? {
         guard let token = cachedToken else { throw TempoError.notConfigured }
+        guard let author else { throw TempoError.notConfigured }
+        guard let issueIdInt = Int(issueId) else { throw TempoError.badURL }
         guard let url = URL(string: "\(Self.base)/worklogs") else { throw TempoError.badURL }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let body: [String: Any] = [
-            "issueId": issueId,
+            "issueId": issueIdInt,
             "timeSpentSeconds": seconds,
             "startDate": date,
             "startTime": startTime,
             "description": description,
-            "authorAccountId": accountId,
+            "authorAccountId": author,
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, resp) = try await URLSession.shared.data(for: req)
@@ -94,11 +106,11 @@ final class TempoClient {
             throw TempoError.http(http.statusCode, String(String(data: data, encoding: .utf8)?.prefix(400) ?? ""))
         }
         let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        return obj?["tempoWorklogId"] as? Int
+        return (obj?["tempoWorklogId"] as? Int).map(String.init)
     }
 
     /// Delete a previously-created worklog. 404 (already gone) is tolerated.
-    func deleteWorklog(id: Int) async {
+    func deleteWorklog(id: String) async {
         guard let token = cachedToken, let url = URL(string: "\(Self.base)/worklogs/\(id)") else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "DELETE"

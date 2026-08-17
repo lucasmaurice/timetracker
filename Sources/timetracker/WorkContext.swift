@@ -151,8 +151,12 @@ final class ContextEnricher {
             ctx.changedFiles = Array(merged.prefix(14))
         }
 
-        // Your own AI-session prompts (Claude Code / Copilot / Kiro) — highest signal.
-        ctx.aiSession = sessions.recentWork(repoPath: repoPath, now: now)
+        // Your own AI-session prompts (Claude Code / Copilot / Kiro) — highest signal. Prefer the
+        // editor extension's own reading when it supplied one: over Remote-SSH, the collector runs
+        // ON the remote host and reads Claude Code / Copilot state that lives there, which this
+        // process (running on the Mac) has no local path to at all. Falls back to the local reader
+        // for everything else (no editor frontmost, local workspace, or the editor found nothing).
+        ctx.aiSession = editor?.aiSession ?? sessions.recentWork(repoPath: repoPath, now: now)
 
         ctx.kubeContext = kubeContext(now: now)
         ctx.processes = devCommands(now: now)
@@ -179,6 +183,11 @@ final class ContextEnricher {
         var terminalCmds: [String]
         var task: String?
         var debugSession: String?
+        // Only populated over a remote connection (Remote-SSH/Codespaces/WSL) — the collector reads
+        // Claude Code / Copilot Chat state that lives on the remote host itself, which this Mac
+        // process has no local path to. For a local session this stays nil and SessionReader.swift
+        // supplies the same signal directly, unchanged from before this field existed.
+        var aiSession: String?
     }
 
     /// Bundle ids whose context the editor extension can supply, mapped to `vscode.env.appName`
