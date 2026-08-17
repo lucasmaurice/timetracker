@@ -38,6 +38,9 @@ install_local "editor-extension-bridge/timetracker-context-bridge.vsix" "Bridge"
 # but is NOT what makes remote sessions work — see the remote step below.
 install_local "editor-extension/timetracker-context.vsix" "Collector (local)"
 
+# Send the extension to remote:
+scp editor-extension/timetracker-context.vsix progi:/tmp/
+
 cat <<'EOF'
 
 Built:
