@@ -54,12 +54,14 @@ struct Ticket: Codable, Equatable {
     /// Ranking prior: not-done + active-sprint + recently-touched + In-Progress rank higher,
     /// so a large assigned backlog (incl. completed tickets kept for the data lake) doesn't
     /// dilute current work. Weights are configurable (Settings → Ranking weights).
-    func priorWeight(now: Date, w: RankWeights) -> Double {
-        priorBreakdown(now: now, w: w).reduce(1.0) { $0 * $1.factor }
+    /// `preferredStates` — pre-lowercased, from Config.preferredTicketStates — is checked against
+    /// the raw status name, one level more specific than `statusCategory` below can be.
+    func priorWeight(now: Date, w: RankWeights, preferredStates: Set<String> = []) -> Double {
+        priorBreakdown(now: now, w: w, preferredStates: preferredStates).reduce(1.0) { $0 * $1.factor }
     }
 
     /// Labeled multiplicative factors (for the Inspector). Only non-neutral factors are listed.
-    func priorBreakdown(now: Date, w: RankWeights) -> [(label: String, factor: Double)] {
+    func priorBreakdown(now: Date, w: RankWeights, preferredStates: Set<String> = []) -> [(label: String, factor: Double)] {
         var out: [(String, Double)] = []
         if done {
             out.append(("done", w.donePenalty))
@@ -70,6 +72,14 @@ struct Ticket: Codable, Equatable {
             let s = (status ?? "").lowercased()
             if s.contains("progress") { out.append(("In Progress", w.inProgressBoost)) }
             else if s.contains("review") { out.append(("In Review", w.inReviewBoost)) }
+        }
+        // A raw-state-name preference, distinct from (and finer-grained than) the category boost
+        // above: two states can share a category — e.g. Azure Boards' "Dev" and "Active" both
+        // categorize as InProgress — but only one of them might actually mean "someone's coding
+        // this right now" for your team. Not applied to a done ticket even if its literal state
+        // name happens to match, so a preference never overrides the done penalty.
+        if !done, let status, preferredStates.contains(status.lowercased()) {
+            out.append(("preferred state (\(status))", w.preferredStateBoost))
         }
         if inSprint { out.append(("active sprint", w.sprintBoost)) }
         if inQueue { out.append(("queue", w.queueBoost)) }
@@ -180,7 +190,7 @@ final class Attribution {
         let fileProvider = f.provider ?? IssueProviderKind.jira.rawValue
         guard fileProvider == config.issueProvider.rawValue else {
             sprint = []; guessTickets = []; guessKeys = []
-            if config.semanticEnabled { matcher.index([], weights: config.rankWeights) }
+            if config.semanticEnabled { matcher.index([], weights: config.rankWeights, preferredStates: config.preferredTicketStatesLower) }
             return
         }
         sprint = f.tickets.filter { !isExcluded($0.key) }   // drop excluded from the whole corpus
@@ -209,7 +219,7 @@ final class Attribution {
         guessTickets = pool
         guessKeys = Set(pool.map { $0.key })
 
-        if config.semanticEnabled { matcher.index(guessTickets, weights: config.rankWeights) }
+        if config.semanticEnabled { matcher.index(guessTickets, weights: config.rankWeights, preferredStates: config.preferredTicketStatesLower) }
     }
 
     // MARK: - Repo → ticket bridge (git history)
@@ -344,7 +354,7 @@ final class Attribution {
     /// Prior-weight breakdown for a ticket key (for the Inspector). Returns labeled factors + total.
     func priorBreakdown(forKey key: String) -> (factors: [(label: String, factor: Double)], total: Double)? {
         guard let t = sprint.first(where: { $0.key.caseInsensitiveCompare(key) == .orderedSame }) else { return nil }
-        let factors = t.priorBreakdown(now: Date(), w: config.rankWeights)
+        let factors = t.priorBreakdown(now: Date(), w: config.rankWeights, preferredStates: config.preferredTicketStatesLower)
         return (factors, factors.reduce(1.0) { $0 * $1.factor })
     }
 
@@ -510,7 +520,7 @@ final class Attribution {
     /// stack. Kept small via its low reliability so it only breaks near-ties.
     private func normalizedPrior(forKey key: String) -> Double {
         guard let t = sprint.first(where: { $0.key.caseInsensitiveCompare(key) == .orderedSame }) else { return 0 }
-        return Swift.max(0, Swift.min(1, t.priorWeight(now: Date(), w: config.rankWeights) - 1.0))
+        return Swift.max(0, Swift.min(1, t.priorWeight(now: Date(), w: config.rankWeights, preferredStates: config.preferredTicketStatesLower) - 1.0))
     }
 
     /// Stiffen the auto-tag bar in noisy contexts: a workspace repo is trustworthy (1.0), web

@@ -127,6 +127,15 @@ struct Config: Codable {
     var labelMaxCount: Int = 2000
     /// Tickets/patterns to NEVER track or suggest. Exact keys or globs, e.g. "EXCL-*", "GEN-9".
     var excludedTickets: [String] = []
+    /// Exact ticket/work-item STATE names (case-insensitive) that should rank above tickets in
+    /// any other state, even ones sharing the same broad category — e.g. an Azure Boards "Dev"
+    /// state, which usually categorizes as InProgress the same as "Active"/"Resolved" but means
+    /// something more specific. Empty = off. See rankWeights.preferredStateBoost for how much.
+    var preferredTicketStates: [String] = []
+    /// `preferredTicketStates`, pre-lowercased for direct comparison against a ticket's raw
+    /// status. Not stored — `Config` is copied by value at launch, so this stays cheap to compute
+    /// per call site rather than a second field that could drift out of sync with the list above.
+    var preferredTicketStatesLower: Set<String> { Set(preferredTicketStates.map { $0.lowercased() }) }
     /// Catch-all / common tickets always shown in the pickers (even if unassigned/old/done),
     /// e.g. the quarterly Continuous-Improvement epic "CLOUDINFRA-6081". Manual-pick only.
     var commonTickets: [String] = []
@@ -303,6 +312,12 @@ struct RankWeights: Codable {
     var recent3dBoost: Double = 1.3     // updated in last 3 days
     var recent14dBoost: Double = 1.1    // updated in last 14 days
     var stale60dPenalty: Double = 0.8   // untouched > 60 days
+    /// Boost for a ticket whose raw status NAME (not just its broader category — see
+    /// Config.preferredTicketStates) is one you've flagged as "actively being worked". Exists
+    /// because a custom process template can have several states sharing one category: e.g. an
+    /// Azure Boards "Dev" state categorizes as InProgress, same as "Active" and "Resolved", but
+    /// means something more specific day to day that the category alone can't distinguish.
+    var preferredStateBoost: Double = 1.3
 }
 
 struct CategoryRule: Codable {

@@ -80,6 +80,7 @@ struct SettingsView: View {
                     text("Always-no-ticket signatures", csv(\.noTicketRules), "Contexts that always resolve to no-ticket (still logged, non-billable), e.g. app:com.spotify.client, host:news.ycombinator.com. Built up via 'Mark as no-ticket'.")
                     text("'No ticket' → billing ticket", $model.config.noTicketTempoTicket, "Where to log no-ticket time in Tempo/7pace. Empty = skip those blocks (don't submit).")
                     toggle("Guess only from current sprint", $model.config.guessFromSprintOnly, "Restrict guesses to assigned tickets in the active sprint/iteration. Off by default (sprint detection is unreliable and this starves the pool). It still boosts ranking; this only limits eligibility.")
+                    text("Preferred states", csv(\.preferredTicketStates), "Exact state names (case-insensitive) that rank above tickets in any other state, even ones sharing the same broad category — e.g. Azure Boards' \"Dev\" state, which usually categorizes as In Progress the same as \"Active\"/\"Resolved\" but means something more specific. Empty = off. See Preferred-state boost below.")
                 }
 
                 if model.config.worklogProvider == .sevenPace {
@@ -137,6 +138,7 @@ struct SettingsView: View {
                     num("Recent <3d boost (×)", \.rankWeights.recent3dBoost, "Updated (comment/edit) in the last 3 days.")
                     num("Recent <14d boost (×)", \.rankWeights.recent14dBoost, "Updated in the last 14 days.")
                     num("Stale >60d penalty (×)", \.rankWeights.stale60dPenalty, "Untouched for over 60 days.")
+                    num("Preferred-state boost (×)", \.rankWeights.preferredStateBoost, "Applied when the ticket's raw state name is in Preferred states above (Tickets — shared section).")
                 }
 
                 Section("Housekeeping (pruning)") {
