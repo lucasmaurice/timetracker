@@ -26,6 +26,7 @@ swift build -c release
 
 cd editor-extension && npm install && npm run compile   # optional VS Code / Kiro extension
 cd editor-extension && npm run package                  # → timetracker-context.vsix
+cd editor-extension-bridge && npm install && npm run compile && npm run package  # Remote-SSH/Codespaces/WSL companion — install LOCALLY
 ```
 
 **Ad-hoc signing gotcha:** every rebuild changes the code hash, which invalidates the macOS

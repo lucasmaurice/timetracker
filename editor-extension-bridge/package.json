@@ -1,0 +1,36 @@
+{
+  "name": "timetracker-context-bridge",
+  "displayName": "TimeTracker Context Bridge",
+  "description": "Companion to TimeTracker Context: stays on your LOCAL machine (extensionKind ui) so the heartbeat still lands where the TimeTracker app can read it when your workspace is a Remote-SSH / Codespaces / WSL session. Receives data only via VS Code's own command bus from the paired collector extension — no network calls, no file access outside the heartbeat directory.",
+  "version": "0.1.0",
+  "publisher": "JusteReseau",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lucasmaurice/timetracker.git",
+    "directory": "editor-extension-bridge"
+  },
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx --yes @vscode/vsce package --skip-license -o timetracker-context-bridge.vsix",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.84.0",
+    "typescript": "^5.4.0"
+  }
+}

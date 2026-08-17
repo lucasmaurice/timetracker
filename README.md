@@ -70,7 +70,7 @@ AI-session text (so an explicit key in any of them wins immediately):
 | Frontmost app + window title | NSWorkspace + Accessibility | Accessibility |
 | **Browser active-tab URL** | AppleScript to Chrome/Safari/Arc (skips Chrome incognito) | Automation |
 | **AI-session prompts** | Claude Code (`~/.claude/projects`, incl. `aiTitle`), Copilot (`workspaceStorage/*/chatSessions/*.jsonl` → `v.requests[].message.text`), Kiro (`workspace-sessions/<base64 path>` → newest session's history) | none (reads your own local files) |
-| **Editor extension** (optional) | VS Code / Kiro heartbeat: repo, branch, file, **symbol at cursor**, **commit-message draft**, **modified/recent files** (relative paths), **integrated-terminal commands**, active task / debug session. See [`editor-extension/`](editor-extension/) | none (extension writes a local file) |
+| **Editor extension** (optional) | VS Code / Kiro heartbeat: repo, branch, file, **symbol at cursor**, **commit-message draft**, **modified/recent files** (relative paths), **integrated-terminal commands**, active task / debug session. See [`editor-extension/`](editor-extension/) (+ [`editor-extension-bridge/`](editor-extension-bridge/) for Remote-SSH/Codespaces/WSL) | none (extension writes a local file, or hands it to the local Bridge extension over VS Code's own command bus — no network call either way) |
 | Git depth | branch + `git log -8` subjects + `git status` changed files + open file | none |
 | Kubernetes context | `kubectl config current-context` (+ namespace) | none |
 | Dev processes | `pgrep` for terraform/kubectl/helm/k9s/vault/… | none |
@@ -84,6 +84,10 @@ signals: it writes a local heartbeat with the exact repo/branch/file (no title p
 symbol you're editing, and the `terraform`/`kubectl` commands you run in the integrated terminal.
 TimeTracker reads it when an editor is frontmost; without it, everything still works from titles +
 git. Build/install: `cd editor-extension && npm install && npm run package`, then install the VSIX.
+**Remote-SSH / Codespaces / WSL:** also install **[`editor-extension-bridge`](editor-extension-bridge/)**
+locally — it's what actually gets the heartbeat off the remote host and onto your Mac, over VS
+Code's own command-routing bridge (no SSH config, no new network surface). See that extension's
+README for why the collector alone isn't enough for a remote workspace.
 
 The LLM (`qwen3:4b` via local Ollama) is **event-driven**: it fires when the deterministic
 fusion (lexical + memory + repo + embeddings) is still undecided for the current context, and

@@ -1,8 +1,18 @@
-// TimeTracker Context — a tiny VS Code / Kiro extension that writes a per-workspace "heartbeat"
-// of the live editor context to a file the local TimeTracker app reads. This gives TimeTracker
-// reliable repo/branch/file plus signal it can't get from the outside: the symbol you're editing,
-// commands run in the integrated terminal, and the active task. 100% local — one JSON file, no
-// network. If TimeTracker isn't installed the file is simply never read.
+// TimeTracker Context — a tiny VS Code / Kiro extension that gathers a per-workspace "heartbeat"
+// of the live editor state and gets it to the local TimeTracker app: reliable repo/branch/file
+// (from the built-in Git extension), the symbol you're editing, commands run in the integrated
+// terminal, and the active task. No network calls, ever.
+//
+// This extension runs wherever the WORKSPACE lives — local, or the remote host when you're on
+// Remote-SSH/Codespaces/WSL — because it needs the git extension's exported API and other
+// workspace-scoped data that only exists there. When the workspace is local, that's also where
+// TimeTracker reads its heartbeat file from, so it writes directly. When the workspace is REMOTE,
+// direct writes would land on the remote machine's disk where TimeTracker can never see them — so
+// instead it hands the payload to the paired `timetracker-context-bridge` extension (which VS Code
+// always keeps on your local machine, via its own `extensionKind: ["ui"]`) over
+// `vscode.commands.executeCommand`, VS Code's own command-routing bridge. No network call, no file
+// access outside the heartbeat directory — everything travels inside VS Code's own already-
+// authenticated connection to the remote host.
 
 import * as vscode from 'vscode';
 import * as fs from 'fs';
@@ -15,17 +25,28 @@ const MAX_CMDS = 8;
 const HEARTBEAT_MS = 15000;
 
 let gitApi: any;
+let fileId = '';
 let outFile = '';
+let warnedMissingBridge = false;
 const recentFiles: string[] = [];
 const terminalCmds: string[] = [];
 let activeTask: string | undefined;
 let lastPayload: Record<string, unknown> = {};
 
+/// `vscode.env.remoteName` is undefined for a fully local session, and a string ("ssh-remote",
+/// "wsl", "codespaces", ...) whenever the workspace is remote — exactly what decides whether a
+/// direct local write would land on the wrong machine.
+function isRemote(): boolean {
+  return vscode.env.remoteName !== undefined;
+}
+
 export async function activate(ctx: vscode.ExtensionContext) {
-  try { fs.mkdirSync(CONTEXT_DIR, { recursive: true }); } catch { /* TimeTracker not installed yet */ }
+  // Local-write path only matters for non-remote sessions; harmless (and ignored) otherwise.
+  try { fs.mkdirSync(CONTEXT_DIR, { recursive: true }); } catch { /* TimeTracker not installed yet, or remote */ }
 
   const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  outFile = path.join(CONTEXT_DIR, hash(root ?? `no-folder-${process.pid}`) + '.json');
+  fileId = hash(root ?? `no-folder-${process.pid}`);
+  outFile = path.join(CONTEXT_DIR, fileId + '.json');
 
   // The built-in Git extension is the authoritative source for repo + branch.
   try {
@@ -68,6 +89,12 @@ export async function activate(ctx: vscode.ExtensionContext) {
 
 export function deactivate() {
   // Remove our heartbeat so a closed window isn't read as the focused one.
+  if (isRemote()) {
+    // Fire-and-forget: deactivate() isn't reliably awaited, and there's nothing useful to do if
+    // the bridge (or the command bus itself, mid-teardown) doesn't respond in time.
+    void Promise.resolve(vscode.commands.executeCommand('timetracker.removeHeartbeat', fileId)).catch(() => {});
+    return;
+  }
   try { if (outFile && fs.existsSync(outFile)) { fs.unlinkSync(outFile); } } catch { /* ignore */ }
 }
 
@@ -112,6 +139,23 @@ async function write() {
     debugSession: vscode.debug.activeDebugSession?.name,
   };
   lastPayload = payload;
+
+  if (isRemote()) {
+    try {
+      await vscode.commands.executeCommand('timetracker.receiveHeartbeat', fileId, payload);
+    } catch {
+      // Most likely cause: the timetracker-context-bridge companion isn't installed locally, so
+      // the command doesn't exist. Warn once (not every 15s heartbeat) rather than fail silently
+      // forever — a remote session with no bridge installed produces no attribution signal at all,
+      // and that's easy to mistake for TimeTracker itself not running.
+      if (!warnedMissingBridge) {
+        warnedMissingBridge = true;
+        void vscode.window.showWarningMessage(
+          'TimeTracker Context: install the "TimeTracker Context Bridge" extension locally to send editor context over this remote connection.');
+      }
+    }
+    return;
+  }
   try { if (outFile) { fs.writeFileSync(outFile, JSON.stringify(payload)); } } catch { /* ignore */ }
 }
 
@@ -140,8 +184,11 @@ function pushRecent(p: string) {
 }
 
 function showStatus() {
+  const dest = isRemote()
+    ? `sent via timetracker.receiveHeartbeat to the local TimeTracker Context Bridge (remote session: ${vscode.env.remoteName})`
+    : outFile;
   vscode.window.showInformationMessage(
-    `TimeTracker context → ${outFile}\n` + JSON.stringify(lastPayload, null, 0).slice(0, 300));
+    `TimeTracker context → ${dest}\n` + JSON.stringify(lastPayload, null, 0).slice(0, 300));
 }
 
 function debounce(fn: () => void | Promise<void>, ms: number): () => void {
