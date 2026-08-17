@@ -204,9 +204,12 @@ function newestFile(dir: string, exts: string[]): string | undefined {
   return best?.full;
 }
 
-// Claude Code encodes the cwd by replacing "/" and "." with "-" — same on every platform.
+// Claude Code encodes the cwd by replacing every non-alphanumeric character with "-" — same rule
+// SessionReader.swift uses (see its comment for how this was confirmed: a real path containing
+// "@" showed no "@" in the actual encoded directory name, which a "/"-and-"."-only replacement
+// would have left in place).
 function encodeCwd(p: string): string {
-  return p.split('').map((c) => (c === '/' || c === '.' ? '-' : c)).join('');
+  return p.replace(/[^a-zA-Z0-9]/g, '-');
 }
 
 function claudeCodeForRepo(repoPath: string): string | undefined {

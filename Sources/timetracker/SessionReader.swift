@@ -34,9 +34,15 @@ final class SessionReader {
 
     private var claudeProjects: URL { fm.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects") }
 
-    /// Claude Code encodes the cwd by replacing "/" and "." with "-".
+    /// Claude Code encodes the cwd by replacing every non-alphanumeric character with "-" — NOT
+    /// just "/" and "." as originally assumed here. Confirmed against a real path containing "@"
+    /// (a domain-joined remote account, "lmaurice@progi.local"): the real encoded directory name
+    /// had no "@" in it, which a "/"-and-"."-only replacement would have left in place, silently
+    /// missing every session for that path. Doesn't change behavior for typical Mac paths (no
+    /// special characters beyond "/" and "."), which is why this went unnoticed until a path with
+    /// an unusual character actually hit it.
     private func encodeCwd(_ path: String) -> String {
-        String(path.map { $0 == "/" || $0 == "." ? "-" : $0 })
+        String(path.map { $0.isASCII && ($0.isLetter || $0.isNumber) ? $0 : "-" })
     }
 
     private func claudeCodeForRepo(_ repoPath: String) -> String? {
