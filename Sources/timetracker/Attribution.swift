@@ -232,6 +232,13 @@ final class Attribution {
         repoBridge.rebuild(workspaceDirs: config.expandedWorkspaceDirs, now: now) { self.guessableExtract($0) }
     }
 
+    /// Merge `AzurePRBridge`-resolved (repo, [(key, ts)]) pairs into the repo→ticket bridge. MUST
+    /// be called after `rebuildRepoBridge` in the same pass — that call replaces the bridge's map
+    /// wholesale, which would silently wipe an earlier merge.
+    func ingestPRBridgeResults(_ results: [(repo: String, keys: [(key: String, ts: Double)])], now: Date = Date()) {
+        for r in results { repoBridge.ingestResolvedKeys(repo: r.repo, keys: r.keys, now: now) }
+    }
+
     /// Recency-decayed repo→ticket candidates for the current context, restricted to the
     /// guessable pool. The single strongest grounded signal when the branch names no key.
     func repoRank(_ ctx: WorkContext) -> [TicketGuess] { repoScore(repoName: ctx.repo) }

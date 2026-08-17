@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var summary: Summary!
     private var atlassian: Atlassian!
     private var azureDevOps: AzureDevOps!
+    private var azurePRBridge: AzurePRBridge!
     private var ollama: Ollama!
     private var tempo: TempoClient!
     private var sevenPace: SevenPaceClient!
@@ -62,6 +63,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         summary = Summary(store: store, config: config, attribution: attribution)
         atlassian = Atlassian(config: config)
         azureDevOps = AzureDevOps(config: config)
+        azurePRBridge = AzurePRBridge()
         ollama = Ollama(config: config)
         tempo = TempoClient(config: config, atlassian: atlassian)
         sevenPace = SevenPaceClient(config: config)
@@ -81,13 +83,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         monitor.start()
-        // Read the Keychain off-main (it can block on a permission prompt), then refresh.
+        // Read the Keychain off-main (it can block on a permission prompt), then refresh. The
+        // repo-bridge pass (which now also checks azureDevOps.configured, for the PR bridge) is
+        // chained inside this same completion instead of independently scheduled, so it can't
+        // race the preload and see credentials as "not configured" simply because it ran first.
         DispatchQueue.global(qos: .utility).async { [weak self] in
             self?.atlassian.preload()
             self?.tempo.preload()
+            self?.azureDevOps.preload()
+            self?.sevenPace.preload()
             DispatchQueue.main.async {
                 self?.rebuildMenu(current: self?.monitor.currentState)
-                self?.runRefresh(silent: true)   // freshen Jira on launch if connected
+                self?.runRefresh(silent: true)   // freshen the ticket corpus on launch if connected
+                self?.buildRepoBridgeAndBackfill()
             }
         }
         reindexEmbeddings()
@@ -99,7 +107,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         DispatchQueue.global(qos: .background).async { [weak self] in self?.housekeeping() }
-        buildRepoBridgeAndBackfill()
 
         promptTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.checkAbstainNudge()
@@ -121,16 +128,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Mine workspace git history into the repo→ticket bridge (every launch), and on first run
-    /// seed `labels` from that history (warm-start). All git/store work is off the main thread;
-    /// the in-memory label index is reloaded on main. Mirrors the housekeeping pattern.
+    /// seed `labels` from that history (warm-start). All git/store/network work is off the main
+    /// thread; the in-memory label index is reloaded on main. Mirrors the housekeeping pattern.
     private func buildRepoBridgeAndBackfill() {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             self.attribution.rebuildRepoBridge()
+            // MUST run after rebuildRepoBridge (above): that call replaces the bridge's map
+            // wholesale, so merging PR results first would have them silently wiped.
+            if self.config.issueProvider == .azureDevOps, self.config.azurePRBridgeEnabled, self.azureDevOps.configured {
+                let results = await self.azurePRBridge.resolve(
+                    workspaceDirs: self.config.expandedWorkspaceDirs, azureDevOps: self.azureDevOps, now: Date())
+                self.attribution.ingestPRBridgeResults(results)
+            }
             let firstRun = !UserDefaults.standard.bool(forKey: "ttBackfilledV1")
             let inserted = firstRun ? self.attribution.backfillFromHistory() : 0
             if firstRun { UserDefaults.standard.set(true, forKey: "ttBackfilledV1") }
-            DispatchQueue.main.async {
+            await MainActor.run {
                 // The bridge was (re)built after init's reloadSprint, so reload to widen the guess
                 // pool with freshly-mined keys and re-index the matcher/embeddings.
                 self.attribution.reloadSprint()
@@ -526,7 +540,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             UserDefaults.standard.set(remaining, forKey: "submittedDays")
         }
         store.pruneLabels(max: config.labelMaxCount)
-        tempo.pruneWorklogMap(olderThanDays: 90)   // resubmission no longer realistic past this
+        worklogProvider.pruneWorklogMap(olderThanDays: 90)   // resubmission no longer realistic past this
     }
 
     private func markSubmitted(day: String) {

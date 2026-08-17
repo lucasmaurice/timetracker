@@ -24,6 +24,9 @@ final class AzureDevOps: IssueProvider {
     private var cached: Credentials?
     private var credentials: Credentials? { cached }
     var configured: Bool { cached != nil }
+    /// The connected organization, for `AzurePRBridge` to skip repos hosted in a different org
+    /// than the PAT is scoped to (a PAT is always single-org).
+    var connectedOrg: String? { cached?.org }
 
     func preload() {
         guard !loaded else { return }
@@ -78,6 +81,53 @@ final class AzureDevOps: IssueProvider {
     func fetchIssueId(forKey key: String) async -> String? {
         AzureBoardsKeyFormat(branchPattern: config.azureBranchKeyPattern).canonicalize(key)
             .flatMap { $0.hasPrefix("AB#") ? String($0.dropFirst(3)) : nil }
+    }
+
+    // MARK: - Pull requests (for AzurePRBridge)
+
+    struct PullRequestSummary { var id: Int; var title: String; var description: String; var sourceBranch: String; var closedDate: String? }
+
+    /// Recently completed PRs for a repo — one call, not paginated further; a repo→ticket signal
+    /// only needs recent history, and the decay in `RepoTicketBridge` makes old PRs contribute
+    /// almost nothing anyway. `repo` accepts the repository name directly (the API takes name or
+    /// GUID interchangeably), so no separate name→id lookup is needed.
+    func listCompletedPullRequests(project: String, repo: String, top: Int = 200) async -> [PullRequestSummary]? {
+        guard let base = try? orgBase() else { return nil }
+        let projPath = project.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? project
+        let repoPath = repo.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repo
+        guard let url = URL(string: "\(base)/\(projPath)/_apis/git/repositories/\(repoPath)/pullrequests"
+            + "?searchCriteria.status=completed&$top=\(top)&api-version=7.1") else { return nil }
+        struct Resp: Decodable {
+            struct PR: Decodable { var pullRequestId: Int; var title: String?; var description: String?; var sourceRefName: String?; var closedDate: String? }
+            var value: [PR]
+        }
+        guard let req = try? authedRequest(url: url),
+              let (data, resp) = try? await URLSession.shared.data(for: req),
+              (try? Self.check(resp, data)) != nil,
+              let parsed = try? JSONDecoder().decode(Resp.self, from: data)
+        else { return nil }
+        return parsed.value.map {
+            PullRequestSummary(id: $0.pullRequestId, title: $0.title ?? "", description: $0.description ?? "",
+                               sourceBranch: $0.sourceRefName ?? "", closedDate: $0.closedDate)
+        }
+    }
+
+    /// Work items linked to one PR — the fallback for PRs where no key was found in
+    /// title/description/branch text. Bounded to the unresolved remainder by the caller
+    /// (`AzurePRBridge`), since this is one call per PR and AzDO throttles aggressively.
+    func workItemsLinkedToPullRequest(project: String, repo: String, pullRequestId: Int) async -> [String] {
+        guard let base = try? orgBase() else { return [] }
+        let projPath = project.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? project
+        let repoPath = repo.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? repo
+        guard let url = URL(string: "\(base)/\(projPath)/_apis/git/repositories/\(repoPath)/pullRequests/\(pullRequestId)/workitems?api-version=7.1")
+        else { return [] }
+        struct Resp: Decodable { struct Ref: Decodable { var id: String }; var value: [Ref] }
+        guard let req = try? authedRequest(url: url),
+              let (data, resp) = try? await URLSession.shared.data(for: req),
+              (try? Self.check(resp, data)) != nil,
+              let parsed = try? JSONDecoder().decode(Resp.self, from: data)
+        else { return [] }
+        return parsed.value.map { "AB#\($0.id)" }
     }
 
     // MARK: - WIQL → workitemsbatch → sprint.json

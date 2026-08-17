@@ -173,10 +173,15 @@ final class RepoTicketBridge {
 
     private func ingest(into stats: inout [String: Stat], occurrences: [(String, Double)],
                         now: Date, extract: (String) -> String?) {
+        ingestKeyed(into: &stats, occurrences: occurrences.compactMap { text, ts in
+            extract(text).map { (key: $0, ts: ts) }
+        }, now: now)
+    }
+
+    private func ingestKeyed(into stats: inout [String: Stat], occurrences: [(key: String, ts: Double)], now: Date) {
         let nowTs = now.timeIntervalSince1970
         let halfLifeSecs = halfLifeDays * 86400
-        for (text, ts) in occurrences {
-            guard let key = extract(text) else { continue }
+        for (key, ts) in occurrences {
             let age = max(0, nowTs - ts)
             let decay = ts > 0 ? pow(0.5, age / halfLifeSecs) : 0.25  // undated ref: small flat weight
             var s = stats[key] ?? Stat(score: 0, lastSeen: 0)
@@ -184,6 +189,21 @@ final class RepoTicketBridge {
             s.lastSeen = Swift.max(s.lastSeen, ts)
             stats[key] = s
         }
+    }
+
+    /// Merge externally-resolved (key, timestamp) pairs into a repo's stats — used by the Azure
+    /// Repos PR→work-item bridge, whose keys come from a network lookup rather than a regex over
+    /// local text, so they can't flow through `rebuild`'s synchronous `extract` closure. MUST run
+    /// **after** `rebuild()` for the same repos: `rebuild` replaces `map` wholesale, so calling
+    /// this first would have its merge silently wiped.
+    func ingestResolvedKeys(repo: String, keys: [(key: String, ts: Double)], now: Date) {
+        guard !keys.isEmpty else { return }
+        queue.sync {
+            var stats = map[repo] ?? [:]
+            ingestKeyed(into: &stats, occurrences: keys, now: now)
+            map[repo] = stats
+        }
+        save()
     }
 
     // MARK: - Persistence
