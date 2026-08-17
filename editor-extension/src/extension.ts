@@ -323,8 +323,26 @@ function showStatus() {
   const dest = isRemote()
     ? `sent via timetracker.receiveHeartbeat to the local TimeTracker Context Bridge (remote session: ${vscode.env.remoteName})`
     : outFile;
+  // AI-session path diagnostics — only meaningful (and only computed) when remote, since that's
+  // the only case where aiSessionRemote's path-matching can silently miss due to an environment
+  // mismatch (e.g. os.homedir() resolving differently across process contexts on domain-joined
+  // accounts) that's otherwise invisible from the outside.
+  let diag = '';
+  if (isRemote()) {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const home = os.homedir();
+    const claudeDir = root ? path.join(home, '.claude', 'projects', encodeCwd(root)) : undefined;
+    const copilotBase = path.join(vscodeServerDataDir(), 'User', 'workspaceStorage');
+    diag = '\n--- ai-session diagnostics ---'
+      + `\nos.homedir() = ${home}`
+      + `\nworkspaceRoot = ${root}`
+      + `\nclaudeDir = ${claudeDir}`
+      + `\nclaudeDir exists = ${claudeDir ? fs.existsSync(claudeDir) : 'n/a (no workspace root)'}`
+      + `\nvscodeServerDataDir = ${vscodeServerDataDir()}`
+      + `\ncopilot workspaceStorage exists = ${fs.existsSync(copilotBase)}`;
+  }
   vscode.window.showInformationMessage(
-    `TimeTracker context → ${dest}\n` + JSON.stringify(lastPayload, null, 0).slice(0, 300));
+    `TimeTracker context → ${dest}${diag}\n` + JSON.stringify(lastPayload, null, 0).slice(0, 300));
 }
 
 function debounce(fn: () => void | Promise<void>, ms: number): () => void {
