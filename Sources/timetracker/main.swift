@@ -56,6 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var embedCandidates: [TicketGuess] = []
     private var embedInFlight = false
     private var lastEmbedDoc: String?
+    private var prReviewInFlight: Set<Int> = []
 
     func applicationDidFinishLaunching(_ note: Notification) {
         store = Store()
@@ -79,7 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         monitor.onUpdate = { [weak self] state in
             DispatchQueue.main.async {
-                self?.updateStatus(state); self?.recordArc(state); self?.maybeEmbed(state)
+                self?.updateStatus(state); self?.recordArc(state); self?.maybeEmbed(state); self?.maybeResolvePRReview(state)
             }
         }
         monitor.start()
@@ -1216,6 +1217,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let cur = monitor.currentState, cur.attribution.ticket == nil, !cur.attribution.candidates.isEmpty {
                 llmRefine()
             }
+        }
+    }
+
+    /// If the focused window is a PR you're reviewing (title "Pull request NNNN: ... - Repos")
+    /// and its linked work item hasn't been resolved yet this session, fetch it live regardless of
+    /// who it's assigned to — a code review is real work on someone else's ticket, not something
+    /// the "assigned to me" corpus should have to already contain. Guarded so this doesn't touch
+    /// the network on every sample: `prReviewInFlight` avoids a duplicate request while one is
+    /// outstanding, and `!Attribution.isExact` skips it entirely once resolved (from then on the
+    /// exact-match check in `decideAttribution` fires purely from Attribution's in-memory cache).
+    private func maybeResolvePRReview(_ state: LiveState?) {
+        guard config.issueProvider == .azureDevOps, config.azurePRBridgeEnabled, azureDevOps.configured,
+              let st = state, !st.idle, !Attribution.isExact(st.attribution.source),
+              let prId = attribution.extractPRNumber(fromTitle: st.context.title),
+              !prReviewInFlight.contains(prId)
+        else { return }
+        prReviewInFlight.insert(prId)
+        Task { @MainActor in
+            defer { self.prReviewInFlight.remove(prId) }
+            guard let ticket = await self.azureDevOps.resolveWorkItem(forPullRequestId: prId) else { return }
+            self.attribution.cachePRReviewTicket(prId: prId, ticket: ticket)
+            self.refineCurrent()
         }
     }
 

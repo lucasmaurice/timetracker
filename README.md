@@ -226,6 +226,12 @@ Notes:
   different capture pattern than the default `feature/12345-fix-thing`.
 - `done`/ranking-boost state is resolved from each work item type's *live* state category, not a
   fixed list — process templates vary per project and per type.
+- **Reviewing a teammate's PR is recognized too.** When the focused window title looks like Azure
+  Repos' PR page ("Pull request 32068: … - Repos"), the app resolves that PR's linked work item
+  live and treats it as an exact match for as long as you're on that window — regardless of who
+  it's assigned to. This is the one deliberate exception to the "focus logging never touches the
+  network" rule; it's scoped narrowly (only while that specific PR window is focused, cached 10
+  minutes) rather than widening the guess pool to your whole team's backlog.
 
 ## Configuration
 

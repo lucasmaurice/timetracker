@@ -130,6 +130,73 @@ final class AzureDevOps: IssueProvider {
         return parsed.value.map { "AB#\($0.id)" }
     }
 
+    // MARK: - Live PR-review resolution (for the "reviewing someone else's ticket" exact match)
+
+    private struct PRLookup: Decodable {
+        struct Repo: Decodable { var id: String; var project: Proj }
+        struct Proj: Decodable { var name: String }
+        var repository: Repo
+    }
+
+    private var prResolutionCache: [Int: (ticket: Ticket?, ts: Date)] = [:]
+    private static let prCacheTTL: TimeInterval = 600  // 10 min — covers one review session
+
+    /// Live, on-demand resolution of the work item linked to a PR you're actively reviewing
+    /// (window title "Pull request NNNN: ... - Repos") — regardless of who it's assigned to.
+    /// Deliberately NOT part of `refreshSprint`'s "assigned to me" corpus: this is a narrow
+    /// exception carved out for the moment you're reviewing someone else's PR, not a general
+    /// widening of the guess pool to the whole team's backlog. Cached briefly per PR id so
+    /// repeated attribution samples during one review don't re-hit the API on every tick.
+    func resolveWorkItem(forPullRequestId prId: Int) async -> Ticket? {
+        if let cached = prResolutionCache[prId], Date().timeIntervalSince(cached.ts) < Self.prCacheTTL {
+            return cached.ticket
+        }
+        let ticket = await fetchWorkItemForPR(prId)
+        prResolutionCache[prId] = (ticket, Date())
+        return ticket
+    }
+
+    /// Two calls: the PR is looked up org-wide by id alone (no repo/project known yet from a
+    /// window title), which yields the repo + project needed for the existing linked-work-items
+    /// lookup; then one work item's fields are fetched to build a real `Ticket` (state category,
+    /// match text) instead of a bare key.
+    private func fetchWorkItemForPR(_ prId: Int) async -> Ticket? {
+        guard let base = try? orgBase(),
+              let lookupURL = URL(string: "\(base)/_apis/git/pullrequests/\(prId)?api-version=7.1"),
+              let req = try? authedRequest(url: lookupURL),
+              let (data, resp) = try? await URLSession.shared.data(for: req),
+              (try? Self.check(resp, data)) != nil,
+              let pr = try? JSONDecoder().decode(PRLookup.self, from: data)
+        else { return nil }
+
+        let keys = await workItemsLinkedToPullRequest(project: pr.repository.project.name, repo: pr.repository.id, pullRequestId: prId)
+        guard let workItemId = keys.first.flatMap({ $0.hasPrefix("AB#") ? Int($0.dropFirst(3)) : nil }),
+              let items = try? await batchFetch(ids: [workItemId], fields: Self.fetchFields),
+              let item = items.first
+        else { return nil }
+        return await ticket(fromBatchItem: item)
+    }
+
+    /// Field-mapping shared with `refreshSprint` below, minus area-exclusion/parent-epic lookup
+    /// (not worth another round trip for a single ad hoc ticket resolved this way).
+    private func ticket(fromBatchItem item: BatchItem) async -> Ticket {
+        let f = item.fields
+        let areaPath = f["System.AreaPath"]?.stringValue ?? ""
+        let type = f["System.WorkItemType"]?.stringValue ?? ""
+        let state = f["System.State"]?.stringValue ?? ""
+        let categories = await stateCategories(forType: type, project: areaPath.split(separator: "\\").first.map(String.init) ?? config.azureProject)
+        let category = categories[state]
+        let done = category == "Completed" || category == "Removed"
+        let title = f["System.Title"]?.stringValue ?? ""
+        let tags = (f["System.Tags"]?.stringValue ?? "").split(separator: ";").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        let description = Self.stripHTML(f["System.Description"]?.stringValue ?? f["Microsoft.VSTS.TCM.ReproSteps"]?.stringValue ?? "")
+        let text = Ticket.buildMatchText(summary: title, type: type, epic: nil, components: [areaPath], labels: tags, description: description)
+        return Ticket(key: "AB#\(item.id)", summary: title, text: text, status: state,
+                      updated: f["System.ChangedDate"]?.stringValue, done: done,
+                      inSprint: false, inQueue: false, common: false,
+                      issueId: "\(item.id)", statusCategory: category)
+    }
+
     // MARK: - WIQL → workitemsbatch → sprint.json
 
     private struct WiqlResponse: Decodable { struct Ref: Decodable { var id: Int }; var workItems: [Ref] }

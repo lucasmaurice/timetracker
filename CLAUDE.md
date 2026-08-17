@@ -222,9 +222,22 @@ specifically to avoid clobbering unrelated in-flight edits. Every field in `Conf
 comment explaining what it does — `SettingsView` surfaces essentially all of them with that help text.
 
 **Network boundary.** Only the active issue provider's connect/refresh, the active worklog
-provider's submit, and localhost Ollama touch the network. Focus logging is entirely offline. Keep
-it that way — it is the app's central promise, restated in the README, the Info.plist usage
-strings, and the `Store` header comment.
+provider's submit, localhost Ollama, and — the one deliberate exception — live PR-review
+resolution touch the network. Focus logging is entirely offline. Keep it that way — it is the
+app's central promise, restated in the README, the Info.plist usage strings, and the `Store`
+header comment.
+
+**PR-review resolution (the network-boundary exception).** When the focused window title matches
+Azure Repos' PR-review format ("Pull request NNNN: … - Repos" — both the web UI and VS Code use
+it), `main.swift`'s `maybeResolvePRReview` calls `AzureDevOps.resolveWorkItem(forPullRequestId:)`
+live, regardless of who the linked work item is assigned to, and caches the result in
+`Attribution.prReviewTickets` (source `"prReview"`, added to `Attribution.exactSources` — a
+resolved PR review is never second-guessed by embedding/LLM refinement). This is intentionally
+*not* a widening of `guessTickets`/`sprint.json`'s "assigned to me" corpus — reviewing a
+teammate's PR is real work on their ticket, but the general guess pool should still stay scoped to
+your own assigned work. `AzureDevOps` caches the resolution 10 minutes per PR id so repeated
+attribution samples during one review don't re-hit the API, and `maybeResolvePRReview` skips
+entirely once `Attribution.isExact` is already true for the segment — no polling.
 
 **Privacy layers are distinct.** `excludedApps`/`excludedWindowPatterns` record *nothing* (the
 window title isn't even read); `noTicketRules` still log the time but resolve it to no-ticket. Idle

@@ -165,7 +165,7 @@ final class Attribution {
     /// Attribution sources that must never be overridden by an async refinement (embedding/LLM):
     /// the exact-key matches plus explicit human/learned signals. Fused sources
     /// (semantic/memory/repo/embed/llm/guess) are refinable as more evidence arrives.
-    static let exactSources: Set<String> = ["url", "branch", "title", "commit", "session", "learned", "manual", "pinned"]
+    static let exactSources: Set<String> = ["url", "branch", "title", "commit", "session", "learned", "manual", "pinned", "prReview"]
     static func isExact(_ source: String?) -> Bool { source.map { exactSources.contains($0) } ?? false }
 
     /// True if a ticket key is on the exclusion list (exact or glob match).
@@ -440,6 +440,38 @@ final class Attribution {
         return nil
     }
 
+    /// Matches Azure Repos' PR-review window title ("Pull request 32068: Add new php7.4 node 24
+    /// image - Repos"), both the web UI and VS Code use this format. Only the PR number matters
+    /// here — the resolved work item is a DIFFERENT id space than a ticket key, so this can't
+    /// reuse `keyFormat.extract`.
+    private static let prTitleRegex = try! NSRegularExpression(pattern: "(?i)pull request (\\d+)")
+    func extractPRNumber(fromTitle title: String) -> Int? {
+        let range = NSRange(title.startIndex..., in: title)
+        guard let m = Self.prTitleRegex.firstMatch(in: title, range: range),
+              let r = Range(m.range(at: 1), in: title) else { return nil }
+        return Int(title[r])
+    }
+
+    /// PR id -> its linked work item, resolved live and kept only for this run (never persisted
+    /// to sprint.json — it's a narrow, moment-specific exception, not a corpus widening). Set by
+    /// the async resolver in main.swift once the network round trip completes; from then on the
+    /// exact-match check in `decideAttribution` below fires purely from this in-memory map, no
+    /// further network on the hot attribution path.
+    private var prReviewTickets: [Int: Ticket] = [:]
+
+    /// Called once a PR's linked work item is fetched. Merges the ticket into the live guess pool
+    /// too (not just the PR-id cache) so ranking/lexical-match/priorBreakdown treat it like any
+    /// other candidate if it also turns up via other signals — e.g. its own title/branch.
+    func cachePRReviewTicket(prId: Int, ticket: Ticket) {
+        prReviewTickets[prId] = ticket
+        if !guessKeys.contains(ticket.key) {
+            guessKeys.insert(ticket.key)
+            guessTickets.append(ticket)
+            if config.semanticEnabled { matcher.index(guessTickets, weights: config.rankWeights, preferredStates: config.preferredTicketStatesLower) }
+        }
+        if !sprint.contains(where: { $0.key == ticket.key }) { sprint.append(ticket) }
+    }
+
     /// Attribute a moment of work from its enriched context, using only the synchronous
     /// (deterministic) signals. The async layers (embedding, LLM) re-run `decideAttribution`
     /// with their extra evidence once available.
@@ -466,6 +498,14 @@ final class Attribution {
         // The commit message you're typing right now often names the ticket — strong + current.
         if let t = ctx.scmMessage.flatMap({ exactTicket(from: $0, source: .commit) }) { return .init(ticket: t, source: "commit", category: cat) }
         if let t = ctx.aiSession.flatMap({ exactTicket(from: $0, source: .session) }) { return .init(ticket: t, source: "session", category: cat) }
+
+        // 1a) Reviewing someone else's PR (window title "Pull request NNNN: ... - Repos") is an
+        // exception to "only your own assigned tickets get exact treatment" — the work item was
+        // resolved live via the AzDO API (see main.swift's PR-review resolver) specifically
+        // because you're looking at it right now, regardless of who it's assigned to.
+        if let prId = extractPRNumber(fromTitle: ctx.title), let t = prReviewTickets[prId] {
+            return .init(ticket: t.key, source: "prReview", category: cat)
+        }
 
         // 1b) A standing "this context is non-billable" rule resolves to no-ticket (still logged).
         // After exact keys, so an explicit key on a no-ticket app still wins.
