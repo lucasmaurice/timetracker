@@ -236,8 +236,24 @@ function summarizeClaudeJSONL(file: string): string | undefined {
   }
   const parts: string[] = [];
   if (title) { parts.push(title); }
-  parts.push(...userMsgs.filter((m) => m.length > 4).slice(-3).map((m) => m.slice(0, 200)));
+  // Last 3 REAL prompts: skip one-word controls and Claude Code's own command/skill scaffolding,
+  // injected as synthetic "user" turns (slash-command wrappers, whole skill files loaded as "Base
+  // directory for this skill: ..."). Without this, those synthetic turns crowd the actual prompt
+  // out of the last-3 window — confirmed on a real transcript (see SessionReader.swift, the
+  // canonical version of this logic, for the exact case that surfaced it).
+  parts.push(...userMsgs.filter((m) => m.length > 4 && !looksSynthetic(m)).slice(-3).map((m) => m.slice(0, 200)));
   return parts.length ? parts.join(' · ') : undefined;
+}
+
+// True for Claude Code's own injected scaffolding (slash-command wrappers, skill-file content,
+// hook/system output) rather than something you actually typed.
+const SYNTHETIC_MARKERS = [
+  '<command-message>', '<command-name>', '<command-args>',
+  '<local-command-stdout>', '<local-command-stderr>', '<local-command-caveat>',
+  '<system-reminder>', 'Base directory for this skill:',
+];
+function looksSynthetic(text: string): boolean {
+  return SYNTHETIC_MARKERS.some((m) => text.includes(m));
 }
 
 function claudeUserText(message: any): string | undefined {

@@ -81,10 +81,26 @@ final class SessionReader {
         }
         var parts: [String] = []
         if let title { parts.append(title) }
-        // Last 3 prompts, skipping our own one-word controls.
-        let recent = userMsgs.filter { $0.count > 4 }.suffix(3).map { String($0.prefix(200)) }
+        // Last 3 REAL prompts: skip one-word controls and Claude Code's own command/skill
+        // scaffolding, which is injected as synthetic "user" turns (slash-command wrappers, whole
+        // skill files loaded as "Base directory for this skill: ..."). Without this, those
+        // synthetic turns crowd the actual prompt out of the last-3 window — confirmed on a real
+        // transcript where a /commit-push-pr invocation buried the real request under its own
+        // command wrapper and the full skill file content.
+        let recent = userMsgs.filter { $0.count > 4 && !Self.looksSynthetic($0) }.suffix(3).map { String($0.prefix(200)) }
         parts.append(contentsOf: recent)
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// True for Claude Code's own injected scaffolding (slash-command wrappers, skill-file
+    /// content, hook/system output) rather than something you actually typed.
+    private static let syntheticMarkers = [
+        "<command-message>", "<command-name>", "<command-args>",
+        "<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>",
+        "<system-reminder>", "Base directory for this skill:",
+    ]
+    private static func looksSynthetic(_ text: String) -> Bool {
+        syntheticMarkers.contains { text.contains($0) }
     }
 
     private static func userText(_ message: Any?) -> String? {
