@@ -652,18 +652,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.informativeText = "Create a Tempo API token in Tempo → Settings → API integration, then paste it here. (Separate from your Jira token.)"
         alert.addButton(withTitle: "Connect")
         alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Open Tempo settings")
+
+        let stack = NSStackView(); stack.orientation = .vertical; stack.spacing = 6
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
         field.placeholderString = "Tempo API token"
-        alert.accessoryView = field
-        alert.window.initialFirstResponder = field
-        let resp = alert.runModal()
-        if resp == .alertThirdButtonReturn {
-            let site = atlassian.site ?? "id.atlassian.com"
+        let openButton = linkButton("Open Tempo settings") { [weak self] in
+            let site = self?.atlassian.site ?? "id.atlassian.com"
             NSWorkspace.shared.open(URL(string: "https://\(site)/plugins/servlet/ac/io.tempo.jira/tempo-app#!/configuration/api-integration")!)
-            return promptForTempoToken()
         }
-        guard resp == .alertFirstButtonReturn else { return nil }
+        stack.addArrangedSubview(field)
+        stack.addArrangedSubview(openButton)
+        stack.frame = NSRect(x: 0, y: 0, width: 320, height: 56)
+        alert.accessoryView = stack
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         let t = field.stringValue.trimmingCharacters(in: .whitespaces)
         return t.isEmpty ? nil : t
     }
@@ -1055,35 +1057,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.messageText = "Connect Azure DevOps (Personal Access Token)"
         alert.informativeText = """
-        Create a token at https://dev.azure.com/<org>/_usersSettings/tokens with scopes \
-        Work Items (Read) and Code (Read), then enter:
-          • Organization: your <org> (the part before .visualstudio.com, or after dev.azure.com/)
-          • Personal Access Token
+        Enter your organization, then use “Open token page” below to create a token. Azure \
+        DevOps has no way to preselect scopes via link — on the page, choose "Custom defined" \
+        and check exactly:
+          • Work Items — Read
+          • Code — Read
         """
         alert.addButton(withTitle: "Connect")
         alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Open token page")
+
         let stack = NSStackView(); stack.orientation = .vertical; stack.spacing = 6
         let orgField = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
         orgField.placeholderString = "Organization (e.g. contoso)"
         orgField.stringValue = config.azureOrg
+        let openButton = linkButton("Open token page") { [orgField] in
+            let org = orgField.stringValue.trimmingCharacters(in: .whitespaces)
+            let path = org.isEmpty ? "https://dev.azure.com/_usersSettings/tokens" : "https://dev.azure.com/\(org)/_usersSettings/tokens"
+            if let url = URL(string: path) { NSWorkspace.shared.open(url) }
+        }
+        let scopesLabel = NSTextField(labelWithString: "Required scopes: Work Items (Read), Code (Read)")
+        scopesLabel.font = .boldSystemFont(ofSize: NSFont.smallSystemFontSize)
         let patField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
         patField.placeholderString = "Personal Access Token"
         stack.addArrangedSubview(orgField)
+        stack.addArrangedSubview(openButton)
+        stack.addArrangedSubview(scopesLabel)
         stack.addArrangedSubview(patField)
-        stack.frame = NSRect(x: 0, y: 0, width: 340, height: 60)
+        stack.frame = NSRect(x: 0, y: 0, width: 340, height: 110)
         alert.accessoryView = stack
         alert.window.initialFirstResponder = orgField
-        let resp = alert.runModal()
-        if resp == .alertThirdButtonReturn {
-            NSWorkspace.shared.open(URL(string: "https://dev.azure.com/\(orgField.stringValue)/_usersSettings/tokens")!)
-            return promptForAzureDevOpsPAT()
-        }
-        guard resp == .alertFirstButtonReturn else { return nil }
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         let org = orgField.stringValue.trimmingCharacters(in: .whitespaces)
         let pat = patField.stringValue.trimmingCharacters(in: .whitespaces)
         guard !org.isEmpty, !pat.isEmpty else { return nil }
         return (org, pat)
+    }
+
+    /// A plain button inside an alert's accessory view, as opposed to one of `NSAlert`'s own
+    /// `addButton`s — clicking one of THOSE always ends the modal session (that's how
+    /// `runModal()` returns), which is what made "Open token page" close the whole connect
+    /// dialog and lose anything already typed. A button that isn't wired through
+    /// `addButton`/`runModal`'s return value can be clicked without ending the modal at all.
+    /// NSButton needs an Objective-C target/action, not a Swift closure, hence the trampoline.
+    private final class ActionTrampoline: NSObject {
+        let action: () -> Void
+        init(_ action: @escaping () -> Void) { self.action = action }
+        @objc func invoke() { action() }
+    }
+    private static var trampolineKey: UInt8 = 0
+    private func linkButton(_ title: String, action: @escaping () -> Void) -> NSButton {
+        let trampoline = ActionTrampoline(action)
+        let button = NSButton(title: title, target: trampoline, action: #selector(ActionTrampoline.invoke))
+        button.bezelStyle = .inline
+        // Retain the trampoline for as long as the button exists — NSButton's `target` is unowned.
+        objc_setAssociatedObject(button, &Self.trampolineKey, trampoline, .OBJC_ASSOCIATION_RETAIN)
+        return button
     }
 
     @objc private func disconnectAtlassian() {
@@ -1110,35 +1138,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.messageText = "Connect Atlassian (API token)"
         alert.informativeText = """
-        Create a token at id.atlassian.com → Security → API tokens, then enter:
+        Use “Open token page” below to create a token, then enter:
           • Site: your <site> (e.g. acme, or acme.atlassian.net)
           • Email: your Atlassian account email
           • API token: the token you created
         """
         alert.addButton(withTitle: "Connect")
         alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Open token page")
 
-        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 340, height: 84))
-        stack.orientation = .vertical; stack.spacing = 6
+        let stack = NSStackView(); stack.orientation = .vertical; stack.spacing = 6
         let siteField = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
         siteField.placeholderString = "Site (e.g. acme)"
         let emailField = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
         emailField.placeholderString = "you@company.com"
+        let openButton = linkButton("Open token page") {
+            NSWorkspace.shared.open(URL(string: "https://id.atlassian.com/manage-profile/security/api-tokens")!)
+        }
+        let scopesLabel = NSTextField(labelWithString: "Required scopes: read:jira-work, read:jira-user (or read:me)")
+        scopesLabel.font = .boldSystemFont(ofSize: NSFont.smallSystemFontSize)
         let tokenField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
         tokenField.placeholderString = "API token"
         stack.addArrangedSubview(siteField)
         stack.addArrangedSubview(emailField)
+        stack.addArrangedSubview(openButton)
+        stack.addArrangedSubview(scopesLabel)
         stack.addArrangedSubview(tokenField)
+        stack.frame = NSRect(x: 0, y: 0, width: 340, height: 140)
         alert.accessoryView = stack
         alert.window.initialFirstResponder = siteField
 
-        let resp = alert.runModal()
-        if resp == .alertThirdButtonReturn {
-            NSWorkspace.shared.open(URL(string: "https://id.atlassian.com/manage-profile/security/api-tokens")!)
-            return promptForApiToken()   // re-show after opening the token page
-        }
-        guard resp == .alertFirstButtonReturn else { return nil }
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         let site = siteField.stringValue.trimmingCharacters(in: .whitespaces)
         let email = emailField.stringValue.trimmingCharacters(in: .whitespaces)
         let token = tokenField.stringValue.trimmingCharacters(in: .whitespaces)
