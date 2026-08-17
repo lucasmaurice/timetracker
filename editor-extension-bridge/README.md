@@ -22,20 +22,33 @@ to the same local file TimeTracker already reads.
 Code's own already-authenticated connection to the remote host.** It validates every incoming id
 against the collector's known filename format and caps payload size before writing anything.
 
-## Build & Install
+## Build & install (recommended)
 
-Identical to `editor-extension` — see that README. The only thing that matters here: make sure
-this one installs to your **local** machine, not the remote workspace (run *Install from VSIX*
-from a local window, or `code --install-extension` from a local terminal — not the remote-connected
-integrated terminal).
+From the repo root:
+
+```bash
+./scripts/build-editor-extensions.sh
+```
+
+Builds and installs/updates both this extension and the collector, locally. `--force` makes it
+safe to re-run any time you pull a change — it's an update, not just a first install. This is the
+only thing that needs to happen for this extension specifically: it must always be local, and the
+script only ever installs it locally, so there's no remote step for the Bridge (unlike the
+collector — see [`editor-extension`](../editor-extension) for that).
+
+## Build manually
 
 ```bash
 cd editor-extension-bridge
 npm install
 npm run compile
 npm run package           # → timetracker-context-bridge.vsix
-code --install-extension timetracker-context-bridge.vsix
+code --install-extension timetracker-context-bridge.vsix --force
 ```
+
+The only thing that matters if you do this by hand: make sure it installs to your **local**
+machine, not the remote workspace (run *Install from VSIX* from a local window, or
+`code --install-extension` from a local terminal — not the remote-connected integrated terminal).
 
 ## Verify
 

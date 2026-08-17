@@ -83,11 +83,14 @@ The optional **[editor extension](editor-extension/)** (VS Code / Kiro) sharpens
 signals: it writes a local heartbeat with the exact repo/branch/file (no title parsing), the
 symbol you're editing, and the `terraform`/`kubectl` commands you run in the integrated terminal.
 TimeTracker reads it when an editor is frontmost; without it, everything still works from titles +
-git. Build/install: `cd editor-extension && npm install && npm run package`, then install the VSIX.
-**Remote-SSH / Codespaces / WSL:** also install **[`editor-extension-bridge`](editor-extension-bridge/)**
-locally — it's what actually gets the heartbeat off the remote host and onto your Mac, over VS
-Code's own command-routing bridge (no SSH config, no new network surface). See that extension's
-README for why the collector alone isn't enough for a remote workspace.
+git. Build/install (both this and its Remote-SSH companion, see below): `./scripts/build-editor-extensions.sh`.
+
+**Remote-SSH / Codespaces / WSL:** also needs **[`editor-extension-bridge`](editor-extension-bridge/)**
+installed locally — it's what actually gets the heartbeat off the remote host and onto your Mac,
+over VS Code's own command-routing bridge (no SSH config, no new network surface). The build
+script above installs it locally automatically; it prints the one remaining manual step (copying
+the collector's VSIX onto the remote host itself, which the script can't reach). See that
+extension's README for why the collector alone isn't enough for a remote workspace.
 
 The LLM (`qwen3:4b` via local Ollama) is **event-driven**: it fires when the deterministic
 fusion (lexical + memory + repo + embeddings) is still undecided for the current context, and

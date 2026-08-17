@@ -24,9 +24,7 @@ swift build -c release
 ./scripts/install-launchagent.sh # start at login + relaunch on crash
 ./scripts/sync-sprint.sh         # offline sprint.json sync (needs a CLASSIC token; app stays offline)
 
-cd editor-extension && npm install && npm run compile   # optional VS Code / Kiro extension
-cd editor-extension && npm run package                  # → timetracker-context.vsix
-cd editor-extension-bridge && npm install && npm run compile && npm run package  # Remote-SSH/Codespaces/WSL companion — install LOCALLY
+./scripts/build-editor-extensions.sh      # builds + installs/updates both editor extensions locally
 ```
 
 **Ad-hoc signing gotcha:** every rebuild changes the code hash, which invalidates the macOS

@@ -28,39 +28,43 @@ To fix that, also install the companion **[`editor-extension-bridge`](../editor-
 on your local machine regardless of where the workspace is — this extension then hands it the
 heartbeat over `vscode.commands.executeCommand`, VS Code's own command-routing bridge, instead of
 writing a file directly. No SSH config, no new network surface: everything travels inside VS
-Code's own already-authenticated connection to the remote host. See that extension's own README
-for build/install — the steps below are identical, just in the other folder.
+Code's own already-authenticated connection to the remote host.
+
+`./scripts/build-editor-extensions.sh` (see below) builds and installs the Bridge locally for you
+automatically — the only manual step left is getting *this* extension onto the remote host itself,
+which the script prints instructions for.
 
 If you forget to install it, you'll get a one-time warning notification the first time a remote
 heartbeat fails to send, rather than silent nothing.
 
-## Build
+## Build & install (recommended)
+
+From the repo root, one script builds **and** installs/updates both this extension and the Bridge:
+
+```bash
+./scripts/build-editor-extensions.sh
+```
+
+It's idempotent (`--force`), so re-run it any time you pull a change to either extension — same
+command for a first install and for an update. It only reaches your **local** machine, though: for
+Remote-SSH/Codespaces/WSL it prints the extra manual step to get the collector onto the remote
+host (see [`editor-extension-bridge`](../editor-extension-bridge) for why that's a separate step).
+
+## Build manually
 
 ```bash
 cd editor-extension
 npm install
 npm run compile          # → out/extension.js
-```
-
-## Install
-
-**Option A — packaged VSIX (recommended, installs in both editors):**
-
-```bash
 npm run package          # → timetracker-context.vsix
 ```
 
-- VS Code: `code --install-extension timetracker-context.vsix`
-- Kiro:    `kiro --install-extension timetracker-context.vsix`
+- VS Code: `code --install-extension timetracker-context.vsix --force`
+- Kiro:    `kiro --install-extension timetracker-context.vsix --force`
   (or in either editor: Command Palette → *Extensions: Install from VSIX…*)
 
-Remote workflows: also build/install `editor-extension-bridge` the same way, but make sure it
-lands **locally** — e.g. run VS Code's *Install from VSIX* command while a *local* window (File →
-New Window, not the remote one) is focused, or use `code --install-extension` from a local
-terminal rather than the remote-connected integrated terminal.
-
-**Option B — dev run (no packaging):** open this folder in VS Code / Kiro and press **F5** to
-launch an Extension Development Host.
+**Dev run (no packaging):** open this folder in VS Code / Kiro and press **F5** to launch an
+Extension Development Host.
 
 ## Verify
 
