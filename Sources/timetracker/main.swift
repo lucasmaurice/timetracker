@@ -1568,6 +1568,40 @@ if CommandLine.arguments.contains("--eval") {
     exit(0)
 }
 
+// Headless period-compiler dump (`--dump-periods [--day yyyy-MM-dd]`): the manual-verification
+// vehicle for PeriodCompiler against the real local DB, ahead of any Review UI risk. Temporary —
+// remove once the Review UI is wired to periods and this is superseded by using the app directly.
+if CommandLine.arguments.contains("--dump-periods") {
+    let config = Config.load()
+    let store = Store()
+    let attribution = Attribution(config: config, store: store)
+    let ollama = Ollama(config: config)
+    var day = Date()
+    if let idx = CommandLine.arguments.firstIndex(of: "--day"), idx + 1 < CommandLine.arguments.count {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
+        if let d = f.date(from: CommandLine.arguments[idx + 1]) { day = d }
+    }
+    let sem = DispatchSemaphore(value: 0)
+    Task {
+        let periods = await PeriodCompiler.compile(day: day, config: config, store: store, attribution: attribution, ollama: ollama)
+        let hm = DateFormatter(); hm.dateFormat = "HH:mm"
+        print("Periods for \(TimeBlocks.dayString(day)):")
+        for p in periods {
+            let kind = p.kind.rawValue.padding(toLength: 10, withPad: " ", startingAt: 0)
+            let trueH = String(format: "%.2f", p.trueSeconds / 3600)
+            let repH = String(format: "%.2f", p.reportedSeconds / 3600)
+            print("  [\(p.seq)] \(kind) \(hm.string(from: p.start))–\(hm.string(from: p.end))  true=\(trueH)h reported=\(repH)h  ticket=\(p.effectiveTicket ?? "—")  source=\(p.guessSource ?? "-")")
+        }
+        let totalTrue = periods.reduce(0.0) { $0 + $1.trueSeconds } / 3600
+        let totalReported = periods.reduce(0.0) { $0 + $1.reportedSeconds } / 3600
+        let target = TimeBlocks.dailyTargetSeconds(day, config) / 3600
+        print(String(format: "Total: true=%.2fh reported=%.2fh target=%.2fh", totalTrue, totalReported, target))
+        sem.signal()
+    }
+    sem.wait()
+    exit(0)
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
