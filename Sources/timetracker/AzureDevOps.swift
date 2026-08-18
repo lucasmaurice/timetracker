@@ -174,12 +174,14 @@ final class AzureDevOps: IssueProvider {
               let items = try? await batchFetch(ids: [workItemId], fields: Self.fetchFields),
               let item = items.first
         else { return nil }
-        return await ticket(fromBatchItem: item)
+        // false: this is the one path that resolves a work item regardless of who it's assigned
+        // to — see `Ticket.assignedToMe`'s doc comment.
+        return await ticket(fromBatchItem: item, assignedToMe: false)
     }
 
     /// Field-mapping shared with `refreshSprint` below, minus area-exclusion/parent-epic lookup
     /// (not worth another round trip for a single ad hoc ticket resolved this way).
-    private func ticket(fromBatchItem item: BatchItem) async -> Ticket {
+    private func ticket(fromBatchItem item: BatchItem, assignedToMe: Bool) async -> Ticket {
         let f = item.fields
         let areaPath = f["System.AreaPath"]?.stringValue ?? ""
         let type = f["System.WorkItemType"]?.stringValue ?? ""
@@ -194,7 +196,7 @@ final class AzureDevOps: IssueProvider {
         return Ticket(key: "AB#\(item.id)", summary: title, text: text, status: state,
                       updated: f["System.ChangedDate"]?.stringValue, done: done,
                       inSprint: false, inQueue: false, common: false,
-                      issueId: "\(item.id)", statusCategory: category)
+                      issueId: "\(item.id)", statusCategory: category, assignedToMe: assignedToMe)
     }
 
     // MARK: - WIQL → workitemsbatch → sprint.json
@@ -358,7 +360,8 @@ final class AzureDevOps: IssueProvider {
                 key: key, summary: title, text: text, status: state,
                 updated: f["System.ChangedDate"]?.stringValue, done: done,
                 inSprint: false,  // resolved below, once, from the team's current iteration
-                inQueue: false, common: false, issueId: "\(item.id)", statusCategory: category))
+                inQueue: false, common: false, issueId: "\(item.id)", statusCategory: category,
+                assignedToMe: true))  // the WIQL is always "AssignedTo = @Me" — explicit for clarity
         }
 
         if let currentPath = await currentIterationPath() {

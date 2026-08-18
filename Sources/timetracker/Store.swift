@@ -22,6 +22,10 @@ struct Segment {
     /// window title — is what lets the Teach UI, content memory, and the evaluator see the *actual
     /// work*, and lets us replay/audit a guess after the fact. Local-only, like everything else.
     var contextDoc: String?
+    /// `WorkContext.meeting` at attribution time (app/keyword detected meeting label, e.g. a Teams
+    /// window title) — mirrors `contextDoc` but kept as its own column so the period compiler can
+    /// filter on it directly instead of parsing it back out of the free-text document.
+    var meeting: String?
 
     var duration: TimeInterval { end.timeIntervalSince(start) }
 }
@@ -67,6 +71,7 @@ final class Store {
         // already exists, so don't route these through the logging exec().
         sqlite3_exec(db, "ALTER TABLE segments ADD COLUMN confidence REAL;", nil, nil, nil)
         sqlite3_exec(db, "ALTER TABLE segments ADD COLUMN context_doc TEXT;", nil, nil, nil)
+        sqlite3_exec(db, "ALTER TABLE segments ADD COLUMN meeting TEXT;", nil, nil, nil)
         exec("""
         CREATE TABLE IF NOT EXISTS labels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,6 +88,23 @@ final class Store {
             ticket TEXT,
             note TEXT,
             PRIMARY KEY (day, block)
+        );
+        """)
+        // Periods replace block_assignments' role for the floating-period compiler (PeriodCompiler.swift).
+        // A separate table, not a repurposed block_assignments: a period's existence/shape is
+        // data-dependent (derived from that day's actual segments), unlike a block, which is a pure
+        // function of Config — so a period's kind/bounds must be snapshotted to keep `seq` stable
+        // across re-compilations (see PeriodCompiler's seq-matching logic).
+        exec("""
+        CREATE TABLE IF NOT EXISTS period_assignments (
+            day TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            start_ts INTEGER NOT NULL,
+            end_ts INTEGER NOT NULL,
+            ticket TEXT,
+            note TEXT,
+            PRIMARY KEY (day, seq)
         );
         """)
     }
@@ -103,8 +125,8 @@ final class Store {
     @discardableResult
     func insert(_ s: Segment) -> Int64 {
         let sql = """
-        INSERT INTO segments (start_ts,end_ts,bundle_id,app_name,window_title,idle,ticket,ticket_source,category,confidence,context_doc)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?);
+        INSERT INTO segments (start_ts,end_ts,bundle_id,app_name,window_title,idle,ticket,ticket_source,category,confidence,context_doc,meeting)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?);
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return -1 }
@@ -120,6 +142,7 @@ final class Store {
         bindText(stmt, 9, s.category)
         if let c = s.confidence { sqlite3_bind_double(stmt, 10, c) } else { sqlite3_bind_null(stmt, 10) }
         bindText(stmt, 11, s.contextDoc)
+        bindText(stmt, 12, s.meeting)
         guard sqlite3_step(stmt) == SQLITE_DONE else { return -1 }
         return sqlite3_last_insert_rowid(db)
     }
@@ -304,7 +327,7 @@ final class Store {
 
     /// All segments overlapping [start,end).
     func segments(from start: Date, to end: Date) -> [Segment] {
-        let sql = "SELECT id,start_ts,end_ts,bundle_id,app_name,window_title,idle,ticket,ticket_source,category,confidence,context_doc FROM segments WHERE end_ts>? AND start_ts<? ORDER BY start_ts;"
+        let sql = "SELECT id,start_ts,end_ts,bundle_id,app_name,window_title,idle,ticket,ticket_source,category,confidence,context_doc,meeting FROM segments WHERE end_ts>? AND start_ts<? ORDER BY start_ts;"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
         defer { sqlite3_finalize(stmt) }
@@ -324,7 +347,50 @@ final class Store {
                 ticketSource: colText(stmt, 8),
                 category: colText(stmt, 9),
                 confidence: sqlite3_column_type(stmt, 10) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 10),
-                contextDoc: colText(stmt, 11)
+                contextDoc: colText(stmt, 11),
+                meeting: colText(stmt, 12)
+            ))
+        }
+        return out
+    }
+
+    // MARK: - Period assignments (manual overrides for the floating-period compiler)
+
+    func setPeriodAssignment(day: String, seq: Int, kind: String, start: Date, end: Date, ticket: String?, note: String?) {
+        let sql = """
+        INSERT INTO period_assignments(day,seq,kind,start_ts,end_ts,ticket,note) VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(day,seq) DO UPDATE SET kind=excluded.kind, start_ts=excluded.start_ts, end_ts=excluded.end_ts, ticket=excluded.ticket, note=excluded.note;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, day)
+        sqlite3_bind_int(stmt, 2, Int32(seq))
+        bindText(stmt, 3, kind)
+        sqlite3_bind_int64(stmt, 4, Int64(start.timeIntervalSince1970))
+        sqlite3_bind_int64(stmt, 5, Int64(end.timeIntervalSince1970))
+        bindText(stmt, 6, ticket)
+        bindText(stmt, 7, note)
+        sqlite3_step(stmt)
+    }
+
+    /// All manually-saved periods for a day, for `PeriodCompiler`'s seq-matching against a fresh
+    /// compilation (see `PeriodCompiler.swift`'s "seq stability" note).
+    func periodAssignments(day: String) -> [(seq: Int, kind: String, start: Date, end: Date, ticket: String?, note: String?)] {
+        let sql = "SELECT seq,kind,start_ts,end_ts,ticket,note FROM period_assignments WHERE day=? ORDER BY seq;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, day)
+        var out: [(Int, String, Date, Date, String?, String?)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            out.append((
+                Int(sqlite3_column_int(stmt, 0)),
+                colText(stmt, 1) ?? "regular",
+                Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 2))),
+                Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 3))),
+                colText(stmt, 4),
+                colText(stmt, 5)
             ))
         }
         return out

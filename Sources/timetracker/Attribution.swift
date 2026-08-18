@@ -18,6 +18,45 @@ struct Ticket: Codable, Equatable {
     /// doesn't distinguish "in review" from "in progress", so Jira tickets leave this nil and fall
     /// back to the name-based heuristic below — this only takes over where it adds precision.
     var statusCategory: String?
+    /// True for every ticket populated the normal way (Jira's JQL, Azure DevOps' WIQL both already
+    /// mean "assigned to me"). Only ever `false` for a ticket resolved live via the PR-review path
+    /// (`AzureDevOps.resolveWorkItem(forPullRequestId:)`), which is explicitly allowed to surface a
+    /// teammate's work item — see `PeriodCompiler`'s regular-block candidate gate, which requires
+    /// this to be true (code-review periods deliberately don't).
+    var assignedToMe: Bool = true
+
+    init(key: String, summary: String, text: String? = nil, status: String? = nil, updated: String? = nil,
+         done: Bool = false, inSprint: Bool = false, inQueue: Bool = false, common: Bool = false,
+         issueId: String? = nil, statusCategory: String? = nil, assignedToMe: Bool = true) {
+        self.key = key; self.summary = summary; self.text = text; self.status = status; self.updated = updated
+        self.done = done; self.inSprint = inSprint; self.inQueue = inQueue; self.common = common
+        self.issueId = issueId; self.statusCategory = statusCategory; self.assignedToMe = assignedToMe
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case key, summary, text, status, updated, done, inSprint, inQueue, common, issueId, statusCategory, assignedToMe
+    }
+
+    /// A plain synthesized `Decodable` would throw on any `sprint.json` written before this field
+    /// existed (missing key on a non-Optional property, unlike `text`'s Optional-driven backward
+    /// compat above) — silently emptying the whole ticket corpus on the very next launch after an
+    /// update, exactly the `Config.load()` bug this project already hit once. `decodeIfPresent` +
+    /// the field's own default sidesteps it the same way.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        key = try c.decode(String.self, forKey: .key)
+        summary = try c.decode(String.self, forKey: .summary)
+        text = try c.decodeIfPresent(String.self, forKey: .text)
+        status = try c.decodeIfPresent(String.self, forKey: .status)
+        updated = try c.decodeIfPresent(String.self, forKey: .updated)
+        done = try c.decodeIfPresent(Bool.self, forKey: .done) ?? false
+        inSprint = try c.decodeIfPresent(Bool.self, forKey: .inSprint) ?? false
+        inQueue = try c.decodeIfPresent(Bool.self, forKey: .inQueue) ?? false
+        common = try c.decodeIfPresent(Bool.self, forKey: .common) ?? false
+        issueId = try c.decodeIfPresent(String.self, forKey: .issueId)
+        statusCategory = try c.decodeIfPresent(String.self, forKey: .statusCategory)
+        assignedToMe = try c.decodeIfPresent(Bool.self, forKey: .assignedToMe) ?? true
+    }
 
     /// What the lexical/embedding matcher sees (rich, includes the description).
     var matchText: String { (text?.isEmpty == false ? text! : summary) }
@@ -90,6 +129,18 @@ struct Ticket: Codable, Equatable {
             else if days > 60 { out.append(("stale >60d", w.stale60dPenalty)) }
         }
         return out
+    }
+
+    /// "Actively being worked" for `PeriodCompiler`'s regular-block candidate gate — mirrors the
+    /// exact fallback chain `priorBreakdown` above already uses (statusCategory, else
+    /// preferredTicketStates membership, else a name-based heuristic), since Jira tickets never
+    /// have `statusCategory` set at all: gating on `statusCategory == "InProgress"` literally would
+    /// make every Jira user's regular blocks abstain forever.
+    func isInProgressLike(preferredStates: Set<String>) -> Bool {
+        if done { return false }
+        if let statusCategory { return statusCategory == "InProgress" }
+        if let status, preferredStates.contains(status.lowercased()) { return true }
+        return (status ?? "").lowercased().contains("progress")
     }
 
     /// Jira's `updated` (and Azure Boards' `ChangedDate`) include fractional seconds

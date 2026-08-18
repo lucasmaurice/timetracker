@@ -187,9 +187,24 @@ final class Atlassian: IssueProvider {
         // inSprint = in a board's active sprint (Agile API) OR the issue's Sprint custom field has
         // an active sprint (fallback for boards where the Agile sprint endpoint returns nothing).
         let inSprint = sprintKeys.contains(key) || Self.hasActiveSprint(f[sprintFieldId ?? ""])
+        // parseTicket is shared by the "assignee = currentUser()" fetch AND the queue/common-JQL
+        // fetches (which explicitly pull in tickets that may not be assigned to you) — so check the
+        // issue's own assignee against the connected account rather than trusting which query found
+        // it. Falls back to `true` (Ticket's default) when neither identity field is available,
+        // since self-assigned is still the overwhelming majority case.
+        let assignee = f["assignee"] as? [String: Any]
+        let assignedToMe: Bool
+        if let acct = assignee?["accountId"] as? String, let mine = cachedAccountId {
+            assignedToMe = acct == mine
+        } else if let email = assignee?["emailAddress"] as? String, let mine = credentials?.email {
+            assignedToMe = email.caseInsensitiveCompare(mine) == .orderedSame
+        } else {
+            assignedToMe = true
+        }
         return Ticket(key: key, summary: summary, text: text, status: status, updated: updated,
                       done: done, inSprint: inSprint, inQueue: queueKeys.contains(key),
-                      common: commonKeys.contains(key.uppercased()), issueId: issue["id"] as? String)
+                      common: commonKeys.contains(key.uppercased()), issueId: issue["id"] as? String,
+                      assignedToMe: assignedToMe)
     }
 
     /// True if a Sprint custom-field value contains an active sprint. Jira Cloud returns an array
