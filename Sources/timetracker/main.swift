@@ -351,7 +351,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         case .azureDevOps:
             if azureDevOps.configured {
-                if let org = azureDevOps.connectedOrg { menu.addItem(disabled("Connected to Azure DevOps (\(org))")) }
+                if let org = azureDevOps.connectedOrg {
+                    let who = azureDevOps.connectedUser.map { "as \($0) " } ?? ""
+                    menu.addItem(disabled("Connected \(who)to \(org) (Azure DevOps)"))
+                }
                 let logout = NSMenuItem(title: "Disconnect Azure DevOps", action: #selector(disconnectAzureDevOps), keyEquivalent: "")
                 logout.target = self; menu.addItem(logout)
             } else {

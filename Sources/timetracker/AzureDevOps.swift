@@ -27,6 +27,12 @@ final class AzureDevOps: IssueProvider {
     /// The connected organization, for `AzurePRBridge` to skip repos hosted in a different org
     /// than the PAT is scoped to (a PAT is always single-org).
     var connectedOrg: String? { cached?.org }
+    /// The PAT owner's display name, for the menu's "Connected as … " line. Resolved lazily (once
+    /// per session, from `refreshSprint`) rather than at `preload()` — preload must stay
+    /// network-free (see CLAUDE.md's threading invariants), so this is nil until the first
+    /// refresh (launch or manual) completes.
+    private var cachedUser: String?
+    var connectedUser: String? { cachedUser }
 
     func preload() {
         guard !loaded else { return }
@@ -72,6 +78,23 @@ final class AzureDevOps: IssueProvider {
         let (data, resp) = try await URLSession.shared.data(for: try authedRequest(url: url))
         try Self.check(resp, data)
         return credentials?.org ?? "connected"
+    }
+
+    private struct Profile: Decodable { var displayName: String?; var emailAddress: String? }
+
+    /// The PAT owner's identity — a different host (`app.vssps.visualstudio.com`, not
+    /// `dev.azure.com`) than every other call in this file, so it can't reuse `orgBase()`. Cached
+    /// for the session; failures are silent (menu just omits the "as <user>" part) since this is
+    /// cosmetic, not required for anything functional.
+    private func resolveIdentity() async {
+        guard cachedUser == nil,
+              let url = URL(string: "https://app.vssps.visualstudio.com/_apis/profile/profiles/me?api-version=7.1"),
+              let req = try? authedRequest(url: url),
+              let (data, resp) = try? await URLSession.shared.data(for: req),
+              (try? Self.check(resp, data)) != nil,
+              let profile = try? JSONDecoder().decode(Profile.self, from: data)
+        else { return }
+        cachedUser = profile.displayName ?? profile.emailAddress
     }
 
     /// 7pace and worklog submission need no AzDO identity — `resolveAuthor` on `WorklogProvider`
@@ -343,8 +366,10 @@ final class AzureDevOps: IssueProvider {
     /// and (over)write sprint.json stamped for this provider. Mirrors `Atlassian.refreshSprint()`.
     @discardableResult
     func refreshSprint() async throws -> RefreshResult {
+        async let identity: () = resolveIdentity()   // independent of the WIQL/batch fetch below
         let ids = try await wiqlIds()
         let items = try await batchFetch(ids: ids, fields: Self.fetchFields)
+        await identity
 
         // Resolve parent titles in a second batch call — workitemsbatch doesn't expand relations.
         let parentIds = Set(items.compactMap { $0.fields["System.Parent"]?.stringValue.flatMap(Int.init) })
