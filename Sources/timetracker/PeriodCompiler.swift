@@ -22,6 +22,7 @@ struct Period: Identifiable {
     var assignedTicket: String?    // manual period_assignments override
     var assignedNote: String?
     var byTicket: [(ticket: String?, seconds: Double)]
+    var byCategory: [(category: String?, seconds: Double)]
     var contextDoc: String?
     var recap: String?
 
@@ -32,6 +33,8 @@ struct Period: Identifiable {
     }
     var hasActivity: Bool { trueSeconds >= 60 }
 }
+
+extension Period: PeriodicReport {}
 
 /// Builds a day's `[Period]` from its stored segments: carves out code-review (already tagged live
 /// by the PR-review feature), meeting/daily, and a fixed break, then floats the remaining active
@@ -69,7 +72,7 @@ enum PeriodCompiler {
             seq: 0, kind: .breakPeriod, start: bStart, end: bEnd, members: [],
             trueSeconds: config.breakDurationMinutes * 60, reportedSeconds: config.breakDurationMinutes * 60,
             ticket: config.breakTicket.isEmpty ? nil : config.breakTicket, guessSource: "break-fixed",
-            guessConfidence: nil, assignedTicket: nil, assignedNote: nil, byTicket: [], contextDoc: nil, recap: "Break"))
+            guessConfidence: nil, assignedTicket: nil, assignedNote: nil, byTicket: [], byCategory: [], contextDoc: nil, recap: "Break"))
 
         // 2. Code review — segments already tagged live (ticketSource == "prReview") by the
         // existing PR-review feature. No new detection: group into runs, keep the run's own ticket.
@@ -135,20 +138,23 @@ enum PeriodCompiler {
                                     members: [(segment: Segment, seconds: Double)],
                                     ticket: String?, guessSource: String?, guessConfidence: Double? = nil) -> Period {
         var ticketSecs: [String: Double] = [:]
+        var catSecs: [String: Double] = [:]
         var appSecs: [String: Double] = [:]
         var repDoc: (dur: Double, doc: String)?
         for (s, secs) in members {
             ticketSecs[s.ticket ?? "", default: 0] += secs
+            catSecs[s.category ?? "", default: 0] += secs
             appSecs[s.appName, default: 0] += secs
             if let d = s.contextDoc, !d.isEmpty, secs > (repDoc?.dur ?? 0) { repDoc = (secs, d) }
         }
         let byTicket = ticketSecs.sorted { $0.value > $1.value }.map { (ticket: $0.key.isEmpty ? nil : $0.key, seconds: $0.value) }
+        let byCategory = catSecs.sorted { $0.value > $1.value }.map { (category: $0.key.isEmpty ? nil : $0.key, seconds: $0.value) }
         let byApp = appSecs.sorted { $0.value > $1.value }.map { (app: $0.key, seconds: $0.value) }
         let trueSeconds = members.reduce(0) { $0 + $1.seconds }
         return Period(seq: 0, kind: kind, start: start, end: end, members: members,
                       trueSeconds: trueSeconds, reportedSeconds: trueSeconds, ticket: ticket,
                       guessSource: guessSource, guessConfidence: guessConfidence,
-                      assignedTicket: nil, assignedNote: nil, byTicket: byTicket,
+                      assignedTicket: nil, assignedNote: nil, byTicket: byTicket, byCategory: byCategory,
                       contextDoc: repDoc?.doc, recap: repDoc.map { Summary.recap(fromDoc: $0.doc, apps: byApp) })
     }
 
