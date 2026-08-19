@@ -81,18 +81,22 @@ final class AzureDevOps: IssueProvider {
         return credentials?.org ?? "connected"
     }
 
-    private struct Profile: Decodable { var displayName: String?; var emailAddress: String? }
+    private struct ConnectionData: Decodable {
+        struct AuthenticatedUser: Decodable { var providerDisplayName: String?; var customDisplayName: String? }
+        var authenticatedUser: AuthenticatedUser?
+    }
 
-    /// The PAT owner's identity — a different host (`app.vssps.visualstudio.com`, not
-    /// `dev.azure.com`) than every other call in this file, so it can't reuse `orgBase()`. Cached
-    /// for the session; a failure just means the menu omits the "as <user>" part (cosmetic, not
-    /// functional), but logs the actual status/body to stderr (~/Library/Application
-    /// Support/TimeTracker/stderr.log when run via the LaunchAgent) since this endpoint was never
-    /// verified against a real tenant and silently swallowing every failure mode made it
-    /// undebuggable the first time it didn't work.
+    /// The PAT owner's identity, via the same connection-negotiation endpoint AzDO's own tooling
+    /// (e.g. the git credential helper) uses to validate a PAT — confirmed needing no scope beyond
+    /// what's already granted for Work Items/Code, unlike the Profile API
+    /// (app.vssps.visualstudio.com/_apis/profile/profiles/me), which 401'd against a real PAT
+    /// scoped exactly as this app's own connect dialog instructs. Reuses `orgBase()` (same host as
+    /// every other call in this file). Cached for the session; a failure just means the menu omits
+    /// the "as <user>" part (cosmetic, not functional), but logs the actual status/body to stderr
+    /// (~/Library/Application Support/TimeTracker/stderr.log when run via the LaunchAgent).
     private func resolveIdentity() async {
         guard cachedUser == nil else { return }
-        guard let url = URL(string: "https://app.vssps.visualstudio.com/_apis/profile/profiles/me?api-version=7.1"),
+        guard let url = URL(string: "\((try? orgBase()) ?? "")/_apis/connectionData?api-version=7.1"),
               let req = try? authedRequest(url: url)
         else { return }
         guard let (data, resp) = try? await URLSession.shared.data(for: req) else {
@@ -106,14 +110,14 @@ final class AzureDevOps: IssueProvider {
             FileHandle.standardError.write("azdo identity: \(error.localizedDescription) — body: \(body)\n".data(using: .utf8)!)
             return
         }
-        guard let profile = try? JSONDecoder().decode(Profile.self, from: data) else {
+        guard let profile = (try? JSONDecoder().decode(ConnectionData.self, from: data))?.authenticatedUser else {
             let body = String(data: data, encoding: .utf8)?.prefix(500) ?? ""
             FileHandle.standardError.write("azdo identity: decode failed — body: \(body)\n".data(using: .utf8)!)
             return
         }
-        cachedUser = profile.displayName ?? profile.emailAddress
+        cachedUser = profile.customDisplayName ?? profile.providerDisplayName
         if cachedUser == nil {
-            FileHandle.standardError.write("azdo identity: decoded profile had no displayName/emailAddress\n".data(using: .utf8)!)
+            FileHandle.standardError.write("azdo identity: decoded authenticatedUser had no display name\n".data(using: .utf8)!)
         }
     }
 
