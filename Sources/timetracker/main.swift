@@ -365,6 +365,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         folder.target = self; menu.addItem(folder)
 
         menu.addItem(.separator())
+        if let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String, !build.isEmpty {
+            menu.addItem(disabled("Build \(build)"))
+        }
         let quit = NSMenuItem(title: "Quit TimeTracker", action: #selector(quit), keyEquivalent: "q")
         quit.target = self; menu.addItem(quit)
 
