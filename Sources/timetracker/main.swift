@@ -248,15 +248,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let attr = current?.attribution
 
-        // Section 1 — the current ticket itself: description, an "open in browser" link, and why
-        // it was picked. Only shown when a ticket is actually resolved (not a bare guess).
+        // Section 1 — the current ticket itself: description (itself the "open in browser" link,
+        // when resolvable) and why it was picked. Only shown when a ticket is actually resolved
+        // (not a bare guess).
         if let t = attr?.ticket, t != config.noTicketLabel {
             let summary = attribution.summary(for: t)
-            menu.addItem(disabled("\(t)\(summary.map { " — \($0.prefix(60))" } ?? "")"))
+            let titleLine = "\(t)\(summary.map { " — \($0.prefix(60))" } ?? "")"
             if let url = issueProvider.browserURL(forKey: t) {
-                let open = NSMenuItem(title: "Open in browser", action: #selector(openTicketURL), keyEquivalent: "")
-                open.target = self; open.representedObject = url
-                menu.addItem(open)
+                let item = NSMenuItem(title: titleLine, action: #selector(openTicketURL), keyEquivalent: "")
+                item.target = self; item.representedObject = url
+                menu.addItem(item)
+            } else {
+                menu.addItem(disabled(titleLine))
             }
             let src = attr?.source ?? "?"
             let conf = attr?.confidence.map { String(format: " · %.2f", $0) } ?? ""
