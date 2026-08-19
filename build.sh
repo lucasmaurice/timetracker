@@ -43,6 +43,9 @@ rm -rf "$APP"   # don't leave a duplicate bundle in the repo (confuses Spotlight
 
 echo
 echo "Built: $DEST/$APP"
-echo "Launch once manually:  open \"$DEST/$APP\""
-echo "Then grant Accessibility in System Settings > Privacy & Security > Accessibility."
 echo "To run at login, install the LaunchAgent:  ./scripts/install-launchagent.sh"
+echo
+
+# Every rebuild changes the code hash, invalidating the previous Accessibility grant — reset it
+# and relaunch so you can grant once, cleanly, to this build (see scripts/reset-accessibility.sh).
+./scripts/reset-accessibility.sh
