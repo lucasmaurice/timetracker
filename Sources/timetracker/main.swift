@@ -246,16 +246,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(.separator())
         }
 
+        let attr = current?.attribution
+
+        // Section 1 — the current ticket itself: description, an "open in browser" link, and why
+        // it was picked. Only shown when a ticket is actually resolved (not a bare guess).
+        if let t = attr?.ticket, t != config.noTicketLabel {
+            let summary = attribution.summary(for: t)
+            menu.addItem(disabled("\(t)\(summary.map { " — \($0.prefix(60))" } ?? "")"))
+            if let url = issueProvider.browserURL(forKey: t) {
+                let open = NSMenuItem(title: "Open in browser", action: #selector(openTicketURL), keyEquivalent: "")
+                open.target = self; open.representedObject = url
+                menu.addItem(open)
+            }
+            let src = attr?.source ?? "?"
+            let conf = attr?.confidence.map { String(format: " · %.2f", $0) } ?? ""
+            let why = Attribution.isExact(src) ? "from \(Attribution.sourceDescription(src))"
+                : "\(Attribution.sourceDescription(src))\(conf)"
+            menu.addItem(disabled("Why: \(why)"))
+            menu.addItem(.separator())
+        }
+
+        // Section 2 — the raw signals behind that decision.
         let appLine = current.map { "\($0.appName)\($0.idle ? " (idle)" : "")" } ?? "—"
         menu.addItem(disabled("App: \(appLine)"))
-        if let t = current?.title, !t.isEmpty {
-            menu.addItem(disabled("Window: \(t.prefix(60))"))
-        }
-        let attr = current?.attribution
         if let t = attr?.ticket {
-            let src = attr?.source ?? "?"
-            let conf = attr?.confidence.map { String(format: " %.2f", $0) } ?? ""
-            menu.addItem(disabled("Ticket: \(t) (\(src)\(conf))"))
+            menu.addItem(disabled("Ticket: \(t)"))
         } else if let top = attr?.candidates.first {
             menu.addItem(disabled(String(format: "Guess: %@ (%.2f) — confirm below", top.key, top.score)))
         } else {
@@ -266,9 +281,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if let ctx = current?.context {
             if let b = ctx.branch { menu.addItem(disabled("Branch: \(b.prefix(44))")) }
+            if let s = ctx.aiSession { menu.addItem(disabled("Session: \(s.prefix(52))")) }
+        }
+        if let t = current?.title, !t.isEmpty {
+            menu.addItem(disabled("Window: \(t.prefix(60))"))
+        }
+        if let ctx = current?.context {
             if let u = ctx.url, let host = URL(string: u)?.host { menu.addItem(disabled("URL: \(host)")) }
             if let m = ctx.meeting { menu.addItem(disabled("Meeting: \(m.prefix(44))")) }
-            if let s = ctx.aiSession { menu.addItem(disabled("Session: \(s.prefix(52))")) }
         }
         if let llm = lastLLM {
             menu.addItem(disabled("LLM: \(llm.key) (\(String(format: "%.2f", llm.confidence))) \(llm.reason.prefix(34))"))
@@ -498,14 +518,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .map { ReviewAlt(key: $0.key, summary: $0.summary, score: $0.score) }
             var why: String?
             if let src = p.guessSource {
-                why = Attribution.isExact(src) ? "from \(src)"
-                    : "\(src)" + (p.guessConfidence.map { String(format: " · %.2f", $0) } ?? "")
+                why = Attribution.isExact(src) ? "from \(Attribution.sourceDescription(src))"
+                    : "\(Attribution.sourceDescription(src))" + (p.guessConfidence.map { String(format: " · %.2f", $0) } ?? "")
             }
-            let hm = DateFormatter(); hm.dateFormat = "HH:mm"
             return ReviewPeriod(
-                seq: p.id, kind: p.kind,
-                rangeText: "\(hm.string(from: p.start))–\(hm.string(from: p.end))",
-                activeSeconds: p.trueSeconds, idleSeconds: 0,
+                id: p.id, kind: p.kind,
+                durationText: Summary.hm(p.reportedSeconds),
+                activeSeconds: p.trueSeconds,
                 slices: p.byTicket.map { Slice(label: $0.ticket ?? "untracked", seconds: $0.seconds) },
                 recap: p.recap ?? "",
                 guessKey: p.ticket,
@@ -562,10 +581,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func submitToTempoFromReview() {
         guard let model = reviewModel else { return }
         let dayStr = TimeBlocks.dayString(reviewDay)
-        let periodsBySeq = Dictionary(uniqueKeysWithValues: reviewPeriods.map { ($0.id, $0) })
+        let periodsById = Dictionary(uniqueKeysWithValues: reviewPeriods.map { ($0.id, $0) })
         let tf = DateFormatter(); tf.dateFormat = "HH:mm:ss"
         let planned: [PlannedWorklog] = model.periods.compactMap { rp in
-            guard let p = periodsBySeq[rp.seq] else { return nil }
+            guard let p = periodsById[rp.id] else { return nil }
             let raw = rp.ticket.trimmingCharacters(in: .whitespaces)
             guard !raw.isEmpty else { return nil }
             let ticket: String
@@ -577,13 +596,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 ticket = raw.uppercased()
             }
-            // Real per-period start time and REPORTED duration (rounded/padded, not a fixed
-            // blockHours) — the whole point of the floating-period model over the old fixed blocks.
+            // REPORTED duration (rounded/padded, not a fixed blockHours) — the whole point of the
+            // per-ticket day-total model. startTime is a formality some worklog APIs require; it's
+            // not meaningful data here (exact clock time isn't tracked), so the earliest touch on
+            // this ticket today is as good a placeholder as any.
             let startTime = tf.string(from: p.start)
             let seconds = Int(p.reportedSeconds)
             let desc = rp.note.trimmingCharacters(in: .whitespaces).isEmpty
-                ? "\(ticket) — \(dayStr) \(rp.rangeText) (TimeTracker)" : rp.note
-            return PlannedWorklog(date: dayStr, block: rp.seq, ticket: ticket, startTime: startTime, seconds: seconds, description: desc)
+                ? "\(ticket) — \(dayStr) \(p.kind.rawValue) (TimeTracker)" : rp.note
+            return PlannedWorklog(date: dayStr, block: rp.id, ticket: ticket, startTime: startTime, seconds: seconds, description: desc)
         }
         guard !planned.isEmpty else { showInfo("Nothing to submit — assign a ticket to a period first."); return }
 
@@ -591,7 +612,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         let preview = NSAlert()
         preview.messageText = "Submit \(planned.count) worklog(s) to \(worklogProvider.displayName)?"
-        preview.informativeText = planned.map { "• \($0.date) \($0.startTime.prefix(5)) · \($0.ticket) · \(Summary.hm(Double($0.seconds)))\n   “\($0.description)”" }
+        preview.informativeText = planned.map { "• \($0.date) · \($0.ticket) · \(Summary.hm(Double($0.seconds)))\n   “\($0.description)”" }
             .joined(separator: "\n") + "\n\nThis posts to your official \(worklogProvider.displayName) timesheet."
         preview.addButton(withTitle: "Submit to \(worklogProvider.displayName)")
         preview.addButton(withTitle: "Cancel")
@@ -683,16 +704,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func saveReview() {
         guard let model = reviewModel else { return }
         let dayStr = TimeBlocks.dayString(reviewDay)
-        let periodsBySeq = Dictionary(uniqueKeysWithValues: reviewPeriods.map { ($0.id, $0) })
+        let periodsById = Dictionary(uniqueKeysWithValues: reviewPeriods.map { ($0.id, $0) })
         var taught = 0
         for rp in model.periods {
-            guard let p = periodsBySeq[rp.seq] else { continue }
+            guard let p = periodsById[rp.id] else { continue }
             let raw = rp.ticket.trimmingCharacters(in: .whitespaces)
             // Normalize (pasted URL → key); the review stays authoritative for free-form keys.
             let key = raw.isEmpty ? nil : (attribution.normalizeTicketEntry(raw) ?? raw.uppercased())
             let note = rp.note.trimmingCharacters(in: .whitespaces)
-            store.setPeriodAssignment(day: dayStr, seq: Int(rp.seq) ?? p.seq, kind: p.kind.rawValue,
-                                      start: p.start, end: p.end, ticket: key, note: note.isEmpty ? nil : note)
+            store.setPeriodAssignment(day: dayStr, kind: p.kind.rawValue, ticketKey: p.ticket ?? "",
+                                      ticket: key, note: note.isEmpty ? nil : note)
 
             // Teach the guesser — but only from signal, never from silence: when the user changed
             // the system's guess, or explicitly confirmed it. This is the primary labeling pipeline.
@@ -1190,6 +1211,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc private func togglePause() { monitor.setPaused(!monitor.paused); updateStatus(monitor.currentState) }
     @objc private func openDataFolder() { NSWorkspace.shared.open(AppPaths.dataDir) }
+    @objc private func openTicketURL(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        NSWorkspace.shared.open(url)
+    }
     @objc private func openAccessibilitySettings() {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
@@ -1249,7 +1274,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         prReviewInFlight.insert(prId)
         Task { @MainActor in
             defer { self.prReviewInFlight.remove(prId) }
-            guard let ticket = await self.azureDevOps.resolveWorkItem(forPullRequestId: prId) else { return }
+            // Cache the result either way — nil (no linked work item) still marks this PR as
+            // "checked" so the segment reads as code-review activity instead of falling through
+            // to ordinary fusion guessing (see PeriodCompiler's generic-code-review fallback).
+            let ticket = await self.azureDevOps.resolveWorkItem(forPullRequestId: prId)
             self.attribution.cachePRReviewTicket(prId: prId, ticket: ticket)
             self.refineCurrent()
         }
@@ -1599,13 +1627,12 @@ if CommandLine.arguments.contains("--dump-periods") {
     let sem = DispatchSemaphore(value: 0)
     Task {
         let periods = await PeriodCompiler.compile(day: day, config: config, store: store, attribution: attribution, ollama: ollama)
-        let hm = DateFormatter(); hm.dateFormat = "HH:mm"
         print("Periods for \(TimeBlocks.dayString(day)):")
         for p in periods {
             let kind = p.kind.rawValue.padding(toLength: 10, withPad: " ", startingAt: 0)
             let trueH = String(format: "%.2f", p.trueSeconds / 3600)
             let repH = String(format: "%.2f", p.reportedSeconds / 3600)
-            print("  [\(p.seq)] \(kind) \(hm.string(from: p.start))–\(hm.string(from: p.end))  true=\(trueH)h reported=\(repH)h  ticket=\(p.effectiveTicket ?? "—")  source=\(p.guessSource ?? "-")")
+            print("  \(kind) true=\(trueH)h reported=\(repH)h  ticket=\(p.effectiveTicket ?? "—")  source=\(p.guessSource ?? "-")")
         }
         let totalTrue = periods.reduce(0.0) { $0 + $1.trueSeconds } / 3600
         let totalReported = periods.reduce(0.0) { $0 + $1.reportedSeconds } / 3600

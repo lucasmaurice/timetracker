@@ -198,45 +198,57 @@ real-time prompts, `AssignView`'s `.thisBlock` scope, `llmHints`'s "already logg
 `exportToday()`'s quick menu export. `block_assignments` (keyed `(day, block-id)`) still backs
 manual overrides for exactly these paths.
 
-**Floating periods (`PeriodCompiler`/`Period`) — Review and Submit.** `PeriodCompiler.compile(day:
-config: store: attribution: ollama:)` (async) is the retrospective/batch day-builder used by
-**Review today…** and worklog submission. It carves a day into `Period`s (`kind`:
-`.regular`/`.daily`/`.breakPeriod`/`.codeReview`/`.meeting`) instead of fixed clock-aligned blocks:
+**Per-ticket day totals (`PeriodCompiler`/`Period`) — Review and Submit.**
+`PeriodCompiler.compile(day: config: store: attribution: ollama:)` (async) is the retrospective/
+batch day-builder used by **Review today…** and worklog submission. Exact clock times are
+deliberately NOT tracked as meaningful data — only how much time landed on which ticket. A day
+compiles to a `[Period]` (`kind`: `.regular`/`.daily`/`.breakPeriod`/`.codeReview`/`.meeting`),
+each one a total for a `(kind, ticket)` pair, not a slice of the clock:
 
-- Code-review periods group segments already tagged live by the PR-review feature
-  (`ticketSource == "prReview"`) — no new detection, just grouping.
-- Meeting periods group segments carrying `Segment.meeting` (set by `FocusMonitor.flush()` from
-  `WorkContext.meeting`); one matching `config.dailyStandupTitleMatch` becomes a `.daily` period on
-  the fixed `dailyStandupTicket` instead of going through the Ollama guess.
-- A `.breakPeriod` is injected unconditionally at `config.breakStartHour` for
-  `breakDurationMinutes` — not detected from an idle gap — and clips overlapping time out of every
-  other period (break wins outright over whatever else was scheduled then).
-- Everything left over floats into `blockHours`-sized `.regular` buckets: accumulated *active*
-  time, skipping over the carve-outs above (so a block can span more wall-clock time than
-  `blockHours` if a meeting interrupted it). Each bucket's ticket is chosen by a duration + explicit
-  ticket-key-mention score (`Config.periodMentionWeightSeconds`), gated to candidates where
+- **Regular and code-review time are totaled per ticket for the whole day** — no synthetic time
+  bucketing. Each segment already carries its own live-resolved `ticket` (from the normal
+  fusion/PR-review pipeline, which sees far richer signal per moment than any bucket-level
+  re-scoring could), so `PeriodCompiler` just sums by that ticket directly
+  (`PeriodCompiler.groupByTicket`). Regular work is gated to
   `Ticket.assignedToMe && Ticket.isInProgressLike(preferredStates:)` — `isInProgressLike` exists
   because `statusCategory` is Azure-DevOps-only (always nil for Jira), so it falls back through
   `preferredTicketStates` membership, then a plain "contains progress" name heuristic, before
-  giving up. A block with no qualifying candidate abstains rather than guessing wrong.
+  giving up; gated-out/untracked time pools into one unticketed `.regular` entry (still visible and
+  assignable in Review) instead of vanishing. Code-review segments (`ticketSource == "prReview"`,
+  set live by the PR-review feature — see below) are NOT gated (a teammate's ticket is fine), and a
+  PR with no linked board work item falls back to `config.genericCodeReviewTicket` instead of
+  abstaining.
+- **Meeting/daily still needs time-proximity session grouping** (`PeriodCompiler.groupRuns`,
+  `periodMergeGapMinutes`) — unlike regular/code-review, a meeting's ticket isn't already known
+  per-segment, so distinct sessions must be identified before asking Ollama once per session. A
+  session whose `Segment.meeting` label matches `config.dailyStandupTitleMatch` becomes `.daily` on
+  the fixed `dailyStandupTicket` instead of going through the Ollama guess. `Segment.meeting` is set
+  by `FocusMonitor.flush()` from `WorkContext.meeting`. Sessions are merged back together by
+  resulting ticket afterward (`PeriodCompiler.mergeByTicket`) — two separate meetings Ollama
+  resolves to the same ticket become one row.
+- A `.breakPeriod` is injected unconditionally at `config.breakStartHour` for
+  `breakDurationMinutes` — not detected from an idle gap — and clips overlapping time out of every
+  other period (break wins outright over whatever else was scheduled then).
 - Non-regular periods round their *reported* (submitted) duration to `periodRoundMinutes`, clamped
-  to `periodMinMinutes`; floating regular blocks are exempt. If the day's total falls short of the
-  target (`workdayHours`, or `summerFridayHours` on a qualifying Friday —
-  `TimeBlocks.isSummerFriday`/`dailyTargetSeconds`), the shortfall pads the single most-dominant
-  regular period's reported duration; overtime is never trimmed. `Period.trueSeconds` always holds
-  the real, unrounded, unpadded total, independent of `reportedSeconds` — load-bearing for a
-  possible future time-bank/weekly-rebalance feature, so don't collapse the two.
-- `seq` is a `Period`'s stable per-day identity — NOT positional, because a day's period shape is
-  data-dependent (a segment gets re-tagged, more activity accrues between two compiles). Saving
-  Review greedily matches each fresh period to a saved `period_assignments` row of the same `kind`
-  within ~10 minutes of the same `start`, reusing its `seq`; a genuinely new period gets a
-  brand-new, append-only `seq`. This is what keeps `Submit to Tempo`'s replace-not-duplicate
-  behavior working across edits — `worklogId(day:block:)` is called with `String(period.seq)` in
-  place of the old block-id string, so the worklog-id map format didn't need to change at all.
+  to `periodMinMinutes`; regular/code-review totals are exempt (they're real day sums, not a
+  synthetic window). If the day's total falls short of the target (`workdayHours`, or
+  `summerFridayHours` on a qualifying Friday — `TimeBlocks.isSummerFriday`/`dailyTargetSeconds`),
+  the shortfall pads the single most-dominant regular period's reported duration; overtime is never
+  trimmed. `Period.trueSeconds` always holds the real, unrounded, unpadded total, independent of
+  `reportedSeconds` — load-bearing for a possible future time-bank/weekly-rebalance feature, so
+  don't collapse the two.
+- **`Period.id` is exactly `"\(kind)|\(ticket ?? "")"`** — a period's identity IS which ticket its
+  time landed on, so `period_assignments` (keyed `day, kind, ticket_key`) and the worklog-id map
+  (keyed `"day|\(period.id)"` in place of the old block-id string) can look it up directly
+  (`PeriodCompiler.applySavedAssignments`) instead of the fuzzy time-window matching a clock-based
+  model would need. The one edge case: if Ollama's meeting classification genuinely changes between
+  two compiles of the same day, the id changes too and the old saved row/worklog is orphaned rather
+  than replaced — accepted as narrow and non-destructive (no data loss, just a possible stray
+  duplicate), not worth chasing further.
 
 Both `BlockReport` and `Period` conform to `PeriodicReport` (`byTicket`/`byCategory`) so
 `Summary.describe(_:)` works against either. `Summary.appendTimesheet(day:)` (fixed blocks) and
-`appendTimesheet(periods:day:)` (floating periods) both write to `~/timesheet-log.md`; submission
+`appendTimesheet(periods:day:)` (per-ticket totals) both write to `~/timesheet-log.md`; submission
 goes via whichever `WorklogProvider` is active, to Tempo or 7pace — each keeps its **own**
 `(day|block) → worklogId` map file (`tempo-worklogs.json` is `[String: Int]`, 7pace's ids are UUID
 strings) so re-submitting replaces rather than duplicates. Don't merge them into one shared file —

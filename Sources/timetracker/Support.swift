@@ -132,18 +132,18 @@ struct Config: Codable {
     var breakDurationMinutes: Double = 20
     /// Where break time is logged. Empty = the break period abstains.
     var breakTicket: String = ""
-    /// Segments of the same carved-out kind (meeting/code-review) within this gap merge into one
-    /// period, so a brief interruption doesn't split what's really one continuous session.
+    /// A code-review period (PR-review window detected live) whose PR has no work item linked on
+    /// your board still counts as real code-review time — logged here instead of abstaining, same
+    /// idea as breakTicket/dailyStandupTicket. Empty = that time abstains like any other.
+    var genericCodeReviewTicket: String = ""
+    /// Meeting segments within this gap merge into one session (for Ollama ticket-guessing
+    /// purposes), so a brief interruption doesn't split what's really one continuous meeting.
     var periodMergeGapMinutes: Double = 5
     /// Non-regular (daily/break/code-review/meeting) periods round their REPORTED duration to the
-    /// nearest this-many minutes. Does not apply to floating regular blocks.
+    /// nearest this-many minutes. Does not apply to regular work (grouped by ticket, not time).
     var periodRoundMinutes: Double = 5
     /// ...and clamp up to at least this many minutes. Break's fixed duration already satisfies both.
     var periodMinMinutes: Double = 15
-    /// How many seconds one explicit ticket-key mention (in a segment's title/context, beyond just
-    /// time spent) is "worth" when scoring a floating regular block's ticket — the tunable mix
-    /// between duration-dominance and explicit-mention frequency.
-    var periodMentionWeightSeconds: Double = 300
 
     // MARK: Summer Friday (yearly-recurring shortened workday)
 

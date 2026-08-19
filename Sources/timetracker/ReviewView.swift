@@ -10,11 +10,10 @@ struct ReviewAlt: Identifiable {
 /// One editable period in the review screen — a floating regular block, or a carved-out
 /// daily/break/code-review/meeting period. See `PeriodCompiler`.
 struct ReviewPeriod: Identifiable {
-    let seq: String             // Period.seq, stringified — stable per-day id, see PeriodCompiler
+    let id: String                // Period.id ("kind|ticket") — see PeriodCompiler
     let kind: PeriodKind
-    let rangeText: String
-    let activeSeconds: Double   // trueSeconds
-    let idleSeconds: Double
+    let durationText: String      // reported duration, e.g. "2h15" — no clock times tracked/shown
+    let activeSeconds: Double     // trueSeconds
     let slices: [Slice]        // time by ticket (proportion bar)
     let recap: String          // what you did (repo · files · session · app)
     let guessKey: String?      // the system's best guess for the period
@@ -25,7 +24,6 @@ struct ReviewPeriod: Identifiable {
     var ticket: String          // editable final ticket
     var note: String            // editable
     var confirmed: Bool = false // explicit ✓ (teaches the model even if unchanged)
-    var id: String { seq }
 }
 
 final class ReviewModel: ObservableObject {
@@ -131,10 +129,8 @@ private struct PeriodCard: View {
             HStack {
                 Label(period.kind.label, systemImage: period.kind.icon)
                     .font(.caption).foregroundStyle(.secondary)
-                Text(period.rangeText).font(.system(.title3, design: .monospaced)).bold()
+                Text(period.durationText).font(.system(.title3, design: .monospaced)).bold()
                 Spacer()
-                Text("active \(Summary.hm(period.activeSeconds)) · idle \(Summary.hm(period.idleSeconds))")
-                    .font(.caption).foregroundStyle(.secondary)
             }
 
             if period.slices.isEmpty {

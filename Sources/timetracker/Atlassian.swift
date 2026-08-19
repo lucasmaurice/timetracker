@@ -122,6 +122,11 @@ final class Atlassian: IssueProvider {
         return obj["id"] as? String
     }
 
+    func browserURL(forKey key: String) -> URL? {
+        guard let site else { return nil }
+        return URL(string: "https://\(site)/browse/\(key)")
+    }
+
     /// Recursively flatten an ADF (Atlassian Document Format) node tree into plain text.
     private static func flattenADF(_ node: Any?) -> String {
         if let dict = node as? [String: Any] {

@@ -219,6 +219,17 @@ final class Attribution {
     static let exactSources: Set<String> = ["url", "branch", "title", "commit", "session", "learned", "manual", "pinned", "prReview"]
     static func isExact(_ source: String?) -> Bool { source.map { exactSources.contains($0) } ?? false }
 
+    /// Human-readable phrase for an attribution source, for the menu-bar "Why" line and anywhere
+    /// else a raw `ticket_source`/`guessSource` value needs to read as a sentence, not a keyword.
+    private static let sourceDescriptions: [String: String] = [
+        "url": "the page URL", "branch": "your git branch", "title": "the window title",
+        "commit": "a commit message", "session": "your AI session", "prReview": "reviewing this PR",
+        "learned": "a correction you confirmed before", "manual": "set manually", "pinned": "pinned",
+        "rule": "a no-ticket rule", "semantic": "lexical match", "memory": "similar past work",
+        "repo": "repo history", "embed": "embedding match", "llm": "the local LLM", "guess": "best guess",
+    ]
+    static func sourceDescription(_ source: String) -> String { sourceDescriptions[source] ?? source }
+
     /// True if a ticket key is on the exclusion list (exact or glob match).
     func isExcluded(_ key: String) -> Bool {
         let r = NSRange(key.startIndex..., in: key)
@@ -507,14 +518,20 @@ final class Attribution {
     /// to sprint.json — it's a narrow, moment-specific exception, not a corpus widening). Set by
     /// the async resolver in main.swift once the network round trip completes; from then on the
     /// exact-match check in `decideAttribution` below fires purely from this in-memory map, no
-    /// further network on the hot attribution path.
-    private var prReviewTickets: [Int: Ticket] = [:]
+    /// further network on the hot attribution path. The value is `Ticket??` (present-but-nil means
+    /// "checked, no linked work item" — still worth remembering as code-review activity for
+    /// `PeriodCompiler`'s generic-code-review fallback — vs. key-absent meaning "not checked yet").
+    private var prReviewTickets: [Int: Ticket?] = [:]
 
-    /// Called once a PR's linked work item is fetched. Merges the ticket into the live guess pool
-    /// too (not just the PR-id cache) so ranking/lexical-match/priorBreakdown treat it like any
-    /// other candidate if it also turns up via other signals — e.g. its own title/branch.
-    func cachePRReviewTicket(prId: Int, ticket: Ticket) {
+    /// Called once a PR's linked-work-item lookup completes, successful or not. Merges a found
+    /// ticket into the live guess pool too (not just the PR-id cache) so ranking/lexical-match/
+    /// priorBreakdown treat it like any other candidate if it also turns up via other signals —
+    /// e.g. its own title/branch. A nil `ticket` still records the PR as checked (source
+    /// "prReview" fires with no key), so a PR with no board work item is recognized as code-review
+    /// activity rather than falling through to ordinary fusion guessing.
+    func cachePRReviewTicket(prId: Int, ticket: Ticket?) {
         prReviewTickets[prId] = ticket
+        guard let ticket else { return }
         if !guessKeys.contains(ticket.key) {
             guessKeys.insert(ticket.key)
             guessTickets.append(ticket)
@@ -553,9 +570,11 @@ final class Attribution {
         // 1a) Reviewing someone else's PR (window title "Pull request NNNN: ... - Repos") is an
         // exception to "only your own assigned tickets get exact treatment" — the work item was
         // resolved live via the AzDO API (see main.swift's PR-review resolver) specifically
-        // because you're looking at it right now, regardless of who it's assigned to.
-        if let prId = extractPRNumber(fromTitle: ctx.title), let t = prReviewTickets[prId] {
-            return .init(ticket: t.key, source: "prReview", category: cat)
+        // because you're looking at it right now, regardless of who it's assigned to. A PR with no
+        // linked work item still resolves the source to "prReview" (ticket nil, an abstain) rather
+        // than falling through to fusion — PeriodCompiler recognizes it as code review either way.
+        if let prId = extractPRNumber(fromTitle: ctx.title), let resolution = prReviewTickets[prId] {
+            return .init(ticket: resolution?.key, source: "prReview", category: cat)
         }
 
         // 1b) A standing "this context is non-billable" rule resolves to no-ticket (still logged).

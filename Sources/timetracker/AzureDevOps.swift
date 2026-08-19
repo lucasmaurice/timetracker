@@ -83,6 +83,17 @@ final class AzureDevOps: IssueProvider {
             .flatMap { $0.hasPrefix("AB#") ? String($0.dropFirst(3)) : nil }
     }
 
+    /// The org-wide edit URL redirects to the right project automatically — no need to know which
+    /// project this particular work item lives in (the same shortcut `resolveWorkItem(forPullRequestId:)`
+    /// avoids needing up front).
+    func browserURL(forKey key: String) -> URL? {
+        guard let org = connectedOrg,
+              let id = AzureBoardsKeyFormat(branchPattern: config.azureBranchKeyPattern).canonicalize(key)
+                  .flatMap({ $0.hasPrefix("AB#") ? String($0.dropFirst(3)) : nil })
+        else { return nil }
+        return URL(string: "https://dev.azure.com/\(org.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? org)/_workitems/edit/\(id)")
+    }
+
     // MARK: - Pull requests (for AzurePRBridge)
 
     struct PullRequestSummary { var id: Int; var title: String; var description: String; var sourceBranch: String; var closedDate: String? }

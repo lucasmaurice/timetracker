@@ -126,6 +126,9 @@ protocol IssueProvider: AnyObject {
     func disconnect()
     func refreshSprint() async throws -> RefreshResult
     func fetchIssueId(forKey: String) async -> String?
+    /// The ticket/work-item's browser page, for a menu "Open in browser" action. Nil when not
+    /// connected (no site/org known yet) or the key doesn't parse for this provider.
+    func browserURL(forKey key: String) -> URL?
 }
 
 /// A destination for worklogs. `resolveAuthor` puts "whose identity does this worklog need" on

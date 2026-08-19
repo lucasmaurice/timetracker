@@ -93,18 +93,20 @@ final class Store {
         // Periods replace block_assignments' role for the floating-period compiler (PeriodCompiler.swift).
         // A separate table, not a repurposed block_assignments: a period's existence/shape is
         // data-dependent (derived from that day's actual segments), unlike a block, which is a pure
-        // function of Config — so a period's kind/bounds must be snapshotted to keep `seq` stable
-        // across re-compilations (see PeriodCompiler's seq-matching logic).
+        // function of Config. Keyed by (day, kind, ticket_key) — a period's identity is now exactly
+        // which ticket its time landed on (time is totaled per ticket, not tracked by clock
+        // position — see PeriodCompiler), so this is an exact lookup, not fuzzy time-matching.
+        // ticket_key is the COMPILER's own grouping ticket (empty string = untracked), stable
+        // across re-compiles of the same segment data — distinct from `ticket`, the column that
+        // actually holds a manual override.
         exec("""
         CREATE TABLE IF NOT EXISTS period_assignments (
             day TEXT NOT NULL,
-            seq INTEGER NOT NULL,
             kind TEXT NOT NULL,
-            start_ts INTEGER NOT NULL,
-            end_ts INTEGER NOT NULL,
+            ticket_key TEXT NOT NULL,
             ticket TEXT,
             note TEXT,
-            PRIMARY KEY (day, seq)
+            PRIMARY KEY (day, kind, ticket_key)
         );
         """)
     }
@@ -356,41 +358,37 @@ final class Store {
 
     // MARK: - Period assignments (manual overrides for the floating-period compiler)
 
-    func setPeriodAssignment(day: String, seq: Int, kind: String, start: Date, end: Date, ticket: String?, note: String?) {
+    func setPeriodAssignment(day: String, kind: String, ticketKey: String, ticket: String?, note: String?) {
         let sql = """
-        INSERT INTO period_assignments(day,seq,kind,start_ts,end_ts,ticket,note) VALUES(?,?,?,?,?,?,?)
-        ON CONFLICT(day,seq) DO UPDATE SET kind=excluded.kind, start_ts=excluded.start_ts, end_ts=excluded.end_ts, ticket=excluded.ticket, note=excluded.note;
+        INSERT INTO period_assignments(day,kind,ticket_key,ticket,note) VALUES(?,?,?,?,?)
+        ON CONFLICT(day,kind,ticket_key) DO UPDATE SET ticket=excluded.ticket, note=excluded.note;
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, day)
-        sqlite3_bind_int(stmt, 2, Int32(seq))
-        bindText(stmt, 3, kind)
-        sqlite3_bind_int64(stmt, 4, Int64(start.timeIntervalSince1970))
-        sqlite3_bind_int64(stmt, 5, Int64(end.timeIntervalSince1970))
-        bindText(stmt, 6, ticket)
-        bindText(stmt, 7, note)
+        bindText(stmt, 2, kind)
+        bindText(stmt, 3, ticketKey)
+        bindText(stmt, 4, ticket)
+        bindText(stmt, 5, note)
         sqlite3_step(stmt)
     }
 
-    /// All manually-saved periods for a day, for `PeriodCompiler`'s seq-matching against a fresh
-    /// compilation (see `PeriodCompiler.swift`'s "seq stability" note).
-    func periodAssignments(day: String) -> [(seq: Int, kind: String, start: Date, end: Date, ticket: String?, note: String?)] {
-        let sql = "SELECT seq,kind,start_ts,end_ts,ticket,note FROM period_assignments WHERE day=? ORDER BY seq;"
+    /// All manually-saved periods for a day, for `PeriodCompiler.applySavedAssignments`'s exact
+    /// (kind, ticket) lookup against a fresh compilation.
+    func periodAssignments(day: String) -> [(kind: String, ticketKey: String, ticket: String?, note: String?)] {
+        let sql = "SELECT kind,ticket_key,ticket,note FROM period_assignments WHERE day=?;"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, day)
-        var out: [(Int, String, Date, Date, String?, String?)] = []
+        var out: [(String, String, String?, String?)] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             out.append((
-                Int(sqlite3_column_int(stmt, 0)),
-                colText(stmt, 1) ?? "regular",
-                Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 2))),
-                Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 3))),
-                colText(stmt, 4),
-                colText(stmt, 5)
+                colText(stmt, 0) ?? "regular",
+                colText(stmt, 1) ?? "",
+                colText(stmt, 2),
+                colText(stmt, 3)
             ))
         }
         return out

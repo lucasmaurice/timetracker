@@ -1,18 +1,18 @@
 import Foundation
 
-/// A carved-out or floating chunk of a day, replacing `TimeBlocks.Block` for Review/Submit.
-/// See `PeriodCompiler` for how these are built.
+/// A day's time, grouped by ticket — replacing `TimeBlocks.Block` for Review/Submit. Exact
+/// start/stop clock times aren't tracked as meaningful data (only used internally to scope a
+/// day's segment query and as a worklog `date`/`startTime` formality); what matters is how much
+/// time landed on which ticket. See `PeriodCompiler` for how these are built.
 enum PeriodKind: String, Codable, CaseIterable {
     case regular, daily, breakPeriod, codeReview, meeting
 }
 
 struct Period: Identifiable {
-    var seq: Int                   // stable per-day id — see PeriodCompiler.matchSeqs
     var kind: PeriodKind
     var start: Date
     var end: Date
-    /// Exact contributing (segment, clipped-duration) pairs — not re-derived from (start,end), so
-    /// a floating regular block's skipped-over carve-outs are never double-counted downstream.
+    /// Exact contributing (segment, clipped-duration) pairs — not re-derived from (start,end).
     var members: [(segment: Segment, seconds: Double)]
     var trueSeconds: Double        // real tracked time, never altered
     var reportedSeconds: Double    // rounded/clamped/padded value actually exported/submitted
@@ -26,7 +26,9 @@ struct Period: Identifiable {
     var contextDoc: String?
     var recap: String?
 
-    var id: String { String(seq) }
+    /// `(kind, ticket)` is the day's natural identity now that time is grouped by ticket rather
+    /// than by clock position — see `PeriodCompiler.applySavedAssignments`.
+    var id: String { "\(kind.rawValue)|\(ticket ?? "")" }
     var effectiveTicket: String? {
         if let a = assignedTicket, !a.isEmpty { return a }
         return ticket
@@ -36,17 +38,19 @@ struct Period: Identifiable {
 
 extension Period: PeriodicReport {}
 
-/// Builds a day's `[Period]` from its stored segments: carves out code-review (already tagged live
-/// by the PR-review feature), meeting/daily, and a fixed break, then floats the remaining active
-/// time into `blockHours`-sized regular blocks. Retrospective/batch only — real-time nudges and
-/// `AssignView` keep using the fixed `TimeBlocks` model (see CLAUDE.md).
+/// Builds a day's `[Period]` from its stored segments: regular work and code-review time are
+/// totaled per ticket (each segment already carries its own live-resolved `ticket`/`ticketSource`
+/// — no synthetic time-bucketing needed), while daily-standup/break/meeting are carved out as
+/// their own entries. Retrospective/batch only — real-time nudges and `AssignView` keep using the
+/// fixed `TimeBlocks` model (see CLAUDE.md).
 enum PeriodCompiler {
     static func compile(day: Date, config: Config, store: Store, attribution: Attribution, ollama: Ollama) async -> [Period] {
         var periods = compileSync(day: day, config: config, store: store, attribution: attribution)
         periods = await resolveMeetingTickets(periods, config: config, attribution: attribution, ollama: ollama)
-        periods = matchSeqs(periods, day: day, store: store)
+        periods = mergeByTicket(periods)
+        periods = applySavedAssignments(periods, day: day, store: store)
         applyRoundingAndPadding(&periods, day: day, config: config)
-        return periods.sorted { $0.start < $1.start }
+        return sortForDisplay(periods)
     }
 
     // MARK: - Pure, synchronous core (no network — dumpable/testable standalone)
@@ -69,23 +73,27 @@ enum PeriodCompiler {
 
         // 1. Break — fixed injection, unconditional (req. #6), not detected from an idle gap.
         periods.append(Period(
-            seq: 0, kind: .breakPeriod, start: bStart, end: bEnd, members: [],
+            kind: .breakPeriod, start: bStart, end: bEnd, members: [],
             trueSeconds: config.breakDurationMinutes * 60, reportedSeconds: config.breakDurationMinutes * 60,
             ticket: config.breakTicket.isEmpty ? nil : config.breakTicket, guessSource: "break-fixed",
             guessConfidence: nil, assignedTicket: nil, assignedNote: nil, byTicket: [], byCategory: [], contextDoc: nil, recap: "Break"))
 
         // 2. Code review — segments already tagged live (ticketSource == "prReview") by the
-        // existing PR-review feature. No new detection: group into runs, keep the run's own ticket.
+        // existing PR-review feature, including ones the live resolver checked and found no linked
+        // work item for (ticket nil, source still "prReview" — see Attribution.cachePRReviewTicket).
+        // Totaled per ticket for the whole day; a PR with no linked ticket falls back to the
+        // configured generic-code-review ticket instead of silently abstaining.
         let crSegs = allSegs.filter { !$0.idle && $0.ticketSource == "prReview" && usable($0) > 0 }
-        for run in groupRuns(crSegs, mergeGapSeconds: mergeGap) {
-            let members = run.map { ($0, usable($0)) }
-            let ticket = run.first(where: { $0.ticket != nil })?.ticket
-            periods.append(makePeriod(kind: .codeReview, start: run.first!.start, end: run.last!.end,
-                                       members: members, ticket: ticket, guessSource: "period-cr"))
+        for (ticket, members) in groupByTicket(crSegs, usable: usable) {
+            let finalTicket = ticket ?? (config.genericCodeReviewTicket.isEmpty ? nil : config.genericCodeReviewTicket)
+            periods.append(makePeriod(kind: .codeReview, members: members, ticket: finalTicket, guessSource: "period-cr"))
         }
 
-        // 3. Meeting / daily — segments carrying a meeting label, excluding ones already claimed
-        // by code review above (a segment can't be both).
+        // 3. Meeting / daily — segments carrying a meeting label. Still needs time-proximity
+        // session grouping (unlike regular/CR below): a meeting's ticket isn't already known
+        // per-segment, so distinct sessions must be identified before asking Ollama once per
+        // session — merged back together by ticket afterward (see `mergeByTicket`, called once
+        // the async pass below has resolved them).
         let meetingSegs = allSegs.filter { !$0.idle && $0.ticketSource != "prReview" && $0.meeting != nil && usable($0) > 0 }
         for run in groupRuns(meetingSegs, mergeGapSeconds: mergeGap) {
             let members = run.map { ($0, usable($0)) }
@@ -93,19 +101,30 @@ enum PeriodCompiler {
             let isDaily = !config.dailyStandupTitleMatch.isEmpty
                 && label.range(of: config.dailyStandupTitleMatch, options: .caseInsensitive) != nil
             if isDaily {
-                periods.append(makePeriod(kind: .daily, start: run.first!.start, end: run.last!.end, members: members,
+                periods.append(makePeriod(kind: .daily, members: members,
                                            ticket: config.dailyStandupTicket.isEmpty ? nil : config.dailyStandupTicket,
                                            guessSource: "daily-fixed"))
             } else {
                 // Ticket resolved in the async pass (Ollama), if enabled — abstain otherwise.
-                periods.append(makePeriod(kind: .meeting, start: run.first!.start, end: run.last!.end,
-                                           members: members, ticket: nil, guessSource: nil))
+                periods.append(makePeriod(kind: .meeting, members: members, ticket: nil, guessSource: nil))
             }
         }
 
-        // 4. Regular — everything else, floated into blockHours-sized buckets (req. #1/#2).
+        // 4. Regular — everything else, totaled per ticket for the day (requirement #2's "most
+        // mentioned" is now literally "which ticket did the live per-moment pipeline actually
+        // resolve, summed over the day" — richer than a synthetic bucket-level re-score, since
+        // live attribution already sees lexical/memory/repo/embedding/LLM signals per moment).
+        // Gated to assignedToMe + isInProgressLike; ungated/untracked time pools into one
+        // unticketed "regular" entry rather than each losing its own identity silently.
         let regularSegs = allSegs.filter { !$0.idle && $0.ticketSource != "prReview" && $0.meeting == nil }
-        periods += floatingRegularBlocks(regularSegs, usable: usable, config: config, attribution: attribution)
+        let gate: (String) -> Bool = { key in
+            guard let t = attribution.tickets(for: [key]).first else { return false }
+            return t.assignedToMe && t.isInProgressLike(preferredStates: config.preferredTicketStatesLower)
+        }
+        for (ticket, members) in groupByTicket(regularSegs, usable: usable, gate: gate) {
+            periods.append(makePeriod(kind: .regular, members: members, ticket: ticket,
+                                       guessSource: ticket != nil ? "period-regular" : nil))
+        }
 
         return periods
     }
@@ -114,6 +133,25 @@ enum PeriodCompiler {
         let sod = TimeBlocks.calendar.startOfDay(for: day)
         let start = sod.addingTimeInterval(config.breakStartHour * 3600)
         return (start, start.addingTimeInterval(config.breakDurationMinutes * 60))
+    }
+
+    /// Groups segments by their own `ticket` field across the WHOLE day (no time-bucketing) —
+    /// each distinct ticket becomes one group. `gate`, when supplied, redirects a segment whose
+    /// ticket fails it into the unticketed ("") group instead of dropping it outright, so gated-out
+    /// time still shows up as reviewable/assignable rather than silently vanishing.
+    private static func groupByTicket(_ segs: [Segment], usable: (Segment) -> Double,
+                                       gate: ((String) -> Bool)? = nil) -> [(ticket: String?, members: [(segment: Segment, seconds: Double)])] {
+        var byKey: [String: [(segment: Segment, seconds: Double)]] = [:]
+        var order: [String] = []
+        for s in segs {
+            let secs = usable(s)
+            guard secs > 0 else { continue }
+            var key = s.ticket ?? ""
+            if let gate, !key.isEmpty, !gate(key) { key = "" }
+            if byKey[key] == nil { order.append(key) }
+            byKey[key, default: []].append((s, secs))
+        }
+        return order.map { key in (ticket: key.isEmpty ? nil : key, members: byKey[key]!) }
     }
 
     /// Groups already-sorted (by start) segments into maximal runs: a new run starts whenever the
@@ -133,9 +171,10 @@ enum PeriodCompiler {
     }
 
     /// Shared field aggregation (byTicket/contextDoc/recap) for every period built from real
-    /// segments — mirrors `Summary.report`'s per-block aggregation.
-    private static func makePeriod(kind: PeriodKind, start: Date, end: Date,
-                                    members: [(segment: Segment, seconds: Double)],
+    /// segments — mirrors `Summary.report`'s per-block aggregation. `start`/`end` are derived from
+    /// the member span purely as bookkeeping (worklog date/startTime formality) — not meaningful
+    /// display data for a day-total period.
+    private static func makePeriod(kind: PeriodKind, members: [(segment: Segment, seconds: Double)],
                                     ticket: String?, guessSource: String?, guessConfidence: Double? = nil) -> Period {
         var ticketSecs: [String: Double] = [:]
         var catSecs: [String: Double] = [:]
@@ -151,74 +190,16 @@ enum PeriodCompiler {
         let byCategory = catSecs.sorted { $0.value > $1.value }.map { (category: $0.key.isEmpty ? nil : $0.key, seconds: $0.value) }
         let byApp = appSecs.sorted { $0.value > $1.value }.map { (app: $0.key, seconds: $0.value) }
         let trueSeconds = members.reduce(0) { $0 + $1.seconds }
-        return Period(seq: 0, kind: kind, start: start, end: end, members: members,
+        let start = members.map { $0.segment.start }.min() ?? Date()
+        let end = members.map { $0.segment.end }.max() ?? start
+        return Period(kind: kind, start: start, end: end, members: members,
                       trueSeconds: trueSeconds, reportedSeconds: trueSeconds, ticket: ticket,
                       guessSource: guessSource, guessConfidence: guessConfidence,
                       assignedTicket: nil, assignedNote: nil, byTicket: byTicket, byCategory: byCategory,
                       contextDoc: repDoc?.doc, recap: repDoc.map { Summary.recap(fromDoc: $0.doc, apps: byApp) })
     }
 
-    /// Walks segments in order, accumulating USABLE (non-break, non-idle) seconds; once adding a
-    /// whole segment would exceed `blockHours`, that segment starts the next bucket instead —
-    /// buckets can overshoot by at most one segment's worth, a deliberate simplicity tradeoff since
-    /// the floating boundary itself has no user-facing significance (unlike non-regular periods,
-    /// which DO have a strict rounding/minimum rule).
-    private static func floatingRegularBlocks(_ segs: [Segment], usable: (Segment) -> Double,
-                                               config: Config, attribution: Attribution) -> [Period] {
-        let blockSeconds = config.blockHours * 3600
-        var periods: [Period] = []
-        var bucket: [(segment: Segment, seconds: Double)] = []
-        var bucketSeconds: Double = 0
-
-        func flush() {
-            guard !bucket.isEmpty else { return }
-            var p = makePeriod(kind: .regular, start: bucket.first!.segment.start, end: bucket.last!.segment.end,
-                                members: bucket, ticket: nil, guessSource: nil)
-            p.ticket = scoreRegularTicket(bucket, config: config, attribution: attribution)
-            if p.ticket != nil { p.guessSource = "period-regular" }
-            periods.append(p)
-            bucket = []; bucketSeconds = 0
-        }
-
-        for s in segs {
-            let secs = usable(s)
-            guard secs > 0 else { continue }
-            if blockSeconds > 0, bucketSeconds > 0, bucketSeconds + secs > blockSeconds { flush() }
-            bucket.append((s, secs))
-            bucketSeconds += secs
-        }
-        flush()
-        return periods
-    }
-
-    /// "Mix of both" (requirement #2): duration-dominance plus explicit ticket-key mentions in the
-    /// bucket's own titles/context, gated to tickets assigned to the user AND actively in progress.
-    /// Scoped to keys already resolved on some segment in the bucket — not a corpus-wide sweep.
-    private static func scoreRegularTicket(_ bucket: [(segment: Segment, seconds: Double)],
-                                           config: Config, attribution: Attribution) -> String? {
-        var durationByKey: [String: Double] = [:]
-        for (s, secs) in bucket {
-            guard let t = s.ticket, !t.isEmpty else { continue }
-            durationByKey[t, default: 0] += secs
-        }
-        guard !durationByKey.isEmpty else { return nil }
-        var best: (key: String, score: Double)?
-        for key in durationByKey.keys {
-            guard let t = attribution.tickets(for: [key]).first,
-                  t.assignedToMe, t.isInProgressLike(preferredStates: config.preferredTicketStatesLower)
-            else { continue }
-            var mentions = 0
-            for (s, _) in bucket {
-                let hay = "\(s.windowTitle) \(s.contextDoc ?? "")"
-                if hay.range(of: key, options: .caseInsensitive) != nil { mentions += 1 }
-            }
-            let score = durationByKey[key]! + Double(mentions) * config.periodMentionWeightSeconds
-            if best == nil || score > best!.score { best = (key, score) }
-        }
-        return best?.key
-    }
-
-    // MARK: - Async pass: guess a ticket for meeting periods that don't already have one
+    // MARK: - Async pass: guess a ticket for meeting sessions that don't already have one
 
     private static func resolveMeetingTickets(_ periods: [Period], config: Config,
                                                attribution: Attribution, ollama: Ollama) async -> [Period] {
@@ -255,32 +236,42 @@ enum PeriodCompiler {
         return lines.joined(separator: "\n")
     }
 
-    // MARK: - Seq stability
-
-    /// A day's period shape is data-dependent (a segment gets re-tagged, more activity accrues
-    /// between two compiles), so a naive positional `seq` would silently break worklog-id/
-    /// period_assignments continuity. Greedily match each fresh period to an unconsumed saved row
-    /// of the same kind with a close start (within 10 min), reusing its seq + manual override;
-    /// unmatched periods get a brand-new, append-only seq (never reused/decremented).
-    private static func matchSeqs(_ periods: [Period], day: Date, store: Store) -> [Period] {
-        var existing = store.periodAssignments(day: TimeBlocks.dayString(day))
-        var out = periods.sorted { $0.start < $1.start }
-        var nextSeq = (existing.map { $0.seq }.max() ?? -1) + 1
-        let tolerance: TimeInterval = 600
-        for i in out.indices {
-            if let idx = existing.firstIndex(where: {
-                $0.kind == out[i].kind.rawValue && abs($0.start.timeIntervalSince(out[i].start)) <= tolerance
-            }) {
-                let row = existing.remove(at: idx)
-                out[i].seq = row.seq
-                out[i].assignedTicket = row.ticket
-                out[i].assignedNote = row.note
-            } else {
-                out[i].seq = nextSeq
-                nextSeq += 1
-            }
+    /// Collapses periods sharing the same `(kind, ticket)` into one — a no-op for regular/code
+    /// review (already grouped uniquely by construction), but what lets multiple meeting sessions
+    /// that Ollama resolved to the same ticket (or multiple daily-standup sessions) merge into a
+    /// single day-total row.
+    private static func mergeByTicket(_ periods: [Period]) -> [Period] {
+        var groups: [String: [Period]] = [:]
+        var order: [String] = []
+        for p in periods {
+            let key = p.id
+            if groups[key] == nil { order.append(key) }
+            groups[key, default: []].append(p)
         }
-        return out
+        return order.map { key in
+            let group = groups[key]!
+            guard group.count > 1 else { return group[0] }
+            let guessSource = group.first(where: { $0.guessSource != nil })?.guessSource
+            let guessConfidence = group.compactMap { $0.guessConfidence }.max()
+            return makePeriod(kind: group[0].kind, members: group.flatMap { $0.members },
+                              ticket: group[0].ticket, guessSource: guessSource, guessConfidence: guessConfidence)
+        }
+    }
+
+    /// A period's identity is now exactly `(kind, ticket)` — an exact lookup, not the fuzzy
+    /// time-window matching a clock-based model would need. Loading a saved override no longer
+    /// risks drifting onto the wrong period as the day's segment data evolves between compiles.
+    private static func applySavedAssignments(_ periods: [Period], day: Date, store: Store) -> [Period] {
+        let existing = Dictionary(uniqueKeysWithValues: store.periodAssignments(day: TimeBlocks.dayString(day))
+            .map { ("\($0.kind)|\($0.ticketKey)", $0) })
+        return periods.map { p in
+            var p = p
+            if let row = existing[p.id] {
+                p.assignedTicket = row.ticket
+                p.assignedNote = row.note
+            }
+            return p
+        }
     }
 
     // MARK: - Rounding (non-regular only) + shortfall padding
@@ -302,5 +293,18 @@ enum PeriodCompiler {
         let regularWithTicket = periods.indices.filter { periods[$0].kind == .regular && periods[$0].effectiveTicket != nil }
         guard let topIdx = regularWithTicket.max(by: { periods[$0].trueSeconds < periods[$1].trueSeconds }) else { return }
         periods[topIdx].reportedSeconds += shortfall
+    }
+
+    // MARK: - Display order
+
+    /// No clock times to sort by anymore — order by kind (your actual ticket work first, fixed
+    /// carve-outs after), then by how much time within each kind, so the biggest/most relevant
+    /// entries lead.
+    private static let kindOrder: [PeriodKind: Int] = [.regular: 0, .codeReview: 1, .meeting: 2, .daily: 3, .breakPeriod: 4]
+    private static func sortForDisplay(_ periods: [Period]) -> [Period] {
+        periods.sorted { a, b in
+            let ka = kindOrder[a.kind] ?? 99, kb = kindOrder[b.kind] ?? 99
+            return ka != kb ? ka < kb : a.trueSeconds > b.trueSeconds
+        }
     }
 }
