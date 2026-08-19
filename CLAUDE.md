@@ -187,12 +187,57 @@ from a human or a model must go through it. A one-time repair migration (`ttMigr
 
 ### Timesheet output
 
-`Summary` buckets segments into `TimeBlocks.blocks` (a `workdayHours` day of `blockHours` blocks
-starting at `dayStartHour`; the first block absorbs early activity and the last absorbs late, so
-nothing is lost). Each block becomes a `BlockReport` carrying both the inferred guess *and* any
-manual `block_assignments` override, plus the representative `context_doc` and a human recap.
-`effectiveTicket` resolves override-then-inference. Output goes to `~/timesheet-log.md` or, via
-whichever `WorklogProvider` is active, to Tempo or 7pace — each keeps its **own**
+Two coexisting models, split by how retrospective vs. live the consumer is:
+
+**Fixed blocks (`TimeBlocks`/`BlockReport`/`Summary`) — real-time only.** `Summary` buckets
+segments into `TimeBlocks.blocks` (a `workdayHours` day of `blockHours` blocks starting at
+`dayStartHour`; the first block absorbs early activity and the last absorbs late, so nothing is
+lost). Each block becomes a `BlockReport`. This model is now used ONLY by the live paths that need
+a cheap, synchronous "which block is `now` in": `checkAbstainNudge`/`checkUnknownBacklog`'s
+real-time prompts, `AssignView`'s `.thisBlock` scope, `llmHints`'s "already logged today" line, and
+`exportToday()`'s quick menu export. `block_assignments` (keyed `(day, block-id)`) still backs
+manual overrides for exactly these paths.
+
+**Floating periods (`PeriodCompiler`/`Period`) — Review and Submit.** `PeriodCompiler.compile(day:
+config: store: attribution: ollama:)` (async) is the retrospective/batch day-builder used by
+**Review today…** and worklog submission. It carves a day into `Period`s (`kind`:
+`.regular`/`.daily`/`.breakPeriod`/`.codeReview`/`.meeting`) instead of fixed clock-aligned blocks:
+
+- Code-review periods group segments already tagged live by the PR-review feature
+  (`ticketSource == "prReview"`) — no new detection, just grouping.
+- Meeting periods group segments carrying `Segment.meeting` (set by `FocusMonitor.flush()` from
+  `WorkContext.meeting`); one matching `config.dailyStandupTitleMatch` becomes a `.daily` period on
+  the fixed `dailyStandupTicket` instead of going through the Ollama guess.
+- A `.breakPeriod` is injected unconditionally at `config.breakStartHour` for
+  `breakDurationMinutes` — not detected from an idle gap — and clips overlapping time out of every
+  other period (break wins outright over whatever else was scheduled then).
+- Everything left over floats into `blockHours`-sized `.regular` buckets: accumulated *active*
+  time, skipping over the carve-outs above (so a block can span more wall-clock time than
+  `blockHours` if a meeting interrupted it). Each bucket's ticket is chosen by a duration + explicit
+  ticket-key-mention score (`Config.periodMentionWeightSeconds`), gated to candidates where
+  `Ticket.assignedToMe && Ticket.isInProgressLike(preferredStates:)` — `isInProgressLike` exists
+  because `statusCategory` is Azure-DevOps-only (always nil for Jira), so it falls back through
+  `preferredTicketStates` membership, then a plain "contains progress" name heuristic, before
+  giving up. A block with no qualifying candidate abstains rather than guessing wrong.
+- Non-regular periods round their *reported* (submitted) duration to `periodRoundMinutes`, clamped
+  to `periodMinMinutes`; floating regular blocks are exempt. If the day's total falls short of the
+  target (`workdayHours`, or `summerFridayHours` on a qualifying Friday —
+  `TimeBlocks.isSummerFriday`/`dailyTargetSeconds`), the shortfall pads the single most-dominant
+  regular period's reported duration; overtime is never trimmed. `Period.trueSeconds` always holds
+  the real, unrounded, unpadded total, independent of `reportedSeconds` — load-bearing for a
+  possible future time-bank/weekly-rebalance feature, so don't collapse the two.
+- `seq` is a `Period`'s stable per-day identity — NOT positional, because a day's period shape is
+  data-dependent (a segment gets re-tagged, more activity accrues between two compiles). Saving
+  Review greedily matches each fresh period to a saved `period_assignments` row of the same `kind`
+  within ~10 minutes of the same `start`, reusing its `seq`; a genuinely new period gets a
+  brand-new, append-only `seq`. This is what keeps `Submit to Tempo`'s replace-not-duplicate
+  behavior working across edits — `worklogId(day:block:)` is called with `String(period.seq)` in
+  place of the old block-id string, so the worklog-id map format didn't need to change at all.
+
+Both `BlockReport` and `Period` conform to `PeriodicReport` (`byTicket`/`byCategory`) so
+`Summary.describe(_:)` works against either. `Summary.appendTimesheet(day:)` (fixed blocks) and
+`appendTimesheet(periods:day:)` (floating periods) both write to `~/timesheet-log.md`; submission
+goes via whichever `WorklogProvider` is active, to Tempo or 7pace — each keeps its **own**
 `(day|block) → worklogId` map file (`tempo-worklogs.json` is `[String: Int]`, 7pace's ids are UUID
 strings) so re-submitting replaces rather than duplicates. Don't merge them into one shared file —
 `TempoClient`'s decode is `try?`-and-silently-empty on a shape mismatch, which would turn a format
@@ -255,7 +300,7 @@ All under `~/Library/Application Support/TimeTracker/` (`AppPaths.dataDir`):
 
 | File | Contents |
 |------|----------|
-| `timetracker.sqlite` | `segments`, `labels`, `block_assignments` (WAL mode; schema + `ALTER TABLE` migrations in `Store.createSchema`, which intentionally ignores "column exists" errors) |
+| `timetracker.sqlite` | `segments`, `labels`, `block_assignments`, `period_assignments` (WAL mode; schema + `ALTER TABLE` migrations in `Store.createSchema`, which intentionally ignores "column exists" errors) |
 | `config.json` | the `Config` struct |
 | `sprint.json` | ticket/work-item corpus written by the active `IssueProvider`'s refresh or `sync-sprint.sh` (gitignored); stamped with `provider` so a stale cross-provider file is ignored, not reused |
 | `corrections.json` | signature → ticket counts |
