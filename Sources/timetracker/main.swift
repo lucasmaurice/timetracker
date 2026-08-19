@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import SwiftUI
+import UserNotifications
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
@@ -78,6 +79,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupMainMenu()
         setupStatusItem()
         requestAccessibilityIfNeeded()
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
 
         monitor.onUpdate = { [weak self] state in
             DispatchQueue.main.async {
@@ -98,6 +100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.rebuildMenu(current: self?.monitor.currentState)
                 self?.runRefresh(silent: true)   // freshen the ticket corpus on launch if connected
                 self?.buildRepoBridgeAndBackfill()
+                self?.notifyIfIssueProviderDisconnected()
             }
         }
         reindexEmbeddings()
@@ -1233,6 +1236,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func requestAccessibilityIfNeeded() {
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(opts)
+    }
+
+    /// A silently-disconnected issue provider (e.g. a Keychain item that didn't survive a rebuild,
+    /// or credentials never entered) otherwise shows up only as "Connect …" quietly sitting in the
+    /// menu — easy to miss, and everything downstream (guessing, Review, submission) just degrades
+    /// with no obvious cause. Called once preload() has actually run, so `configured` is reliable.
+    private func notifyIfIssueProviderDisconnected() {
+        guard !issueProvider.configured else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "TimeTracker"
+        content.body = "Not connected to \(issueProvider.displayName) — tickets won't be guessed until you reconnect."
+        content.sound = .default
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "issue-provider-disconnected", content: content, trigger: nil))
     }
 
     // MARK: - Continuous embeddings (async, off the hot path)
