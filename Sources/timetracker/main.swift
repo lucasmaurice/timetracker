@@ -351,6 +351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         case .azureDevOps:
             if azureDevOps.configured {
+                if let org = azureDevOps.connectedOrg { menu.addItem(disabled("Connected to Azure DevOps (\(org))")) }
                 let logout = NSMenuItem(title: "Disconnect Azure DevOps", action: #selector(disconnectAzureDevOps), keyEquivalent: "")
                 logout.target = self; menu.addItem(logout)
             } else {
@@ -1084,6 +1085,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 attribution.reloadSprint()
                 reindexEmbeddings()
                 rebuildMenu(current: monitor.currentState)
+                // Remember the org on disk so it pre-fills next time (and survives a restart) —
+                // re-read first, same as addNoTicketRule, so this doesn't clobber unrelated
+                // Settings edits made since launch. AppDelegate's own `config` is a `let` (every
+                // setting needs a restart to take effect, by design), so this only affects the
+                // NEXT launch's prefill, not this session's live dialog.
+                var disk = Config.load()
+                if disk.azureOrg != creds.org { disk.azureOrg = creds.org; disk.save() }
                 showInfo("Connected to \(who). Loaded \(r.open) open / \(r.total) total work item(s).")
             } catch {
                 azureDevOps.disconnect()   // don't keep bad credentials
