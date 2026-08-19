@@ -85,17 +85,36 @@ final class AzureDevOps: IssueProvider {
 
     /// The PAT owner's identity — a different host (`app.vssps.visualstudio.com`, not
     /// `dev.azure.com`) than every other call in this file, so it can't reuse `orgBase()`. Cached
-    /// for the session; failures are silent (menu just omits the "as <user>" part) since this is
-    /// cosmetic, not required for anything functional.
+    /// for the session; a failure just means the menu omits the "as <user>" part (cosmetic, not
+    /// functional), but logs the actual status/body to stderr (~/Library/Application
+    /// Support/TimeTracker/stderr.log when run via the LaunchAgent) since this endpoint was never
+    /// verified against a real tenant and silently swallowing every failure mode made it
+    /// undebuggable the first time it didn't work.
     private func resolveIdentity() async {
-        guard cachedUser == nil,
-              let url = URL(string: "https://app.vssps.visualstudio.com/_apis/profile/profiles/me?api-version=7.1"),
-              let req = try? authedRequest(url: url),
-              let (data, resp) = try? await URLSession.shared.data(for: req),
-              (try? Self.check(resp, data)) != nil,
-              let profile = try? JSONDecoder().decode(Profile.self, from: data)
+        guard cachedUser == nil else { return }
+        guard let url = URL(string: "https://app.vssps.visualstudio.com/_apis/profile/profiles/me?api-version=7.1"),
+              let req = try? authedRequest(url: url)
         else { return }
+        guard let (data, resp) = try? await URLSession.shared.data(for: req) else {
+            FileHandle.standardError.write("azdo identity: request failed (network)\n".data(using: .utf8)!)
+            return
+        }
+        do {
+            try Self.check(resp, data)
+        } catch {
+            let body = String(data: data, encoding: .utf8)?.prefix(500) ?? ""
+            FileHandle.standardError.write("azdo identity: \(error.localizedDescription) — body: \(body)\n".data(using: .utf8)!)
+            return
+        }
+        guard let profile = try? JSONDecoder().decode(Profile.self, from: data) else {
+            let body = String(data: data, encoding: .utf8)?.prefix(500) ?? ""
+            FileHandle.standardError.write("azdo identity: decode failed — body: \(body)\n".data(using: .utf8)!)
+            return
+        }
         cachedUser = profile.displayName ?? profile.emailAddress
+        if cachedUser == nil {
+            FileHandle.standardError.write("azdo identity: decoded profile had no displayName/emailAddress\n".data(using: .utf8)!)
+        }
     }
 
     /// 7pace and worklog submission need no AzDO identity — `resolveAuthor` on `WorklogProvider`
