@@ -20,14 +20,16 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/timetracker"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 
-# Stamp the build identity (short SHA + dirty flag) into CFBundleVersion so the running app can
-# show exactly what's running — every rebuild changes the code hash anyway (see the signing note
-# below), and this session alone has hit more than one "is this build actually the latest" bug.
+# Stamp the build identity (short SHA + dirty flag) and build time into Info.plist so the running
+# app can show exactly what's running — every rebuild changes the code hash anyway (see the
+# signing note below), and this session alone has hit more than one "is this build actually the
+# latest" bug.
 GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
     GIT_SHA="${GIT_SHA}-dirty"
 fi
 plutil -replace CFBundleVersion -string "$GIT_SHA" "$APP/Contents/Info.plist"
+plutil -replace TTBuildTime -string "$(date '+%d/%m %Hh%M')" "$APP/Contents/Info.plist"
 
 # Ad-hoc signing with a stable bundle identifier. Note: the code hash still changes
 # each rebuild, so after a rebuild you must re-grant Accessibility. The helper
