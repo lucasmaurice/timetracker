@@ -49,7 +49,8 @@ final class AzureDevOps: IssueProvider {
     func connect(org: String, pat: String) async throws -> String {
         let trimmedOrg = org.trimmingCharacters(in: .whitespaces)
         let creds = Credentials(org: trimmedOrg, pat: pat)
-        cached = creds; loaded = true
+        Keychain.setCodable(creds, account: Self.account)
+        cached = creds; loaded = true   // own the item under THIS binary; no re-read needed
         return try await testConnection()
     }
 
