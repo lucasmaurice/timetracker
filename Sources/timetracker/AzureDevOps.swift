@@ -96,7 +96,9 @@ final class AzureDevOps: IssueProvider {
     /// (~/Library/Application Support/TimeTracker/stderr.log when run via the LaunchAgent).
     private func resolveIdentity() async {
         guard cachedUser == nil else { return }
-        guard let url = URL(string: "\((try? orgBase()) ?? "")/_apis/connectionData?api-version=7.1"),
+        // connectionData is a preview-only resource — confirmed via a real 400
+        // (VssInvalidPreviewVersionException) against plain api-version=7.1.
+        guard let url = URL(string: "\((try? orgBase()) ?? "")/_apis/connectionData?api-version=7.1-preview"),
               let req = try? authedRequest(url: url)
         else { return }
         guard let (data, resp) = try? await URLSession.shared.data(for: req) else {
