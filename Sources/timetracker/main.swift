@@ -27,6 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var reviewWindow: NSWindow?
     private var reviewHost: NSHostingController<ReviewView>?
     private var reviewModel: ReviewModel?
+    private var reviewPeriods: [Period] = []
     private var reviewDay = Date()
     private var assignWindow: NSWindow?
     private var assignHost: NSHostingController<AssignView>?
@@ -470,47 +471,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func presentReview(day: Date) {
         reviewDay = day
         monitor.flush()   // persist the in-progress segment so today's latest work shows + can be learned
-        let view = makeReviewView(day: reviewDay)
-        if let host = reviewHost, let win = reviewWindow {
-            host.rootView = view
+        Task { @MainActor in
+            let view = await self.makeReviewView(day: self.reviewDay)
+            if let host = self.reviewHost, let win = self.reviewWindow {
+                host.rootView = view
+                NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil)
+                return
+            }
+            let host = NSHostingController(rootView: view)
+            let win = NSWindow(contentViewController: host)
+            win.title = "TimeTracker Review"
+            win.styleMask = [.titled, .closable, .resizable]
+            win.setContentSize(NSSize(width: 600, height: 560))
+            win.isReleasedWhenClosed = false
+            win.center()
+            self.reviewHost = host; self.reviewWindow = win
             NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil)
-            return
         }
-        let host = NSHostingController(rootView: view)
-        let win = NSWindow(contentViewController: host)
-        win.title = "TimeTracker Review"
-        win.styleMask = [.titled, .closable, .resizable]
-        win.setContentSize(NSSize(width: 600, height: 560))
-        win.isReleasedWhenClosed = false
-        win.center()
-        reviewHost = host; reviewWindow = win
-        NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil)
     }
 
-    private func makeReviewView(day: Date) -> ReviewView {
-        let blocks = summary.dayReports(day).map { r -> ReviewBlock in
-            let alts = (r.contextDoc.map { attribution.explain(doc: $0) } ?? [])
+    private func makeReviewView(day: Date) async -> ReviewView {
+        let periods = await PeriodCompiler.compile(day: day, config: config, store: store, attribution: attribution, ollama: ollama)
+        reviewPeriods = periods
+        let reviewPeriodsUI = periods.map { p -> ReviewPeriod in
+            let alts = (p.contextDoc.map { attribution.explain(doc: $0) } ?? [])
                 .map { ReviewAlt(key: $0.key, summary: $0.summary, score: $0.score) }
             var why: String?
-            if let src = r.guessSource {
+            if let src = p.guessSource {
                 why = Attribution.isExact(src) ? "from \(src)"
-                    : "\(src)" + (r.guessConfidence.map { String(format: " · %.2f", $0) } ?? "")
+                    : "\(src)" + (p.guessConfidence.map { String(format: " · %.2f", $0) } ?? "")
             }
-            return ReviewBlock(
-                block: r.block,
-                rangeText: r.label,
-                activeSeconds: r.activeSeconds, idleSeconds: r.idleSeconds,
-                slices: r.byTicket.map { Slice(label: $0.ticket ?? "untracked", seconds: $0.seconds) },
-                recap: r.recap ?? "",
-                guessKey: r.guessKey,
-                guessSummary: r.guessKey.flatMap { attribution.summary(for: $0) },
+            let hm = DateFormatter(); hm.dateFormat = "HH:mm"
+            return ReviewPeriod(
+                seq: p.id, kind: p.kind,
+                rangeText: "\(hm.string(from: p.start))–\(hm.string(from: p.end))",
+                activeSeconds: p.trueSeconds, idleSeconds: 0,
+                slices: p.byTicket.map { Slice(label: $0.ticket ?? "untracked", seconds: $0.seconds) },
+                recap: p.recap ?? "",
+                guessKey: p.ticket,
+                guessSummary: p.ticket.flatMap { attribution.summary(for: $0) },
                 guessWhy: why,
                 alternatives: alts,
-                originalGuess: r.guessKey ?? "",
-                ticket: r.effectiveTicket ?? "",
-                note: r.assignedNote ?? "")
+                originalGuess: p.ticket ?? "",
+                ticket: p.effectiveTicket ?? "",
+                note: p.assignedNote ?? "")
         }
-        let model = ReviewModel(dayText: TimeBlocks.dayString(day), blocks: blocks,
+        let model = ReviewModel(dayText: TimeBlocks.dayString(day), periods: reviewPeriodsUI,
                                 tickets: attribution.pickerTickets, noTicketLabel: config.noTicketLabel)
         reviewModel = model
         return ReviewView(model: model,
@@ -556,33 +562,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func submitToTempoFromReview() {
         guard let model = reviewModel else { return }
         let dayStr = TimeBlocks.dayString(reviewDay)
-        let blocks = TimeBlocks.blocks(for: reviewDay, config)
-        let seconds = Int(config.blockHours * 3600)
-        let planned: [PlannedWorklog] = model.blocks.compactMap { b in
-            let raw = b.ticket.trimmingCharacters(in: .whitespaces)
+        let periodsBySeq = Dictionary(uniqueKeysWithValues: reviewPeriods.map { ($0.id, $0) })
+        let tf = DateFormatter(); tf.dateFormat = "HH:mm:ss"
+        let planned: [PlannedWorklog] = model.periods.compactMap { rp in
+            guard let p = periodsBySeq[rp.seq] else { return nil }
+            let raw = rp.ticket.trimmingCharacters(in: .whitespaces)
             guard !raw.isEmpty else { return nil }
             let ticket: String
             if raw.caseInsensitiveCompare(config.noTicketLabel) == .orderedSame {
-                // "No ticket": map to the configured fallback, or skip Tempo for this block.
+                // "No ticket": map to the configured fallback, or skip Tempo for this period.
                 let fb = config.noTicketTempoTicket.trimmingCharacters(in: .whitespaces).uppercased()
                 guard !fb.isEmpty else { return nil }
                 ticket = fb
             } else {
                 ticket = raw.uppercased()
             }
-            let startHour = blocks.first { $0.id == b.block }?.nominalStartHour ?? config.dayStartHour
-            let startTime = String(format: "%02d:%02d:00", Int(startHour) % 24, Int((startHour - startHour.rounded(.down)) * 60))
-            let desc = b.note.trimmingCharacters(in: .whitespaces).isEmpty
-                ? "\(ticket) — \(dayStr) \(b.rangeText) (TimeTracker)" : b.note
-            return PlannedWorklog(date: dayStr, block: b.block, ticket: ticket, startTime: startTime, seconds: seconds, description: desc)
+            // Real per-period start time and REPORTED duration (rounded/padded, not a fixed
+            // blockHours) — the whole point of the floating-period model over the old fixed blocks.
+            let startTime = tf.string(from: p.start)
+            let seconds = Int(p.reportedSeconds)
+            let desc = rp.note.trimmingCharacters(in: .whitespaces).isEmpty
+                ? "\(ticket) — \(dayStr) \(rp.rangeText) (TimeTracker)" : rp.note
+            return PlannedWorklog(date: dayStr, block: rp.seq, ticket: ticket, startTime: startTime, seconds: seconds, description: desc)
         }
-        guard !planned.isEmpty else { showInfo("Nothing to submit — assign a ticket to a block first."); return }
+        guard !planned.isEmpty else { showInfo("Nothing to submit — assign a ticket to a period first."); return }
 
         // Preview exactly what will be posted.
         NSApp.activate(ignoringOtherApps: true)
         let preview = NSAlert()
         preview.messageText = "Submit \(planned.count) worklog(s) to \(worklogProvider.displayName)?"
-        preview.informativeText = planned.map { "• \($0.date) \($0.block) · \($0.ticket) · 4h\n   “\($0.description)”" }
+        preview.informativeText = planned.map { "• \($0.date) \($0.startTime.prefix(5)) · \($0.ticket) · \(Summary.hm(Double($0.seconds)))\n   “\($0.description)”" }
             .joined(separator: "\n") + "\n\nThis posts to your official \(worklogProvider.displayName) timesheet."
         preview.addButton(withTitle: "Submit to \(worklogProvider.displayName)")
         preview.addButton(withTitle: "Cancel")
@@ -674,25 +683,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func saveReview() {
         guard let model = reviewModel else { return }
         let dayStr = TimeBlocks.dayString(reviewDay)
+        let periodsBySeq = Dictionary(uniqueKeysWithValues: reviewPeriods.map { ($0.id, $0) })
         var taught = 0
-        for b in model.blocks {
-            let raw = b.ticket.trimmingCharacters(in: .whitespaces)
+        for rp in model.periods {
+            guard let p = periodsBySeq[rp.seq] else { continue }
+            let raw = rp.ticket.trimmingCharacters(in: .whitespaces)
             // Normalize (pasted URL → key); the review stays authoritative for free-form keys.
             let key = raw.isEmpty ? nil : (attribution.normalizeTicketEntry(raw) ?? raw.uppercased())
-            let note = b.note.trimmingCharacters(in: .whitespaces)
-            store.setBlockAssignment(day: dayStr, block: b.block,
-                                     ticket: key, note: note.isEmpty ? nil : note)
+            let note = rp.note.trimmingCharacters(in: .whitespaces)
+            store.setPeriodAssignment(day: dayStr, seq: Int(rp.seq) ?? p.seq, kind: p.kind.rawValue,
+                                      start: p.start, end: p.end, ticket: key, note: note.isEmpty ? nil : note)
 
             // Teach the guesser — but only from signal, never from silence: when the user changed
             // the system's guess, or explicitly confirmed it. This is the primary labeling pipeline.
             if let key, !key.isEmpty {
-                let changed = key.caseInsensitiveCompare(b.originalGuess) != .orderedSame
-                if changed || b.confirmed { taught += learnBlock(blockId: b.block, ticket: key) }
+                let changed = key.caseInsensitiveCompare(rp.originalGuess) != .orderedSame
+                if changed || rp.confirmed { taught += learnPeriod(p, ticket: key) }
             }
         }
         if taught > 0 { attribution.reloadMemory() }   // new labels feed content memory (k-NN)
 
-        let rows = summary.appendTimesheet(day: reviewDay)
+        let rows = summary.appendTimesheet(periods: reviewPeriods, day: reviewDay)
         let alert = NSAlert()
         alert.messageText = rows.isEmpty ? "Nothing to export" : "Exported \(rows.count) row(s)"
         var info = rows.joined(separator: "\n")
@@ -701,13 +712,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.runModal()
     }
 
-    /// Turn a confirmed/corrected block into training examples from its REAL work contexts (the
-    /// persisted `context_doc` of its segments), capped to the few longest distinct contexts.
-    /// Returns how many labels were written.
+    /// Turn a confirmed/corrected period into training examples from its REAL work contexts (the
+    /// persisted `context_doc` of its OWN member segments — not re-queried from the store, so a
+    /// floating regular block's skipped-over carve-outs are never pulled in). Capped to the few
+    /// longest distinct contexts. Returns how many labels were written.
     @discardableResult
-    private func learnBlock(blockId: String, ticket: String) -> Int {
-        guard let bounds = TimeBlocks.bounds(day: reviewDay, id: blockId, config) else { return 0 }
-        let segs = store.segments(from: bounds.start, to: bounds.end).filter { !$0.idle }
+    private func learnPeriod(_ period: Period, ticket: String) -> Int {
+        let segs = period.members.map { $0.segment }
         guard !segs.isEmpty else { return 0 }
         // Distinct rich contexts by total duration; fall back to a reconstructed app+title doc.
         var byDoc: [String: Double] = [:]
@@ -732,7 +743,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func shiftReview(_ delta: Int) {
         reviewDay = Calendar.current.date(byAdding: .day, value: delta, to: reviewDay) ?? reviewDay
-        reviewHost?.rootView = makeReviewView(day: reviewDay)
+        Task { @MainActor in
+            self.reviewHost?.rootView = await self.makeReviewView(day: self.reviewDay)
+        }
     }
 
     private func clock(_ d: Date) -> String {
@@ -1397,12 +1410,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// True if the day has activity but at least one active 4h block has no assignment yet.
+    /// True if the day has activity but Review was never saved for it. Deliberately coarser than
+    /// the old per-block check (which read `block_assignments` directly) — now that Save writes
+    /// `period_assignments` instead, per-block granularity doesn't carry over cleanly (a day's
+    /// period shape is data-dependent, not a fixed list of ids), and "did you forget entirely" is
+    /// what this reminder is actually for, not "did you assign every period."
     private func dayNeedsFilling(_ day: Date) -> Bool {
-        for r in summary.dayReports(day) where r.hasActivity {
-            if store.blockAssignment(day: TimeBlocks.dayString(day), block: r.block) == nil { return true }
-        }
-        return false
+        guard summary.dayReports(day).contains(where: { $0.hasActivity }) else { return false }
+        return store.periodAssignments(day: TimeBlocks.dayString(day)).isEmpty
     }
 
     /// The most recent prior day that had activity; returned only if it still needs filling.
