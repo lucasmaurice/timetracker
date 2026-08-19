@@ -254,7 +254,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let t = attr?.ticket, t != config.noTicketLabel {
             let summary = attribution.summary(for: t)
             let titleLine = "\(t)\(summary.map { " — \($0.prefix(60))" } ?? "")"
-            if let url = issueProvider.browserURL(forKey: t) {
+            let project = attribution.tickets(for: [t]).first?.project
+            if let url = issueProvider.browserURL(forKey: t, project: project) {
                 let item = NSMenuItem(title: titleLine, action: #selector(openTicketURL), keyEquivalent: "")
                 item.target = self; item.representedObject = url
                 menu.addItem(item)

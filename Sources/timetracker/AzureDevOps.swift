@@ -83,15 +83,21 @@ final class AzureDevOps: IssueProvider {
             .flatMap { $0.hasPrefix("AB#") ? String($0.dropFirst(3)) : nil }
     }
 
-    /// The org-wide edit URL redirects to the right project automatically — no need to know which
-    /// project this particular work item lives in (the same shortcut `resolveWorkItem(forPullRequestId:)`
-    /// avoids needing up front).
-    func browserURL(forKey key: String) -> URL? {
-        guard let org = connectedOrg,
+    /// Unlike the PR→work-item API lookups (which accept a bare id org-wide), the web UI edit URL
+    /// genuinely needs a project segment to resolve — confirmed against a real link
+    /// (https://dev.azure.com/ProgiDev/DevOps/_workitems/edit/59482). `project` should be the
+    /// ticket's own stored `Ticket.project`; falls back to `config.azureProject` if that's nil
+    /// (e.g. a single-project setup, or a ticket predating this field), and gives up rather than
+    /// guess wrong if neither is known.
+    func browserURL(forKey key: String, project: String?) -> URL? {
+        let proj = (project?.isEmpty == false ? project : nil) ?? config.azureProject
+        guard let org = connectedOrg, !proj.isEmpty,
               let id = AzureBoardsKeyFormat(branchPattern: config.azureBranchKeyPattern).canonicalize(key)
                   .flatMap({ $0.hasPrefix("AB#") ? String($0.dropFirst(3)) : nil })
         else { return nil }
-        return URL(string: "https://dev.azure.com/\(org.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? org)/_workitems/edit/\(id)")
+        let encodedOrg = org.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? org
+        let encodedProject = proj.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? proj
+        return URL(string: "https://dev.azure.com/\(encodedOrg)/\(encodedProject)/_workitems/edit/\(id)")
     }
 
     // MARK: - Pull requests (for AzurePRBridge)
@@ -195,9 +201,10 @@ final class AzureDevOps: IssueProvider {
     private func ticket(fromBatchItem item: BatchItem, assignedToMe: Bool) async -> Ticket {
         let f = item.fields
         let areaPath = f["System.AreaPath"]?.stringValue ?? ""
+        let project = areaPath.split(separator: "\\").first.map(String.init) ?? config.azureProject
         let type = f["System.WorkItemType"]?.stringValue ?? ""
         let state = f["System.State"]?.stringValue ?? ""
-        let categories = await stateCategories(forType: type, project: areaPath.split(separator: "\\").first.map(String.init) ?? config.azureProject)
+        let categories = await stateCategories(forType: type, project: project)
         let category = categories[state]
         let done = category == "Completed" || category == "Removed"
         let title = f["System.Title"]?.stringValue ?? ""
@@ -207,7 +214,8 @@ final class AzureDevOps: IssueProvider {
         return Ticket(key: "AB#\(item.id)", summary: title, text: text, status: state,
                       updated: f["System.ChangedDate"]?.stringValue, done: done,
                       inSprint: false, inQueue: false, common: false,
-                      issueId: "\(item.id)", statusCategory: category, assignedToMe: assignedToMe)
+                      issueId: "\(item.id)", statusCategory: category, assignedToMe: assignedToMe,
+                      project: project.isEmpty ? nil : project)
     }
 
     // MARK: - WIQL → workitemsbatch → sprint.json
@@ -352,9 +360,10 @@ final class AzureDevOps: IssueProvider {
             let areaPath = f["System.AreaPath"]?.stringValue ?? ""
             if excludedAreas.contains(where: { !$0.isEmpty && areaPath.lowercased().hasPrefix($0) }) { continue }
 
+            let project = areaPath.split(separator: "\\").first.map(String.init) ?? config.azureProject
             let type = f["System.WorkItemType"]?.stringValue ?? ""
             let state = f["System.State"]?.stringValue ?? ""
-            let categories = await stateCategories(forType: type, project: areaPath.split(separator: "\\").first.map(String.init) ?? config.azureProject)
+            let categories = await stateCategories(forType: type, project: project)
             let category = categories[state]
             let done = category == "Completed" || category == "Removed"
 
@@ -372,7 +381,8 @@ final class AzureDevOps: IssueProvider {
                 updated: f["System.ChangedDate"]?.stringValue, done: done,
                 inSprint: false,  // resolved below, once, from the team's current iteration
                 inQueue: false, common: false, issueId: "\(item.id)", statusCategory: category,
-                assignedToMe: true))  // the WIQL is always "AssignedTo = @Me" — explicit for clarity
+                assignedToMe: true,  // the WIQL is always "AssignedTo = @Me" — explicit for clarity
+                project: project.isEmpty ? nil : project))
         }
 
         if let currentPath = await currentIterationPath() {

@@ -127,8 +127,11 @@ protocol IssueProvider: AnyObject {
     func refreshSprint() async throws -> RefreshResult
     func fetchIssueId(forKey: String) async -> String?
     /// The ticket/work-item's browser page, for a menu "Open in browser" action. Nil when not
-    /// connected (no site/org known yet) or the key doesn't parse for this provider.
-    func browserURL(forKey key: String) -> URL?
+    /// connected (no site/org known yet) or the key doesn't parse for this provider. `project` is
+    /// Azure Boards' `Ticket.project` (ignored by Jira) — its work-item URL needs a project
+    /// segment (`/{org}/{project}/_workitems/edit/{id}`) and this org's work spans multiple
+    /// projects, so it can't be assumed from `config.azureProject` alone.
+    func browserURL(forKey key: String, project: String?) -> URL?
 }
 
 /// A destination for worklogs. `resolveAuthor` puts "whose identity does this worklog need" on

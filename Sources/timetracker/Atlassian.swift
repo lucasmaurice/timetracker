@@ -122,7 +122,7 @@ final class Atlassian: IssueProvider {
         return obj["id"] as? String
     }
 
-    func browserURL(forKey key: String) -> URL? {
+    func browserURL(forKey key: String, project: String?) -> URL? {
         guard let site else { return nil }
         return URL(string: "https://\(site)/browse/\(key)")
     }

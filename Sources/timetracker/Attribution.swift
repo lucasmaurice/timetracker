@@ -24,17 +24,24 @@ struct Ticket: Codable, Equatable {
     /// teammate's work item — see `PeriodCompiler`'s regular-block candidate gate, which requires
     /// this to be true (code-review periods deliberately don't).
     var assignedToMe: Bool = true
+    /// Azure Boards project name (the first segment of AreaPath, e.g. "DevOps" from
+    /// "DevOps\Service Desk") — nil for Jira, where the key prefix already implies the project.
+    /// Needed because the work-item browser URL requires a project segment
+    /// (`/{org}/{project}/_workitems/edit/{id}`) and this org's work spans multiple projects
+    /// (DevOps/Infra/Platform), so it can't be assumed from `config.azureProject` alone.
+    var project: String?
 
     init(key: String, summary: String, text: String? = nil, status: String? = nil, updated: String? = nil,
          done: Bool = false, inSprint: Bool = false, inQueue: Bool = false, common: Bool = false,
-         issueId: String? = nil, statusCategory: String? = nil, assignedToMe: Bool = true) {
+         issueId: String? = nil, statusCategory: String? = nil, assignedToMe: Bool = true, project: String? = nil) {
         self.key = key; self.summary = summary; self.text = text; self.status = status; self.updated = updated
         self.done = done; self.inSprint = inSprint; self.inQueue = inQueue; self.common = common
         self.issueId = issueId; self.statusCategory = statusCategory; self.assignedToMe = assignedToMe
+        self.project = project
     }
 
     private enum CodingKeys: String, CodingKey {
-        case key, summary, text, status, updated, done, inSprint, inQueue, common, issueId, statusCategory, assignedToMe
+        case key, summary, text, status, updated, done, inSprint, inQueue, common, issueId, statusCategory, assignedToMe, project
     }
 
     /// A plain synthesized `Decodable` would throw on any `sprint.json` written before this field
@@ -56,6 +63,7 @@ struct Ticket: Codable, Equatable {
         issueId = try c.decodeIfPresent(String.self, forKey: .issueId)
         statusCategory = try c.decodeIfPresent(String.self, forKey: .statusCategory)
         assignedToMe = try c.decodeIfPresent(Bool.self, forKey: .assignedToMe) ?? true
+        project = try c.decodeIfPresent(String.self, forKey: .project)
     }
 
     /// What the lexical/embedding matcher sees (rich, includes the description).
