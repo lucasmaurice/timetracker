@@ -29,6 +29,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var reviewHost: NSHostingController<ReviewView>?
     private var reviewModel: ReviewModel?
     private var reviewPeriods: [Period] = []
+    /// The in-flight review compile, so a new one supersedes it instead of racing it — see
+    /// `refreshReviewView`.
+    private var reviewTask: Task<Void, Never>?
     private var reviewDay = Date()
     private var assignWindow: NSWindow?
     private var assignHost: NSHostingController<AssignView>?
@@ -508,11 +511,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func presentReview(day: Date) {
         reviewDay = day
         monitor.flush()   // persist the in-progress segment so today's latest work shows + can be learned
-        Task { @MainActor in
-            let view = await self.makeReviewView(day: self.reviewDay)
+        refreshReviewView(day: reviewDay, present: true)
+    }
+
+    /// Compiles `day` and swaps it into the review window, cancelling any compile still running.
+    ///
+    /// Both guards matter. `PeriodCompiler.compile` awaits one Ollama round trip per meeting
+    /// session, so it is easily seconds long: without cancellation, paging days quickly leaves
+    /// several compiles in flight and the one that *finishes* last wins the view — not the one the
+    /// user asked for last. And since `reviewDay` has already moved on by then, `saveReview` would
+    /// write `TimeBlocks.dayString(reviewDay)` against a `reviewPeriods` array belonging to a
+    /// different day. The staleness check is belt-and-braces for the same reason: cancellation is
+    /// cooperative, so a task can still return a result after being cancelled.
+    private func refreshReviewView(day: Date, present: Bool) {
+        reviewTask?.cancel()
+        reviewTask = Task { @MainActor in
+            let view = await self.makeReviewView(day: day)
+            guard !Task.isCancelled, day == self.reviewDay else { return }
             if let host = self.reviewHost, let win = self.reviewWindow {
                 host.rootView = view
-                NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil)
+                if present { NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil) }
                 return
             }
             let host = NSHostingController(rootView: view)
@@ -607,6 +625,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let tf = DateFormatter(); tf.dateFormat = "HH:mm:ss"
         let planned: [PlannedWorklog] = model.periods.compactMap { rp in
             guard let p = periodsById[rp.id] else { return nil }
+            // Same predicate the timesheet export uses (`appendTimesheet(periods:day:)` filters on
+            // `hasActivity`). They used to disagree: submit billed periods the export omitted, so a
+            // sub-minute period clamped up to `periodMinMinutes` became a 15-minute worklog that
+            // appeared nowhere in timesheet-log.md — impossible to reconcile after the fact.
+            guard p.hasActivity else { return nil }
             let raw = rp.ticket.trimmingCharacters(in: .whitespaces)
             guard !raw.isEmpty else { return nil }
             let ticket: String
@@ -810,9 +833,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func shiftReview(_ delta: Int) {
         reviewDay = Calendar.current.date(byAdding: .day, value: delta, to: reviewDay) ?? reviewDay
-        Task { @MainActor in
-            self.reviewHost?.rootView = await self.makeReviewView(day: self.reviewDay)
-        }
+        refreshReviewView(day: reviewDay, present: false)
     }
 
     private func clock(_ d: Date) -> String {
@@ -1520,9 +1541,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `period_assignments` instead, per-block granularity doesn't carry over cleanly (a day's
     /// period shape is data-dependent, not a fixed list of ids), and "did you forget entirely" is
     /// what this reminder is actually for, not "did you assign every period."
+    ///
+    /// All three checks are needed. `period_assignments` is a new table, so on its own it reports
+    /// EVERY day predating the floating-period compiler as unfilled — including days already
+    /// reviewed and submitted under the fixed-block model. That isn't just noise: it nudges the
+    /// user to reopen and re-submit historical days, which is exactly the path that duplicates
+    /// worklogs (their old map keys no longer resolve — see `WorklogKey`).
     private func dayNeedsFilling(_ day: Date) -> Bool {
         guard summary.dayReports(day).contains(where: { $0.hasActivity }) else { return false }
-        return store.periodAssignments(day: TimeBlocks.dayString(day)).isEmpty
+        let dayStr = TimeBlocks.dayString(day)
+        if !store.periodAssignments(day: dayStr).isEmpty { return false }
+        if (UserDefaults.standard.stringArray(forKey: "submittedDays") ?? []).contains(dayStr) { return false }
+        // Legacy: reviewed under the fixed-block model, before period_assignments existed.
+        return !TimeBlocks.blocks(for: day, config).contains { store.blockAssignment(day: dayStr, block: $0.id)?.ticket?.isEmpty == false }
     }
 
     /// The most recent prior day that had activity; returned only if it still needs filling.

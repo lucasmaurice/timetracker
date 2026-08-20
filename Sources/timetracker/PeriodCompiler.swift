@@ -125,11 +125,49 @@ enum PeriodCompiler {
         // Gated to assignedToMe + isInProgressLike; ungated/untracked time pools into one
         // unticketed "regular" entry rather than each losing its own identity silently.
         let regularSegs = allSegs.filter { !$0.idle && $0.ticketSource != "prReview" && $0.meeting == nil }
-        let gate: (String) -> Bool = { key in
-            guard let t = attribution.tickets(for: [key]).first else { return false }
-            return t.assignedToMe && t.isInProgressLike(preferredStates: config.preferredTicketStatesLower)
+
+        // Manual block assignments (AssignView, abstain nudges) still write `block_assignments` —
+        // a (day, block-id) → ticket map keyed by clock window. That is an explicit statement by
+        // the user about that stretch of time, so it overrides the segment's own live-resolved
+        // ticket AND bypasses the corpus gate below. Without this they are written and then simply
+        // never read by Review/Submit, which is what the first cut of this compiler shipped:
+        // assigning a ticket from the menu appeared to work and silently changed nothing.
+        // Regular time only — daily/break/meeting/code-review carry their own fixed tickets.
+        let dayStr = TimeBlocks.dayString(day)
+        let overrides: [(start: Date, end: Date, ticket: String?)] = TimeBlocks.blocks(for: day, config).compactMap { b in
+            guard let raw = store.blockAssignment(day: dayStr, block: b.id)?.ticket, !raw.isEmpty else { return nil }
+            let isNone = raw.caseInsensitiveCompare(config.noTicketLabel) == .orderedSame
+            return (b.start, b.end, isNone ? nil : raw.uppercased())
         }
-        for (ticket, members) in groupByTicket(regularSegs, usable: usable, gate: gate) {
+        // Midpoint, not start: a segment straddling a block boundary belongs to whichever block
+        // holds most of it, and can't match two overrides.
+        func overriding(_ s: Segment) -> (start: Date, end: Date, ticket: String?)? {
+            let mid = s.start.addingTimeInterval(s.duration / 2)
+            return overrides.first { mid >= $0.start && mid < $0.end }
+        }
+
+        // Corpus lookup built ONCE. This was `attribution.tickets(for:)` — a linear scan with a
+        // locale-aware compare per element — called once per segment, i.e. O(segments × corpus)
+        // on the path that opens the Review window.
+        var corpus: [String: Ticket] = [:]
+        for t in attribution.sprint { corpus[t.key.uppercased()] = t }
+
+        // Effective grouping key for a regular segment, in strict precedence order:
+        // manual override → exact source → the assigned-and-active gate. Exact sources
+        // (url/branch/commit/title/session/learned/manual/pinned) are NEVER gated: `Attribution`
+        // treats them as unimpeachable everywhere else, and gating them here silently dumped
+        // correctly-attributed work into "untracked" whenever the ticket wasn't in your own
+        // assigned corpus — e.g. any key mined from git history, which lives in `guessTickets`
+        // rather than `sprint`. A gated-out segment returns nil and pools into the single
+        // unticketed entry rather than vanishing.
+        let resolveRegular: (Segment) -> String? = { s in
+            if let o = overriding(s) { return o.ticket }
+            guard let key = s.ticket, !key.isEmpty else { return nil }
+            if Attribution.isExact(s.ticketSource) { return key }
+            guard let t = corpus[key.uppercased()] else { return nil }
+            return t.assignedToMe && t.isInProgressLike(preferredStates: config.preferredTicketStatesLower) ? key : nil
+        }
+        for (ticket, members) in groupByTicket(regularSegs, usable: usable, resolve: resolveRegular) {
             periods.append(makePeriod(kind: .regular, members: members, ticket: ticket,
                                        guessSource: ticket != nil ? "period-regular" : nil))
         }
@@ -143,19 +181,19 @@ enum PeriodCompiler {
         return (start, start.addingTimeInterval(config.breakDurationMinutes * 60))
     }
 
-    /// Groups segments by their own `ticket` field across the WHOLE day (no time-bucketing) —
-    /// each distinct ticket becomes one group. `gate`, when supplied, redirects a segment whose
-    /// ticket fails it into the unticketed ("") group instead of dropping it outright, so gated-out
-    /// time still shows up as reviewable/assignable rather than silently vanishing.
+    /// Groups segments by ticket across the WHOLE day (no time-bucketing) — each distinct ticket
+    /// becomes one group. `resolve`, when supplied, decides a segment's effective grouping key
+    /// (see `resolveRegular`); returning nil redirects it into the unticketed ("") group instead
+    /// of dropping it outright, so excluded time still shows up as reviewable/assignable rather
+    /// than silently vanishing.
     private static func groupByTicket(_ segs: [Segment], usable: (Segment) -> Double,
-                                       gate: ((String) -> Bool)? = nil) -> [(ticket: String?, members: [(segment: Segment, seconds: Double)])] {
+                                       resolve: ((Segment) -> String?)? = nil) -> [(ticket: String?, members: [(segment: Segment, seconds: Double)])] {
         var byKey: [String: [(segment: Segment, seconds: Double)]] = [:]
         var order: [String] = []
         for s in segs {
             let secs = usable(s)
             guard secs > 0 else { continue }
-            var key = s.ticket ?? ""
-            if let gate, !key.isEmpty, !gate(key) { key = "" }
+            let key = (resolve != nil ? resolve!(s) : s.ticket) ?? ""
             if byKey[key] == nil { order.append(key) }
             byKey[key, default: []].append((s, secs))
         }
@@ -288,7 +326,13 @@ enum PeriodCompiler {
         let roundTo = max(1, config.periodRoundMinutes * 60)
         let minSeconds = config.periodMinMinutes * 60
         for i in periods.indices {
+            // `.regular` is a real day sum, not a synthetic window — never rounded.
             guard periods[i].kind != .regular else { periods[i].reportedSeconds = periods[i].trueSeconds; continue }
+            // Nor is anything below the `hasActivity` floor, which export and submit both skip:
+            // clamping a 36-second PR glance up to `periodMinMinutes` used to show a 15-minute row
+            // that would never actually be billed, and fed that inflated figure into the shortfall
+            // calculation below.
+            guard periods[i].hasActivity else { periods[i].reportedSeconds = periods[i].trueSeconds; continue }
             let rounded = (periods[i].trueSeconds / roundTo).rounded() * roundTo
             periods[i].reportedSeconds = max(minSeconds, rounded)
         }

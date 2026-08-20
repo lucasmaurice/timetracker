@@ -196,7 +196,10 @@ lost). Each block becomes a `BlockReport`. This model is now used ONLY by the li
 a cheap, synchronous "which block is `now` in": `checkAbstainNudge`/`checkUnknownBacklog`'s
 real-time prompts, `AssignView`'s `.thisBlock` scope, `llmHints`'s "already logged today" line, and
 `exportToday()`'s quick menu export. `block_assignments` (keyed `(day, block-id)`) still backs
-manual overrides for exactly these paths.
+manual overrides for these paths — **and is also read by `PeriodCompiler`**, which applies each
+assigned block as a per-segment ticket override (by segment midpoint) over that clock window before
+grouping. Without that the two stores diverge and a ticket assigned from the menu is written, then
+never read by Review/Submit: it looks like it worked and changes nothing.
 
 **Per-ticket day totals (`PeriodCompiler`/`Period`) — Review and Submit.**
 `PeriodCompiler.compile(day: config: store: attribution: ollama:)` (async) is the retrospective/
@@ -213,8 +216,13 @@ each one a total for a `(kind, ticket)` pair, not a slice of the clock:
   `Ticket.assignedToMe && Ticket.isInProgressLike(preferredStates:)` — `isInProgressLike` exists
   because `statusCategory` is Azure-DevOps-only (always nil for Jira), so it falls back through
   `preferredTicketStates` membership, then a plain "contains progress" name heuristic, before
-  giving up; gated-out/untracked time pools into one unticketed `.regular` entry (still visible and
-  assignable in Review) instead of vanishing. Code-review segments (`ticketSource == "prReview"`,
+  giving up. The gate runs in strict precedence order — **manual `block_assignments` override →
+  `Attribution.isExact(ticketSource)` → the assigned-and-active check**. Exact sources are never
+  gated: gating them dumped correctly-attributed work into "untracked" whenever the key wasn't in
+  your own assigned corpus (anything mined from git history lives in `guessTickets`, not `sprint`),
+  which contradicts the invariant that an exact source is never second-guessed. Gated-out/untracked
+  time pools into one unticketed `.regular` entry (still visible and assignable in Review) instead
+  of vanishing. The corpus lookup is built once per compile, not per segment. Code-review segments (`ticketSource == "prReview"`,
   set live by the PR-review feature — see below) are NOT gated (a teammate's ticket is fine), and a
   PR with no linked board work item falls back to `config.genericCodeReviewTicket` instead of
   abstaining.
@@ -229,9 +237,12 @@ each one a total for a `(kind, ticket)` pair, not a slice of the clock:
 - A `.breakPeriod` is injected unconditionally at `config.breakStartHour` for
   `breakDurationMinutes` — not detected from an idle gap — and clips overlapping time out of every
   other period (break wins outright over whatever else was scheduled then).
-- Non-regular periods round their *reported* (submitted) duration to `periodRoundMinutes`, clamped
-  to `periodMinMinutes`; regular/code-review totals are exempt (they're real day sums, not a
-  synthetic window). If the day's total falls short of the target (`workdayHours`, or
+- Non-regular periods — daily/break/**code-review**/meeting — round their *reported* (submitted)
+  duration to `periodRoundMinutes`, clamped up to `periodMinMinutes`. Only `.regular` is exempt
+  (it's a real day sum, not a synthetic window). Code review is rounded despite also being a day
+  sum, because a PR glance is otherwise billed at its literal duration; note the clamp means a
+  sub-`periodMinMinutes` review is inflated, so `hasActivity` (≥60s) gates both export *and*
+  submission to keep the two reconcilable. If the day's total falls short of the target (`workdayHours`, or
   `summerFridayHours` on a qualifying Friday — `TimeBlocks.isSummerFriday`/`dailyTargetSeconds`),
   the shortfall pads the single most-dominant regular period's reported duration; overtime is never
   trimmed. `Period.trueSeconds` always holds the real, unrounded, unpadded total, independent of
