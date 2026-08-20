@@ -300,7 +300,11 @@ change into duplicate worklogs on the next submit.
 ## Conventions and constraints
 
 **Threading.** This is the most common source of real bugs here, and the comments in the code
-record which ones already happened:
+record which ones already happened. The target builds with
+`-strict-concurrency=targeted` (see `Package.swift` for why targeted and not complete), so anything
+using async/await, `Task`, or a `@Sendable` closure is compiler-checked — Swift 5 language mode
+alone caught none of this, which is how a live data race shipped clean. Keep the build at one
+known warning; if you add a second, you added a race:
 
 - Enrichment (AppleScript, `git`, `lsof`, `pgrep`, `kubectl`, `ps`) runs on `FocusMonitor`'s serial
   `enrichQueue`, never on main — it froze the menu bar. The enricher's caches assume that serial queue.
