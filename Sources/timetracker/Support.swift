@@ -1,8 +1,18 @@
 import Foundation
 
 enum AppPaths {
+    /// Test-only redirection of the ENTIRE data surface — db, config.json, sprint.json, the
+    /// worklog maps, everything derived from `dataDir` below. One override instead of threading a
+    /// path through `Store.init`, `Attribution.reloadSprint`, `Config.load` and the provider
+    /// clients separately, all of which read their location from here.
+    ///
+    /// nil (always, in the shipping app) = the real Application Support location. Tests that set
+    /// it must run serialized — it's process-global state.
+    nonisolated(unsafe) static var overrideDataDir: URL?
+
     static var dataDir: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        if let overrideDataDir { return overrideDataDir }
+        return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("TimeTracker", isDirectory: true)
     }
     static var configFile: URL { dataDir.appendingPathComponent("config.json") }

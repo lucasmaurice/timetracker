@@ -37,8 +37,33 @@ Running the app needs Accessibility (window titles) and Automation (browser tab 
 
 ## Testing
 
-There is **no unit-test target**. The equivalent is `timetracker --eval` (`EvalHarness.swift`),
-a read-only headless harness that never starts the menu-bar app. It reports:
+Two layers, and they cover different things.
+
+**Unit / regression tests — `swift test`.** `Tests/timetrackerTests`, using swift-testing
+(`@Test`/`#expect`). Deterministic and fully offline: `testConfig()` pins `ollamaEnabled = false`
+and the period knobs, so a `Config` default change can't silently move an assertion.
+
+`TestEnv` (in `TestSupport.swift`) redirects `AppPaths.overrideDataDir` at a fresh temp directory,
+so a test never reads or writes the real `~/Library/Application Support/TimeTracker` — it seeds its
+own sqlite file and `sprint.json`. That override is process-global, so **every suite using
+`TestEnv` must carry `.serialized`**, and `TestEnv.deinit` deliberately does NOT reset it (deinit
+isn't ordered against the next test's init, so resetting there can point a later test at the real
+data directory mid-run).
+
+Most of the suite is `PeriodCompiler` invariants pinned after the PR #5 review — exact sources
+surviving the corpus gate, manual `retag` granularity, the `hasActivity` floor, break clipping,
+shortfall padding, period-id uniqueness — plus `WorklogKey` legacy detection and `Ticket`'s
+backward-compatible decoding. Use `PeriodCompiler.compileFast` in tests: it is the whole pipeline
+minus the Ollama meeting guess, so it stays offline.
+
+One trap worth knowing: inside the `#expect` macro an integer *expression* (`8 * 3600`) is
+type-checked in isolation and defaults to `Int`, so comparing it against a `Double?` silently
+yields false. Spell expected Doubles explicitly (`28800.0`). A bare literal takes its type from
+context and is fine.
+
+**Attribution quality — `timetracker --eval`.** Not replaceable by unit tests: it measures ranking
+quality against your real labels rather than asserting behaviour. `EvalHarness.swift`,
+is a read-only headless harness that never starts the menu-bar app. It reports:
 
 - timesheet coverage over the last 30 days, broken down by `ticket_source`
 - the mined repo→ticket bridge
