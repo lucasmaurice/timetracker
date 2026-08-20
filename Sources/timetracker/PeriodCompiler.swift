@@ -144,34 +144,21 @@ enum PeriodCompiler {
         // unticketed "regular" entry rather than each losing its own identity silently.
         let regularSegs = allSegs.filter { !$0.idle && $0.ticketSource != "prReview" && $0.meeting == nil }
 
-        // Manual block assignments (AssignView, abstain nudges) still write `block_assignments` —
-        // a (day, block-id) → ticket map keyed by clock window. That is an explicit statement by
-        // the user about that stretch of time, so it overrides the segment's own live-resolved
-        // ticket AND bypasses the corpus gate below. Without this they are written and then simply
-        // never read by Review/Submit, which is what the first cut of this compiler shipped:
-        // assigning a ticket from the menu appeared to work and silently changed nothing.
-        // Regular time only — daily/break/meeting/code-review carry their own fixed tickets.
-        let dayStr = TimeBlocks.dayString(day)
-        let overrides: [(start: Date, end: Date, ticket: String?)] = TimeBlocks.blocks(for: day, config).compactMap { b in
-            guard let raw = store.blockAssignment(day: dayStr, block: b.id)?.ticket, !raw.isEmpty else { return nil }
-            let isNone = raw.caseInsensitiveCompare(config.noTicketLabel) == .orderedSame
-            return (b.start, b.end, isNone ? nil : raw.uppercased())
-        }
-        // Midpoint, not start: a segment straddling a block boundary belongs to whichever block
-        // holds most of it, and can't match two overrides.
-        func overriding(_ s: Segment) -> (start: Date, end: Date, ticket: String?)? {
-            let mid = s.start.addingTimeInterval(s.duration / 2)
-            return overrides.first { mid >= $0.start && mid < $0.end }
-        }
-
         // Corpus lookup built ONCE. This was `attribution.tickets(for:)` — a linear scan with a
         // locale-aware compare per element — called once per segment, i.e. O(segments × corpus)
         // on the path that opens the Review window.
         var corpus: [String: Ticket] = [:]
         for t in attribution.sprint { corpus[t.key.uppercased()] = t }
 
-        // Effective grouping key for a regular segment, in strict precedence order:
-        // manual override → exact source → the assigned-and-active gate. Exact sources
+        // Effective grouping key for a regular segment: exact source → the assigned-and-active
+        // gate. There is deliberately NO separate `block_assignments` override step here, and it
+        // must not be re-added: `applyAssignment` already writes manual assignments THROUGH to the
+        // segments via `Store.retag`, which sets `ticket_source = "manual"` — an exact source, so
+        // it lands on the first branch below and bypasses the gate. The `block_assignments` row
+        // written alongside it (for `.thisBlock` only) is a coarse whole-block record of the old
+        // fixed-block model. Applying it as an override here re-broadened every finer assignment
+        // back to its whole block, so picking "Last 1 hour" or "Current activity" got silently
+        // widened to the block's ticket. Exact sources
         // (url/branch/commit/title/session/learned/manual/pinned) are NEVER gated: `Attribution`
         // treats them as unimpeachable everywhere else, and gating them here silently dumped
         // correctly-attributed work into "untracked" whenever the ticket wasn't in your own
@@ -179,7 +166,6 @@ enum PeriodCompiler {
         // rather than `sprint`. A gated-out segment returns nil and pools into the single
         // unticketed entry rather than vanishing.
         let resolveRegular: (Segment) -> String? = { s in
-            if let o = overriding(s) { return o.ticket }
             guard let key = s.ticket, !key.isEmpty else { return nil }
             if Attribution.isExact(s.ticketSource) { return key }
             guard let t = corpus[key.uppercased()] else { return nil }

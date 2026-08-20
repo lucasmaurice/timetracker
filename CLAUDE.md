@@ -196,10 +196,14 @@ lost). Each block becomes a `BlockReport`. This model is now used ONLY by the li
 a cheap, synchronous "which block is `now` in": `checkAbstainNudge`/`checkUnknownBacklog`'s
 real-time prompts, `AssignView`'s `.thisBlock` scope, `llmHints`'s "already logged today" line, and
 `exportToday()`'s quick menu export. `block_assignments` (keyed `(day, block-id)`) still backs
-manual overrides for these paths — **and is also read by `PeriodCompiler`**, which applies each
-assigned block as a per-segment ticket override (by segment midpoint) over that clock window before
-grouping. Without that the two stores diverge and a ticket assigned from the menu is written, then
-never read by Review/Submit: it looks like it worked and changes nothing.
+manual overrides for exactly these paths.
+
+`PeriodCompiler` deliberately does **not** read `block_assignments`, and adding such an override is
+a mistake that has already been made once. Manual assignment doesn't need it: `applyAssignment`
+writes through to the segments themselves via `Store.retag`, which stamps
+`ticket_source = "manual"` — an exact source, so `PeriodCompiler` picks it up from `Segment.ticket`
+and skips the corpus gate. Re-applying the coarse whole-block row on top re-broadened every finer
+assignment (`Last 1 hour`, `Current activity`) back to its entire block.
 
 **Per-ticket day totals (`PeriodCompiler`/`Period`) — Review and Submit.**
 `PeriodCompiler.compile(day: config: store: attribution: ollama:)` (async) is the retrospective/
@@ -216,8 +220,8 @@ each one a total for a `(kind, ticket)` pair, not a slice of the clock:
   `Ticket.assignedToMe && Ticket.isInProgressLike(preferredStates:)` — `isInProgressLike` exists
   because `statusCategory` is Azure-DevOps-only (always nil for Jira), so it falls back through
   `preferredTicketStates` membership, then a plain "contains progress" name heuristic, before
-  giving up. The gate runs in strict precedence order — **manual `block_assignments` override →
-  `Attribution.isExact(ticketSource)` → the assigned-and-active check**. Exact sources are never
+  giving up. The gate runs in strict precedence order — **`Attribution.isExact(ticketSource)` →
+  the assigned-and-active check**. Exact sources are never
   gated: gating them dumped correctly-attributed work into "untracked" whenever the key wasn't in
   your own assigned corpus (anything mined from git history lives in `guessTickets`, not `sprint`),
   which contradicts the invariant that an exact source is never second-guessed. Gated-out/untracked
