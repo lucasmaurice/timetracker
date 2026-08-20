@@ -119,9 +119,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.global(qos: .background).async { [weak self] in self?.housekeeping() }
 
         promptTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            self?.checkAbstainNudge()
-            self?.checkUnknownBacklog()
-            self?.checkReminders()
+            // A scheduled Timer fires on the main run loop, so this closure is main-thread by
+            // construction — assumeIsolated states that to the compiler without a Task hop, which
+            // would otherwise defer these checks by a turn for no reason.
+            MainActor.assumeIsolated {
+                self?.checkAbstainNudge()
+                self?.checkUnknownBacklog()
+                self?.checkReminders()
+            }
         }
         // The LLM is now event-driven (fired by `maybeEmbed` when fusion is still ambiguous), but
         // keep a low-frequency safety pass for long single-context sessions where no focus change
@@ -377,8 +382,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         folder.target = self; menu.addItem(folder)
 
         menu.addItem(.separator())
-        if let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String, !build.isEmpty {
-            let time = Bundle.main.infoDictionary?["TTBuildTime"] as? String
+        // TTBuildSHA, not CFBundleVersion: the latter is reserved for a digits-and-periods
+        // version string (build.sh puts the commit count there), so the identifying SHA lives in
+        // our own key. Fall back to CFBundleVersion for bundles built before that split.
+        let info = Bundle.main.infoDictionary
+        if let build = (info?["TTBuildSHA"] as? String ?? info?["CFBundleVersion"] as? String), !build.isEmpty {
+            let time = info?["TTBuildTime"] as? String
             menu.addItem(disabled("Build \(build)" + (time.map { " (\($0))" } ?? "")))
         }
         let quit = NSMenuItem(title: "Quit TimeTracker", action: #selector(quit), keyEquivalent: "q")
@@ -506,8 +515,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func openReview() { presentReview(day: Date()) }
+    @MainActor @objc private func openReview() { presentReview(day: Date()) }
 
+    @MainActor
     private func presentReview(day: Date) {
         reviewDay = day
         monitor.flush()   // persist the in-progress segment so today's latest work shows + can be learned
@@ -523,26 +533,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// write `TimeBlocks.dayString(reviewDay)` against a `reviewPeriods` array belonging to a
     /// different day. The staleness check is belt-and-braces for the same reason: cancellation is
     /// cooperative, so a task can still return a result after being cancelled.
+    @MainActor
     private func refreshReviewView(day: Date, present: Bool) {
         reviewTask?.cancel()
+        // Paint the synchronous result NOW. The full compile awaits one Ollama round trip per
+        // meeting session, and blocking the window on that meant clicking "Review today…"
+        // produced nothing at all — no window, no spinner — for as long as that took.
+        show(makeReviewView(day: day, periods: PeriodCompiler.compileFast(
+            day: day, config: config, store: store, attribution: attribution)), present: present)
         reviewTask = Task { @MainActor in
-            let view = await self.makeReviewView(day: day)
+            let periods = await PeriodCompiler.compile(day: day, config: self.config, store: self.store,
+                                                        attribution: self.attribution, ollama: self.ollama)
+            // Cancellation is cooperative, so a superseded task can still get here; the day check
+            // catches the case where the user paged on while this was in flight.
             guard !Task.isCancelled, day == self.reviewDay else { return }
-            if let host = self.reviewHost, let win = self.reviewWindow {
-                host.rootView = view
-                if present { NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil) }
-                return
-            }
-            let host = NSHostingController(rootView: view)
-            let win = NSWindow(contentViewController: host)
-            win.title = "TimeTracker Review"
-            win.styleMask = [.titled, .closable, .resizable]
-            win.setContentSize(NSSize(width: 600, height: 560))
-            win.isReleasedWhenClosed = false
-            win.center()
-            self.reviewHost = host; self.reviewWindow = win
-            NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil)
+            self.show(self.makeReviewView(day: day, periods: periods), present: false)
         }
+    }
+
+    /// Swap a freshly-built review view into the window, creating the window on first use.
+    @MainActor
+    private func show(_ view: ReviewView, present: Bool) {
+        if let host = reviewHost, let win = reviewWindow {
+            host.rootView = view
+            if present { NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil) }
+            return
+        }
+        let host = NSHostingController(rootView: view)
+        let win = NSWindow(contentViewController: host)
+        win.title = "TimeTracker Review"
+        win.styleMask = [.titled, .closable, .resizable]
+        win.setContentSize(NSSize(width: 600, height: 560))
+        win.isReleasedWhenClosed = false
+        win.center()
+        reviewHost = host; reviewWindow = win
+        NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil)
     }
 
     /// `@MainActor` for the same reason `PeriodCompiler` is: this touches `reviewPeriods`,
@@ -550,8 +575,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `Task { @MainActor in }` does NOT confer isolation on a nonisolated `async` function — it
     /// would still hop to the cooperative pool at the await.
     @MainActor
-    private func makeReviewView(day: Date) async -> ReviewView {
-        let periods = await PeriodCompiler.compile(day: day, config: config, store: store, attribution: attribution, ollama: ollama)
+    private func makeReviewView(day: Date, periods: [Period]) -> ReviewView {
         reviewPeriods = periods
         let reviewPeriodsUI = periods.map { p -> ReviewPeriod in
             let alts = (p.contextDoc.map { attribution.explain(doc: $0) } ?? [])
@@ -621,7 +645,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func submitToTempoFromReview() {
         guard let model = reviewModel else { return }
         let dayStr = TimeBlocks.dayString(reviewDay)
-        let periodsById = Dictionary(uniqueKeysWithValues: reviewPeriods.map { ($0.id, $0) })
+        // `uniquingKeysWith`, not `uniqueKeysWithValues`: the latter TRAPS on a duplicate key, and
+        // id uniqueness here holds only because `compile` runs `mergeByTicket` before returning —
+        // a dependency nothing at this call site expresses. Reordering that pipeline should not be
+        // able to turn into a hard crash in Submit.
+        let periodsById = Dictionary(reviewPeriods.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         let tf = DateFormatter(); tf.dateFormat = "HH:mm:ss"
         let planned: [PlannedWorklog] = model.periods.compactMap { rp in
             guard let p = periodsById[rp.id] else { return nil }
@@ -773,7 +801,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func saveReview() {
         guard let model = reviewModel else { return }
         let dayStr = TimeBlocks.dayString(reviewDay)
-        let periodsById = Dictionary(uniqueKeysWithValues: reviewPeriods.map { ($0.id, $0) })
+        let periodsById = Dictionary(reviewPeriods.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         var taught = 0
         for rp in model.periods {
             guard let p = periodsById[rp.id] else { continue }
@@ -831,6 +859,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return docs.count
     }
 
+    @MainActor
     private func shiftReview(_ delta: Int) {
         reviewDay = Calendar.current.date(byAdding: .day, value: delta, to: reviewDay) ?? reviewDay
         refreshReviewView(day: reviewDay, present: false)
@@ -1512,6 +1541,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Timesheet fill reminders
 
+    @MainActor
     private func checkReminders() {
         guard config.remindersEnabled, !monitor.paused, !promptOpen else { return }
         let now = Date()
@@ -1568,6 +1598,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return nil
     }
 
+    // Runs a modal alert, so it is main-thread by construction anyway.
+    @MainActor
     private func remind(day: Date, message: String) {
         promptOpen = true
         NSApp.activate(ignoringOtherApps: true)

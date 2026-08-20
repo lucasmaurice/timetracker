@@ -28,7 +28,14 @@ GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
     GIT_SHA="${GIT_SHA}-dirty"
 fi
-plutil -replace CFBundleVersion -string "$GIT_SHA" "$APP/Contents/Info.plist"
+# CFBundleVersion is a RESERVED key with machine semantics: Apple specifies one to three
+# period-separated integers, digits only. LaunchServices compares it as an ordered version, and a
+# non-numeric value (a SHA, or anything with a hyphen) is invalid — so the SHA goes in our own
+# TTBuildSHA key, next to the TTBuildTime one this bundle already carries. Commit count is the
+# natural CFBundleVersion: numeric, and monotonically increasing like macOS requires.
+BUILD_NUM="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
+plutil -replace CFBundleVersion -string "$BUILD_NUM" "$APP/Contents/Info.plist"
+plutil -replace TTBuildSHA -string "$GIT_SHA" "$APP/Contents/Info.plist"
 plutil -replace TTBuildTime -string "$(date '+%d/%m %Hh%M')" "$APP/Contents/Info.plist"
 
 # Ad-hoc signing with a stable bundle identifier. Note: the code hash still changes

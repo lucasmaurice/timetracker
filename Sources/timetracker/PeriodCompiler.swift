@@ -55,7 +55,25 @@ enum PeriodCompiler {
     static func compile(day: Date, config: Config, store: Store, attribution: Attribution, ollama: Ollama) async -> [Period] {
         var periods = compileSync(day: day, config: config, store: store, attribution: attribution)
         periods = await resolveMeetingTickets(periods, config: config, attribution: attribution, ollama: ollama)
-        periods = mergeByTicket(periods)
+        return finish(periods, day: day, config: config, store: store)
+    }
+
+    /// `compile` minus the Ollama meeting guess — everything else is identical.
+    ///
+    /// Exists so the Review window can render immediately instead of showing nothing at all while
+    /// a round trip per meeting session completes (easily 10s+ on a meeting-heavy day, or a full
+    /// client timeout if the Ollama host is unreachable). Callers show this first, then swap in the
+    /// full `compile` result when it lands. Meetings appear un-ticketed until then, which is the
+    /// same thing they show when `ollamaEnabled` is false.
+    static func compileFast(day: Date, config: Config, store: Store, attribution: Attribution) -> [Period] {
+        finish(compileSync(day: day, config: config, store: store, attribution: attribution),
+               day: day, config: config, store: store)
+    }
+
+    /// The shared tail: collapse, apply saved overrides, round/pad, order. Kept in one place so the
+    /// fast and full paths can't drift into producing differently-shaped days.
+    private static func finish(_ periods: [Period], day: Date, config: Config, store: Store) -> [Period] {
+        var periods = mergeByTicket(periods)
         periods = applySavedAssignments(periods, day: day, store: store)
         applyRoundingAndPadding(&periods, day: day, config: config)
         return sortForDisplay(periods)

@@ -49,9 +49,14 @@ final class AzureDevOps: IssueProvider {
     func connect(org: String, pat: String) async throws -> String {
         let trimmedOrg = org.trimmingCharacters(in: .whitespaces)
         let creds = Credentials(org: trimmedOrg, pat: pat)
-        Keychain.setCodable(creds, account: Self.account)
-        cached = creds; loaded = true   // own the item under THIS binary; no re-read needed
-        return try await testConnection()
+        // In memory first so testConnection() can use them, but persist ONLY once they're known
+        // good. Writing first left an unverified PAT on disk whenever the test threw, recoverable
+        // only because the caller happens to call disconnect() in its catch — an invariant about
+        // secret storage shouldn't depend on every future call site's error handling.
+        cached = creds; loaded = true
+        let who = try await testConnection()
+        Keychain.setCodable(creds, account: Self.account)   // own the item under THIS binary
+        return who
     }
 
     // MARK: - Requests
@@ -97,8 +102,12 @@ final class AzureDevOps: IssueProvider {
     private func resolveIdentity() async {
         guard cachedUser == nil else { return }
         // connectionData is a preview-only resource — confirmed via a real 400
-        // (VssInvalidPreviewVersionException) against plain api-version=7.1.
-        guard let url = URL(string: "\((try? orgBase()) ?? "")/_apis/connectionData?api-version=7.1-preview"),
+        // (VssInvalidPreviewVersionException) against plain api-version=7.1. Pin the REVISION
+        // (-preview.1), not a bare -preview: Microsoft deprecates a preview once its released
+        // version ships and deactivates it ~12 weeks later, after which requests naming a preview
+        // version are rejected outright. A bare -preview is the least specific form there is, so
+        // it's the first to break.
+        guard let url = URL(string: "\((try? orgBase()) ?? "")/_apis/connectionData?api-version=7.1-preview.1"),
               let req = try? authedRequest(url: url)
         else { return }
         guard let (data, resp) = try? await URLSession.shared.data(for: req) else {

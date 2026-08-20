@@ -69,9 +69,13 @@ final class Atlassian: IssueProvider {
         let normSite = Self.normalizeSite(site)
         let cloudId = try await resolveCloudId(site: normSite)
         let creds = Credentials(site: normSite, email: email, token: token, cloudId: cloudId)
-        Keychain.setCodable(creds, account: Self.account)
-        cached = creds; loaded = true   // own the item under THIS binary; no re-read needed
-        return try await testConnection()
+        // Same ordering rule as AzureDevOps.connect: in memory so testConnection() can use them,
+        // on disk only once they're known good. resolveCloudId above validates the SITE, not the
+        // token — an unverified token was still being persisted whenever the test threw.
+        cached = creds; loaded = true
+        let who = try await testConnection()
+        Keychain.setCodable(creds, account: Self.account)   // own the item under THIS binary
+        return who
     }
 
     // MARK: - Requests
