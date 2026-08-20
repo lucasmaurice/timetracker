@@ -306,6 +306,68 @@ final class Attribution {
         return nil
     }
 
+    /// A `Sendable` handle to exactly the parts of `Attribution` that are safe to touch off the
+    /// main thread: the repo bridge (guards its own state behind a serial queue), the store
+    /// (SQLite in serialized mode), immutable workspace paths, and pure key-extraction closures.
+    ///
+    /// It exists so the launch mining pass can capture THIS instead of `Attribution` or
+    /// `AppDelegate`. `Attribution`'s `sprint`/`guessKeys` are main-owned and unguarded — handing
+    /// the whole object to a background task is the shape of bug #9 was, and nothing but a type
+    /// boundary stops it recurring.
+    struct BackgroundMiner: Sendable {
+        let bridge: RepoTicketBridge
+        let store: Store
+        let workspaceDirs: [URL]
+        let extract: @Sendable (String) -> String?
+        let isExcluded: @Sendable (String) -> Bool
+
+        /// Heavy: spawns git per repo. Replaces the bridge's map wholesale.
+        func rebuildRepoBridge(now: Date = Date()) {
+            bridge.rebuild(workspaceDirs: workspaceDirs, now: now, extract: extract)
+        }
+
+        /// MUST run after `rebuildRepoBridge` in the same pass — that call replaces the map
+        /// wholesale, so merging first would be silently wiped.
+        func ingestPRBridgeResults(_ results: [(repo: String, keys: [(key: String, ts: Double)])], now: Date = Date()) {
+            for r in results { bridge.ingestResolvedKeys(repo: r.repo, keys: r.keys, now: now) }
+        }
+
+        /// Seed `labels` from git history. Returns rows inserted; the caller reloads the in-memory
+        /// index on main.
+        @discardableResult
+        func backfillFromHistory() -> Int {
+            let examples = bridge.backfillExamples(workspaceDirs: workspaceDirs, extract: extract)
+            var inserted = 0
+            for e in examples where !isExcluded(e.ticket) {
+                var lines = ["Repo: \(e.repo)" + (e.branch.map { " (branch \($0))" } ?? "")]
+                if !e.subjects.isEmpty { lines.append("Recent commits: " + e.subjects.prefix(4).joined(separator: " | ")) }
+                store.insertLabel(contextDoc: lines.joined(separator: "\n"), ticket: e.ticket, kind: "backfill")
+                inserted += 1
+            }
+            return inserted
+        }
+    }
+
+    /// Build the background handle. `keyFormat` and `excludeRegexes` are `let`s fixed in `init`,
+    /// so the captured closures read nothing mutable.
+    func backgroundMiner() -> BackgroundMiner {
+        let keyFormat = self.keyFormat
+        let regexes = self.excludeRegexes
+        let excluded: @Sendable (String) -> Bool = { key in
+            let r = NSRange(key.startIndex..., in: key)
+            return regexes.contains { $0.firstMatch(in: key, options: [], range: r) != nil }
+        }
+        return BackgroundMiner(
+            bridge: repoBridge, store: store, workspaceDirs: config.expandedWorkspaceDirs,
+            extract: { text in
+                for source: KeySource in [.commit, .branch] {
+                    if let key = keyFormat.extract(from: text, source: source), !excluded(key) { return key }
+                }
+                return nil
+            },
+            isExcluded: excluded)
+    }
+
     /// Re-mine workspace git history into the repo→ticket bridge. Heavy (spawns git per repo);
     /// call off the main thread. Thread-safe: the bridge guards its own state.
     func rebuildRepoBridge(now: Date = Date()) {

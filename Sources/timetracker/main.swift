@@ -3,6 +3,10 @@ import ApplicationServices
 import SwiftUI
 import UserNotifications
 
+/// Main-actor isolated as a whole. Everything here is menu/window/timer work that already ran on
+/// main by convention; stating it lets the compiler check the background hops instead of trusting
+/// comments, and makes `[weak self]` legal inside the `@Sendable` closures below.
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let config = Config.load()
@@ -96,27 +100,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // repo-bridge pass (which now also checks azureDevOps.configured, for the PR bridge) is
         // chained inside this same completion instead of independently scheduled, so it can't
         // race the preload and see credentials as "not configured" simply because it ran first.
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            self?.atlassian.preload()
-            self?.tempo.preload()
-            self?.azureDevOps.preload()
-            self?.sevenPace.preload()
+        // Bind the clients here, on main. They're `@unchecked Sendable` (each guards its own
+        // state behind a lock), so the background queue can call `preload()` on them without
+        // reaching back through `self` for main-isolated stored properties.
+        let clients: [any Preloadable] = [atlassian, tempo, azureDevOps, sevenPace]
+        DispatchQueue.global(qos: .utility).async { [self] in
+            for c in clients { c.preload() }
             DispatchQueue.main.async {
-                self?.rebuildMenu(current: self?.monitor.currentState)
-                self?.runRefresh(silent: true)   // freshen the ticket corpus on launch if connected
-                self?.buildRepoBridgeAndBackfill()
-                self?.notifyIfIssueProviderDisconnected()
+                MainActor.assumeIsolated {
+                    self.rebuildMenu(current: self.monitor.currentState)
+                    self.runRefresh(silent: true)   // freshen the ticket corpus on launch if connected
+                    self.buildRepoBridgeAndBackfill()
+                    self.notifyIfIssueProviderDisconnected()
+                }
             }
         }
         reindexEmbeddings()
 
         if config.jiraRefreshMinutes > 0 {
             jiraTimer = Timer.scheduledTimer(withTimeInterval: config.jiraRefreshMinutes * 60, repeats: true) { [weak self] _ in
-                self?.runRefresh(silent: true)
+                MainActor.assumeIsolated { self?.runRefresh(silent: true) }   // Timer fires on the main run loop
             }
         }
 
-        DispatchQueue.global(qos: .background).async { [weak self] in self?.housekeeping() }
+        // housekeeping() only touches Store (serialized SQLite) and the worklog maps (lock-guarded),
+        // so it is safe off-main; it lives on AppDelegate purely for access to those.
+        if let store, let tempo, let sevenPace {
+            let config = self.config
+            DispatchQueue.global(qos: .background).async {
+                Self.housekeeping(store: store, tempo: tempo, sevenPace: sevenPace, config: config)
+            }
+        }
 
         promptTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             // A scheduled Timer fires on the main run loop, so this closure is main-thread by
@@ -133,7 +147,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // ever re-triggers embedding. `llmRefine` no-ops unless the segment is still undecided.
         if config.ollamaEnabled, config.llmRefreshMinutes > 0 {
             llmTimer = Timer.scheduledTimer(withTimeInterval: config.llmRefreshMinutes * 60, repeats: true) { [weak self] _ in
-                self?.llmRefine()
+                MainActor.assumeIsolated { self?.llmRefine() }   // Timer fires on the main run loop
             }
         }
     }
@@ -146,18 +160,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// seed `labels` from that history (warm-start). All git/store/network work is off the main
     /// thread; the in-memory label index is reloaded on main. Mirrors the housekeeping pattern.
     private func buildRepoBridgeAndBackfill() {
-        Task.detached(priority: .utility) { [weak self] in
-            guard let self else { return }
-            self.attribution.rebuildRepoBridge()
+        // Capture a narrow, Sendable handle rather than `self`. Handing a background task the whole
+        // AppDelegate (and through it `Attribution`, whose sprint/guessKeys are main-owned and
+        // unguarded) is the exact shape of the data race in #9 — the type boundary is what stops
+        // it recurring, since nothing else will.
+        let miner = attribution.backgroundMiner()
+        // Implicitly-unwrapped stored properties: bind them concretely here, on main, so the
+        // background task holds real instances rather than optionals it would have to re-unwrap.
+        guard let prBridge = azurePRBridge, let azdo = azureDevOps else { return }
+        let dirs = config.expandedWorkspaceDirs
+        let usePRBridge = config.issueProvider == .azureDevOps && config.azurePRBridgeEnabled
+        Task.detached(priority: .utility) { [self] in
+            miner.rebuildRepoBridge()
             // MUST run after rebuildRepoBridge (above): that call replaces the bridge's map
             // wholesale, so merging PR results first would have them silently wiped.
-            if self.config.issueProvider == .azureDevOps, self.config.azurePRBridgeEnabled, self.azureDevOps.configured {
-                let results = await self.azurePRBridge.resolve(
-                    workspaceDirs: self.config.expandedWorkspaceDirs, azureDevOps: self.azureDevOps, now: Date())
-                self.attribution.ingestPRBridgeResults(results)
+            if usePRBridge, azdo.configured {
+                let results = await prBridge.resolve(workspaceDirs: dirs, azureDevOps: azdo, now: Date())
+                miner.ingestPRBridgeResults(results)
             }
             let firstRun = !UserDefaults.standard.bool(forKey: "ttBackfilledV1")
-            let inserted = firstRun ? self.attribution.backfillFromHistory() : 0
+            let inserted = firstRun ? miner.backfillFromHistory() : 0
             if firstRun { UserDefaults.standard.set(true, forKey: "ttBackfilledV1") }
             await MainActor.run {
                 // The bridge was (re)built after init's reloadSprint, so reload to widen the guess
@@ -610,7 +632,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Housekeeping / pruning
 
-    private func housekeeping() {
+    /// `static` and dependency-injected so it can genuinely run off-main: everything it touches is
+    /// either the Store (serialized SQLite), a lock-guarded worklog map, or UserDefaults (its own
+    /// synchronization). Previously an instance method, which meant the background queue reached
+    /// through `self` for main-owned properties.
+    nonisolated private static func housekeeping(store: Store, tempo: TempoClient, sevenPace: SevenPaceClient, config: Config) {
+        let worklogProvider: any WorklogProvider = config.worklogProvider == .tempo ? tempo : sevenPace
         let now = Date()
         if config.segmentRetentionDays > 0 {
             store.deleteSegments(before: now.addingTimeInterval(-config.segmentRetentionDays * 86400))
@@ -1368,7 +1395,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func reindexEmbeddings() {
         guard embeddings.enabled else { return }
         let tickets = attribution.guessTickets   // embeddings only over the guessable pool
-        Task.detached { [weak self] in await self?.embeddings.index(tickets) }
+        guard let matcher = embeddings else { return }   // bound on main; the matcher owns its state
+        Task.detached { await matcher.index(tickets) }
     }
 
     /// On context change, rank by embeddings async, then re-fuse all signals. Embedding is now a
@@ -1793,8 +1821,14 @@ if CommandLine.arguments.contains("--dump-periods") {
     exit(0)
 }
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)   // menu-bar only, no Dock icon
-app.run()
+// Top-level code in a main.swift is nonisolated, but this all genuinely runs on the main thread
+// before the run loop starts. `assumeIsolated` states that rather than hopping, which would defer
+// app setup past `run()`.
+MainActor.assumeIsolated {
+    let app = NSApplication.shared
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    app.setActivationPolicy(.accessory)   // menu-bar only, no Dock icon
+    _ = delegate                          // keep the delegate alive; NSApplication doesn't retain it
+    app.run()
+}

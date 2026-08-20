@@ -158,6 +158,13 @@ enum WorklogKey {
     }
 }
 
+/// The one thing every provider client shares for launch: a Keychain read that must happen off the
+/// main thread (it can block on a permission prompt). Lets `applicationDidFinishLaunching` hand a
+/// background queue a plain array instead of reaching back through the main-isolated AppDelegate.
+protocol Preloadable: AnyObject, Sendable {
+    func preload()
+}
+
 /// A destination for worklogs. `resolveAuthor` puts "whose identity does this worklog need" on
 /// the provider that owns that identity (Tempo: the paired Jira account; 7pace: its own user)
 /// instead of hard-coding one provider's accountId call at the main.swift submit site.

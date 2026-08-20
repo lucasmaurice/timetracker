@@ -11,7 +11,8 @@ import Foundation
 ///
 /// Credentials live in the login Keychain, never in config.json. Network calls happen only
 /// on Connect (cloud-id resolve + validate) and Refresh; focus logging stays fully offline.
-final class Atlassian: IssueProvider {
+/// `@unchecked Sendable`: all mutable state is guarded by `lock`.
+final class Atlassian: IssueProvider, Preloadable, @unchecked Sendable {
     var displayName: String { "Jira" }
     struct Credentials: Codable { var site: String; var email: String; var token: String; var cloudId: String }
 
@@ -24,25 +25,30 @@ final class Atlassian: IssueProvider {
     // every focus change, and hitting the Keychain each time caused a prompt storm under
     // ad-hoc signing (every read re-prompts). After the first read (one prompt, click
     // "Always Allow"), all later checks are in-memory.
+    /// Guards every mutable field. `preload()` deliberately runs on a background queue (the
+    /// Keychain can block on a permission prompt), while main reads `configured` when rebuilding
+    /// the menu — so these were genuinely racing. Never held across an `await`.
+    private let lock = NSLock()
+    private func sync<T>(_ body: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return body() }
     private var loaded = false
     private var cached: Credentials?
 
     /// Pure in-memory — NEVER hits the Keychain on the calling thread. SecItemCopyMatching
     /// can block waiting on a permission prompt, which froze the menu-bar UI at launch.
-    private var credentials: Credentials? { cached }
-    var configured: Bool { cached != nil }
-    var site: String? { cached?.site }
+    private var credentials: Credentials? { sync { cached } }
+    var configured: Bool { sync { cached != nil } }
+    var site: String? { sync { cached?.site } }
 
     /// Read the Keychain exactly once. MUST be called off the main thread (see above).
     func preload() {
-        guard !loaded else { return }
-        cached = Keychain.getCodable(Credentials.self, account: Self.account)
-        loaded = true
+        guard sync({ !loaded }) else { return }
+        let creds = Keychain.getCodable(Credentials.self, account: Self.account)   // outside the lock
+        sync { cached = creds; loaded = true }
     }
 
     func disconnect() {
         Keychain.delete(account: Self.account)
-        cached = nil; loaded = true
+        sync { cached = nil; loaded = true }
     }
 
     /// Accepts "acme", "acme.atlassian.net", or "https://acme.atlassian.net/" → host only.
@@ -72,7 +78,7 @@ final class Atlassian: IssueProvider {
         // Same ordering rule as AzureDevOps.connect: in memory so testConnection() can use them,
         // on disk only once they're known good. resolveCloudId above validates the SITE, not the
         // token — an unverified token was still being persisted whenever the test threw.
-        cached = creds; loaded = true
+        sync { cached = creds; loaded = true }
         let who = try await testConnection()
         Keychain.setCodable(creds, account: Self.account)   // own the item under THIS binary
         return who
@@ -102,18 +108,18 @@ final class Atlassian: IssueProvider {
         let (data, resp) = try await URLSession.shared.data(for: req)
         try Self.check(resp, data)
         let me = try JSONDecoder().decode(Myself.self, from: data)
-        cachedAccountId = me.accountId
+        sync { cachedAccountId = me.accountId }
         return me.displayName ?? me.emailAddress ?? "connected"
     }
 
     /// The current user's Atlassian accountId (needed as the Tempo worklog author).
     func accountId() async -> String? {
-        if let id = cachedAccountId { return id }
+        if let id = sync({ cachedAccountId }) { return id }
         guard let req = try? authedRequest(path: "/rest/api/3/myself"),
               let (data, resp) = try? await URLSession.shared.data(for: req),
               (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) == true,
               let me = try? JSONDecoder().decode(Myself.self, from: data) else { return nil }
-        cachedAccountId = me.accountId
+        sync { cachedAccountId = me.accountId }
         return me.accountId
     }
 
@@ -208,7 +214,7 @@ final class Atlassian: IssueProvider {
         //   dict present → compare identity; fall back to true only if we have no identity at all
         let assignedToMe: Bool
         if let assignee = f["assignee"] as? [String: Any] {
-            if let acct = assignee["accountId"] as? String, let mine = cachedAccountId {
+            if let acct = assignee["accountId"] as? String, let mine = sync({ cachedAccountId }) {
                 assignedToMe = acct == mine
             } else if let email = assignee["emailAddress"] as? String, let mine = credentials?.email {
                 assignedToMe = email.caseInsensitiveCompare(mine) == .orderedSame
@@ -239,15 +245,15 @@ final class Atlassian: IssueProvider {
     /// Resolve the Sprint custom-field id once (its schema.custom is the greenhopper sprint type).
     private var cachedSprintFieldId: String??
     private func sprintFieldId() async -> String? {
-        if let cached = cachedSprintFieldId { return cached }
+        if let hit = sync({ cachedSprintFieldId }) { return hit }
         guard let req = try? authedRequest(path: "/rest/api/3/field"),
               let (data, resp) = try? await URLSession.shared.data(for: req),
               (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) == true,
               let fields = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-            cachedSprintFieldId = .some(nil); return nil
+            sync { cachedSprintFieldId = .some(nil) }; return nil
         }
         let id = fields.first { (($0["schema"] as? [String: Any])?["custom"] as? String) == "com.pyxis.greenhopper.jira:gh-sprint" }?["id"] as? String
-        cachedSprintFieldId = .some(id)
+        sync { cachedSprintFieldId = .some(id) }
         return id
     }
 
@@ -259,7 +265,7 @@ final class Atlassian: IssueProvider {
         // from it, and PeriodCompiler gates regular work on that. Omit it and every ticket silently
         // reads as "assigned to me" — the gate becomes a no-op with no visible error.
         var fields = "summary,labels,components,issuetype,parent,description,status,updated,assignee"
-        if let sf = cachedSprintFieldId ?? nil { fields += ",\(sf)" }
+        if let sf = sync({ cachedSprintFieldId }) ?? nil { fields += ",\(sf)" }
         var out: [[String: Any]] = []
         var token: String?
         var pages = 0

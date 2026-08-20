@@ -11,7 +11,8 @@ import Foundation
 /// ProgiDev/DevOps project: Task and User Story states include "Dev" and "Resolved", neither of
 /// which is a standard Agile-template name, and "Resolved" categorizes as InProgress there, not a
 /// distinct Resolved category).
-final class AzureDevOps: IssueProvider {
+/// `@unchecked Sendable` is earned, not asserted: every mutable field is guarded by `lock` above.
+final class AzureDevOps: IssueProvider, Preloadable, @unchecked Sendable {
     var displayName: String { "Azure DevOps" }
     struct Credentials: Codable { var org: String; var pat: String }
 
@@ -20,29 +21,36 @@ final class AzureDevOps: IssueProvider {
 
     init(config: Config) { self.config = config }
 
-    private var loaded = false
-    private var cached: Credentials?
-    private var credentials: Credentials? { cached }
-    var configured: Bool { cached != nil }
+    /// Guards every mutable field on this class. The launch mining pass (`AzurePRBridge`) reads
+    /// credentials from a background task while `connect`/`disconnect`/`refreshSprint` mutate them
+    /// on main, so "main-confined" was never quite true. Never held across an `await` — lock,
+    /// read-or-write, unlock.
+    private let lock = NSLock()
+    private func sync<T>(_ body: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return body() }
+
+    private var _loaded = false
+    private var _cached: Credentials?
+    private var credentials: Credentials? { sync { _cached } }
+    var configured: Bool { sync { _cached != nil } }
     /// The connected organization, for `AzurePRBridge` to skip repos hosted in a different org
     /// than the PAT is scoped to (a PAT is always single-org).
-    var connectedOrg: String? { cached?.org }
+    var connectedOrg: String? { sync { _cached?.org } }
     /// The PAT owner's display name, for the menu's "Connected as … " line. Resolved lazily (once
     /// per session, from `refreshSprint`) rather than at `preload()` — preload must stay
     /// network-free (see CLAUDE.md's threading invariants), so this is nil until the first
     /// refresh (launch or manual) completes.
-    private var cachedUser: String?
-    var connectedUser: String? { cachedUser }
+    private var _cachedUser: String?
+    var connectedUser: String? { sync { _cachedUser } }
 
     func preload() {
-        guard !loaded else { return }
-        cached = Keychain.getCodable(Credentials.self, account: Self.account)
-        loaded = true
+        guard sync({ !_loaded }) else { return }
+        let creds = Keychain.getCodable(Credentials.self, account: Self.account)   // outside the lock
+        sync { _cached = creds; _loaded = true }
     }
 
     func disconnect() {
         Keychain.delete(account: Self.account)
-        cached = nil; loaded = true
+        sync { _cached = nil; _loaded = true }
     }
 
     @discardableResult
@@ -53,7 +61,7 @@ final class AzureDevOps: IssueProvider {
         // good. Writing first left an unverified PAT on disk whenever the test threw, recoverable
         // only because the caller happens to call disconnect() in its catch — an invariant about
         // secret storage shouldn't depend on every future call site's error handling.
-        cached = creds; loaded = true
+        sync { _cached = creds; _loaded = true }
         let who = try await testConnection()
         Keychain.setCodable(creds, account: Self.account)   // own the item under THIS binary
         return who
@@ -100,7 +108,7 @@ final class AzureDevOps: IssueProvider {
     /// the "as <user>" part (cosmetic, not functional), but logs the actual status/body to stderr
     /// (~/Library/Application Support/TimeTracker/stderr.log when run via the LaunchAgent).
     private func resolveIdentity() async {
-        guard cachedUser == nil else { return }
+        guard sync({ _cachedUser == nil }) else { return }
         // connectionData is a preview-only resource — confirmed via a real 400
         // (VssInvalidPreviewVersionException) against plain api-version=7.1. Pin the REVISION
         // (-preview.1), not a bare -preview: Microsoft deprecates a preview once its released
@@ -126,8 +134,9 @@ final class AzureDevOps: IssueProvider {
             FileHandle.standardError.write("azdo identity: decode failed — body: \(body)\n".data(using: .utf8)!)
             return
         }
-        cachedUser = profile.customDisplayName ?? profile.providerDisplayName
-        if cachedUser == nil {
+        let name = profile.customDisplayName ?? profile.providerDisplayName
+        sync { _cachedUser = name }
+        if name == nil {
             FileHandle.standardError.write("azdo identity: decoded authenticatedUser had no display name\n".data(using: .utf8)!)
         }
     }
@@ -223,11 +232,11 @@ final class AzureDevOps: IssueProvider {
     /// widening of the guess pool to the whole team's backlog. Cached briefly per PR id so
     /// repeated attribution samples during one review don't re-hit the API on every tick.
     func resolveWorkItem(forPullRequestId prId: Int) async -> Ticket? {
-        if let cached = prResolutionCache[prId], Date().timeIntervalSince(cached.ts) < Self.prCacheTTL {
-            return cached.ticket
+        if let hit = sync({ prResolutionCache[prId] }), Date().timeIntervalSince(hit.ts) < Self.prCacheTTL {
+            return hit.ticket
         }
         let ticket = await fetchWorkItemForPR(prId)
-        prResolutionCache[prId] = (ticket, Date())
+        sync { prResolutionCache[prId] = (ticket, Date()) }
         return ticket
     }
 
@@ -365,7 +374,7 @@ final class AzureDevOps: IssueProvider {
     private var stateCategoryCache: [String: [String: String]] = [:]  // workItemType -> state -> category
 
     private func stateCategories(forType type: String, project: String) async -> [String: String] {
-        if let cached = stateCategoryCache[type] { return cached }
+        if let hit = sync({ stateCategoryCache[type] }) { return hit }
         guard let base = try? orgBase() else { return [:] }
         let projPath = project.isEmpty ? "" : "/\(project.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? project)"
         let encodedType = type.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? type
@@ -377,7 +386,7 @@ final class AzureDevOps: IssueProvider {
         else { return [:] }
         var map: [String: String] = [:]
         for s in parsed.states { map[s.name] = s.category }
-        stateCategoryCache[type] = map
+        sync { stateCategoryCache[type] = map }
         return map
     }
 

@@ -31,7 +31,11 @@ struct Segment {
 }
 
 /// Local-only SQLite persistence. No network, ever.
-final class Store {
+/// `@unchecked Sendable`: `db` is opened once in `init` and never reassigned, and macOS's
+/// libsqlite3 is built in serialized threading mode, so concurrent use of the one connection is
+/// mutex-guarded by SQLite itself. That protects the FILE — it is not licence to read app-level
+/// caches off-main (see `Attribution`).
+final class Store: @unchecked Sendable {
     private var db: OpaquePointer?
     let dbPath: String
 
