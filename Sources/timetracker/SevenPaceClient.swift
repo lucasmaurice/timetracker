@@ -37,6 +37,10 @@ final class SevenPaceClient: WorklogProvider {
     private func mapKey(day: String, block: String) -> String { "\(day)|\(block)" }
     func worklogId(day: String, block: String) -> String? { worklogMap[mapKey(day: day, block: block)] }
 
+    func legacyFixedBlockWorklogIds(day: String) -> [(block: String, id: String)] {
+        WorklogKey.legacyIds(in: worklogMap, day: day)
+    }
+
     func setWorklogId(day: String, block: String, id: String?) {
         if let id { worklogMap[mapKey(day: day, block: block)] = id }
         else { worklogMap.removeValue(forKey: mapKey(day: day, block: block)) }

@@ -134,6 +134,30 @@ protocol IssueProvider: AnyObject {
     func browserURL(forKey key: String, project: String?) -> URL?
 }
 
+/// The `(day|block)` worklog-map key shape, shared by every `WorklogProvider`.
+///
+/// Fixed blocks keyed on a bare block id ("2026-08-18|3"); floating periods key on `Period.id`
+/// ("2026-08-18|regular|CLOUD-1234"). The two shapes never collide, which is what makes the switch
+/// detectable — but it also means a day submitted under the old model has ids the new keys can't
+/// find, so a re-submit would CREATE a second full set of worklogs on someone's official timesheet
+/// rather than replace the first. There is no lossless key migration (N time-sliced blocks don't
+/// map onto per-ticket day totals), so the submit path detects the legacy rows and offers to delete
+/// them instead.
+enum WorklogKey {
+    /// True for an old fixed-block key component: `TimeBlocks.Block.id` is always "1"..."N".
+    static func isLegacyFixedBlock(_ block: String) -> Bool { !block.isEmpty && block.allSatisfy(\.isNumber) }
+
+    /// Legacy `(block, id)` pairs for `day`, out of a provider's raw map. Generic over the id type
+    /// so Tempo's `Int` ids and 7pace's UUID strings share one implementation.
+    static func legacyIds<V>(in map: [String: V], day: String) -> [(block: String, id: String)] {
+        map.compactMap { kv in
+            let parts = kv.key.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2, parts[0] == day, isLegacyFixedBlock(String(parts[1])) else { return nil }
+            return (String(parts[1]), "\(kv.value)")
+        }.sorted { $0.block.localizedStandardCompare($1.block) == .orderedAscending }
+    }
+}
+
 /// A destination for worklogs. `resolveAuthor` puts "whose identity does this worklog need" on
 /// the provider that owns that identity (Tempo: the paired Jira account; 7pace: its own user)
 /// instead of hard-coding one provider's accountId call at the main.swift submit site.
@@ -146,6 +170,10 @@ protocol WorklogProvider: AnyObject {
     func resolveAuthor() async -> String?
     func worklogId(day: String, block: String) -> String?
     func setWorklogId(day: String, block: String, id: String?)
+    /// Worklogs this app posted for `day` under the OLD fixed-block model — see `WorklogKey`.
+    /// Returned so the submit path can delete them before posting floating periods, instead of
+    /// silently double-billing the day.
+    func legacyFixedBlockWorklogIds(day: String) -> [(block: String, id: String)]
     func pruneWorklogMap(olderThanDays: Double)
     func createWorklog(issueId: String, author: String?, date: String, startTime: String,
                        seconds: Int, description: String) async throws -> String?

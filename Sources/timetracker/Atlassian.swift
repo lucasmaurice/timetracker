@@ -195,16 +195,22 @@ final class Atlassian: IssueProvider {
         // parseTicket is shared by the "assignee = currentUser()" fetch AND the queue/common-JQL
         // fetches (which explicitly pull in tickets that may not be assigned to you) — so check the
         // issue's own assignee against the connected account rather than trusting which query found
-        // it. Falls back to `true` (Ticket's default) when neither identity field is available,
-        // since self-assigned is still the overwhelming majority case.
-        let assignee = f["assignee"] as? [String: Any]
+        // it. Three distinct cases, deliberately NOT collapsed into one `else` (an earlier version
+        // did, which made an unassigned ticket read as yours):
+        //   key absent   → the field wasn't requested; we genuinely can't tell → true (majority case)
+        //   key null     → the issue really is unassigned → NOT yours
+        //   dict present → compare identity; fall back to true only if we have no identity at all
         let assignedToMe: Bool
-        if let acct = assignee?["accountId"] as? String, let mine = cachedAccountId {
-            assignedToMe = acct == mine
-        } else if let email = assignee?["emailAddress"] as? String, let mine = credentials?.email {
-            assignedToMe = email.caseInsensitiveCompare(mine) == .orderedSame
+        if let assignee = f["assignee"] as? [String: Any] {
+            if let acct = assignee["accountId"] as? String, let mine = cachedAccountId {
+                assignedToMe = acct == mine
+            } else if let email = assignee["emailAddress"] as? String, let mine = credentials?.email {
+                assignedToMe = email.caseInsensitiveCompare(mine) == .orderedSame
+            } else {
+                assignedToMe = true   // assigned to someone, but we can't resolve our own identity
+            }
         } else {
-            assignedToMe = true
+            assignedToMe = !f.keys.contains("assignee")   // null = unassigned; absent = unknown
         }
         return Ticket(key: key, summary: summary, text: text, status: status, updated: updated,
                       done: done, inSprint: inSprint, inQueue: queueKeys.contains(key),
@@ -243,7 +249,10 @@ final class Atlassian: IssueProvider {
     /// and (over)write sprint.json. Returns total and not-done counts.
     /// Fully-paginated `/search/jql` fetch for a JQL, returning raw issue dicts.
     private func fetchIssues(jql: String) async throws -> [[String: Any]] {
-        var fields = "summary,labels,components,issuetype,parent,description,status,updated"
+        // `assignee` is load-bearing, not cosmetic: parseTicket derives `Ticket.assignedToMe`
+        // from it, and PeriodCompiler gates regular work on that. Omit it and every ticket silently
+        // reads as "assigned to me" — the gate becomes a no-op with no visible error.
+        var fields = "summary,labels,components,issuetype,parent,description,status,updated,assignee"
         if let sf = cachedSprintFieldId ?? nil { fields += ",\(sf)" }
         var out: [[String: Any]] = []
         var token: String?

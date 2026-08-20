@@ -40,6 +40,10 @@ final class TempoClient: WorklogProvider {
         if let data = try? JSONEncoder().encode(worklogMap) { try? data.write(to: mapFile, options: [.atomic]) }
     }
 
+    func legacyFixedBlockWorklogIds(day: String) -> [(block: String, id: String)] {
+        WorklogKey.legacyIds(in: worklogMap, day: day)
+    }
+
     func setWorklogId(day: String, block: String, id: String?) {
         if let id, let intId = Int(id) { worklogMap[mapKey(day: day, block: block)] = intId }
         else { worklogMap.removeValue(forKey: mapKey(day: day, block: block)) }

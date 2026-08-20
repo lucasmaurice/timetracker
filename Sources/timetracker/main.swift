@@ -79,7 +79,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupMainMenu()
         setupStatusItem()
         requestAccessibilityIfNeeded()
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        if Self.canUseUserNotifications {
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        }
 
         monitor.onUpdate = { [weak self] state in
             DispatchQueue.main.async {
@@ -525,6 +527,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// `@MainActor` for the same reason `PeriodCompiler` is: this touches `reviewPeriods`,
+    /// `reviewModel` and `attribution`, all main-owned. Being called from inside a
+    /// `Task { @MainActor in }` does NOT confer isolation on a nonisolated `async` function — it
+    /// would still hop to the cooperative pool at the await.
+    @MainActor
     private func makeReviewView(day: Date) async -> ReviewView {
         let periods = await PeriodCompiler.compile(day: day, config: config, store: store, attribution: attribution, ollama: ollama)
         reviewPeriods = periods
@@ -633,6 +640,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         preview.addButton(withTitle: "Cancel")
         guard preview.runModal() == .alertFirstButtonReturn else { return }
 
+        // This day may already carry worklogs posted under the OLD fixed-block model, whose map
+        // keys the floating-period ids can't resolve (see `WorklogKey`). Posting on top of them
+        // duplicates the whole day on an official timesheet, so make it an explicit, informed
+        // choice rather than a silent one — we hold the old ids, so we can actually clean up.
+        let legacy = worklogProvider.legacyFixedBlockWorklogIds(day: dayStr)
+        if !legacy.isEmpty {
+            let warn = NSAlert()
+            warn.alertStyle = .warning
+            warn.messageText = "\(dayStr) was already submitted under the previous timesheet model"
+            warn.informativeText = "\(legacy.count) worklog(s) from the old fixed-block model still exist in "
+                + "\(worklogProvider.displayName) for this day. They can't be matched to the new per-ticket "
+                + "periods, so submitting now would ADD to them and bill the day twice.\n\n"
+                + "Delete the old worklog(s) first, then submit the periods above?"
+            warn.addButton(withTitle: "Delete \(legacy.count) old, then submit")
+            warn.addButton(withTitle: "Cancel")
+            guard warn.runModal() == .alertFirstButtonReturn else { return }
+        }
+
         if !worklogProvider.configured {
             guard let token = promptForWorklogToken() else { return }
             worklogProvider.connect(token: token)
@@ -644,6 +669,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let author = await worklogProvider.resolveAuthor()
             var ok = 0
             var fails: [String] = []
+            // Confirmed above. Clear the map entry as each one goes, so an interrupted run doesn't
+            // re-prompt for worklogs that are already gone.
+            for old in legacy {
+                await worklogProvider.deleteWorklog(id: old.id)
+                worklogProvider.setWorklogId(day: dayStr, block: old.block, id: nil)
+            }
             for p in planned {
                 var idStr = attribution.issueId(forKey: p.ticket)
                 if idStr == nil { idStr = await issueProvider.fetchIssueId(forKey: p.ticket) }
@@ -1253,8 +1284,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// or credentials never entered) otherwise shows up only as "Connect …" quietly sitting in the
     /// menu — easy to miss, and everything downstream (guessing, Review, submission) just degrades
     /// with no obvious cause. Called once preload() has actually run, so `configured` is reliable.
+    /// `UNUserNotificationCenter.current()` raises `bundleProxyForCurrentProcess is nil` — a hard
+    /// crash, not a throw — in any process without a real bundle. `swift build` + running
+    /// `.build/debug/timetracker` directly is a documented dev path here (see CLAUDE.md), so every
+    /// call site has to be gated on actually being bundled.
+    private static var canUseUserNotifications: Bool { Bundle.main.bundleIdentifier != nil }
+
     private func notifyIfIssueProviderDisconnected() {
         guard !issueProvider.configured else { return }
+        guard Self.canUseUserNotifications else {
+            // Un-bundled dev run: no notification centre, but don't swallow the signal entirely.
+            FileHandle.standardError.write("timetracker: not connected to \(issueProvider.displayName)\n".data(using: .utf8)!)
+            return
+        }
         let content = UNMutableNotificationContent()
         content.title = "TimeTracker"
         content.body = "Not connected to \(issueProvider.displayName) — tickets won't be guessed until you reconnect."
@@ -1659,8 +1701,11 @@ if CommandLine.arguments.contains("--dump-periods") {
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
         if let d = f.date(from: CommandLine.arguments[idx + 1]) { day = d }
     }
-    let sem = DispatchSemaphore(value: 0)
-    Task {
+    // Pump the run loop rather than blocking on a semaphore: PeriodCompiler is @MainActor (see
+    // its doc comment), so parking the main thread here would deadlock the very work we're
+    // awaiting. Pumping also lets URLSession's delegate callbacks land for the Ollama pass.
+    var done = false
+    Task { @MainActor in
         let periods = await PeriodCompiler.compile(day: day, config: config, store: store, attribution: attribution, ollama: ollama)
         print("Periods for \(TimeBlocks.dayString(day)):")
         for p in periods {
@@ -1673,9 +1718,9 @@ if CommandLine.arguments.contains("--dump-periods") {
         let totalReported = periods.reduce(0.0) { $0 + $1.reportedSeconds } / 3600
         let target = TimeBlocks.dailyTargetSeconds(day, config) / 3600
         print(String(format: "Total: true=%.2fh reported=%.2fh target=%.2fh", totalTrue, totalReported, target))
-        sem.signal()
+        done = true
     }
-    sem.wait()
+    while !done { RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05)) }
     exit(0)
 }
 

@@ -43,6 +43,14 @@ extension Period: PeriodicReport {}
 /// — no synthetic time-bucketing needed), while daily-standup/break/meeting are carved out as
 /// their own entries. Retrospective/batch only — real-time nudges and `AssignView` keep using the
 /// fixed `TimeBlocks` model (see CLAUDE.md).
+///
+/// **`@MainActor` is load-bearing, not decoration.** This reads `Store` and — once per segment via
+/// the regular gate — `Attribution.sprint`, a plain `[Ticket]` that `reloadSprint()` and
+/// `cachePRReviewTicket()` mutate on main. A plain `nonisolated async` func hops to the global
+/// cooperative pool (tools 5.9 = Swift 5 mode, so strict concurrency checking will NOT flag it and
+/// a clean build proves nothing), which races those mutations — a real crash. Keep the isolation;
+/// the sync core is cheap and the only genuine suspension is the Ollama call.
+@MainActor
 enum PeriodCompiler {
     static func compile(day: Date, config: Config, store: Store, attribution: Attribution, ollama: Ollama) async -> [Period] {
         var periods = compileSync(day: day, config: config, store: store, attribution: attribution)
