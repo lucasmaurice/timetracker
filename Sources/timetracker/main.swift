@@ -1113,8 +1113,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         teachModel?.count = attribution.labelCount
     }
 
+    /// Quick menu export. Uses the SAME model Review and Submit use — `PeriodCompiler` —
+    /// otherwise the same day exported through the two menu items appends two incompatible sets of
+    /// rows to one `timesheet-log.md`, with different durations and groupings and nothing to say
+    /// which is authoritative. `compileFast` keeps this synchronous (no Ollama round trip), so the
+    /// quick export stays quick; meetings just export un-ticketed, as they already do when Ollama
+    /// is disabled.
+    @MainActor
     @objc private func exportToday() {
-        let rows = summary.appendTimesheet(day: Date())
+        let day = Date()
+        let periods = PeriodCompiler.compileFast(day: day, config: config, store: store, attribution: attribution)
+        let rows = summary.appendTimesheet(periods: periods, day: day)
         let alert = NSAlert()
         alert.messageText = rows.isEmpty ? "No activity to export yet" : "Appended \(rows.count) row(s) to timesheet-log.md"
         alert.informativeText = rows.joined(separator: "\n")
@@ -1579,11 +1588,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// worklogs (their old map keys no longer resolve — see `WorklogKey`).
     private func dayNeedsFilling(_ day: Date) -> Bool {
         guard summary.dayReports(day).contains(where: { $0.hasActivity }) else { return false }
-        let dayStr = TimeBlocks.dayString(day)
-        if !store.periodAssignments(day: dayStr).isEmpty { return false }
-        if (UserDefaults.standard.stringArray(forKey: "submittedDays") ?? []).contains(dayStr) { return false }
-        // Legacy: reviewed under the fixed-block model, before period_assignments existed.
-        return !TimeBlocks.blocks(for: day, config).contains { store.blockAssignment(day: dayStr, block: $0.id)?.ticket?.isEmpty == false }
+        return !TimesheetRecord.exists(day: day, config: config, store: store,
+                                       submittedDays: UserDefaults.standard.stringArray(forKey: "submittedDays") ?? [])
     }
 
     /// The most recent prior day that had activity; returned only if it still needs filling.

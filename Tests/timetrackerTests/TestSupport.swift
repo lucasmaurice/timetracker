@@ -2,6 +2,16 @@ import Foundation
 import Testing
 @testable import timetracker
 
+
+/// Single parent for EVERY suite in this target.
+///
+/// `TestEnv` claims the process-global `AppPaths.overrideDataDir`, and `.serialized` only orders
+/// tests *within* one suite — separate top-level suites still run in parallel with each other and
+/// stomp that global mid-test. Nesting every suite here (via `extension TTTests`) makes the trait
+/// apply to all of them, so the whole target runs serially.
+@Suite(.serialized)
+struct TTTests {}
+
 /// A disposable data directory + `Store`, so tests never touch the real
 /// `~/Library/Application Support/TimeTracker`. `AppPaths.overrideDataDir` is process-global, so
 /// every suite using this must carry `.serialized`.

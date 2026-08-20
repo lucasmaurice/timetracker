@@ -5,6 +5,7 @@ import Testing
 /// Regression tests for the PR #5 review findings that live in `PeriodCompiler`.
 /// Serialized: they share `AppPaths.overrideDataDir`. `compileFast` is used throughout — it is the
 /// full pipeline minus the Ollama meeting guess, so these stay offline and deterministic.
+extension TTTests {
 @Suite(.serialized)
 @MainActor
 struct PeriodCompilerTests {
@@ -225,4 +226,5 @@ struct PeriodCompilerTests {
                                                  store: env.store, attribution: env.attribution(config))
         #expect(periods.allSatisfy { $0.trueSeconds == 0 })
     }
+}
 }

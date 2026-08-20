@@ -45,10 +45,12 @@ and the period knobs, so a `Config` default change can't silently move an assert
 
 `TestEnv` (in `TestSupport.swift`) redirects `AppPaths.overrideDataDir` at a fresh temp directory,
 so a test never reads or writes the real `~/Library/Application Support/TimeTracker` — it seeds its
-own sqlite file and `sprint.json`. That override is process-global, so **every suite using
-`TestEnv` must carry `.serialized`**, and `TestEnv.deinit` deliberately does NOT reset it (deinit
-isn't ordered against the next test's init, so resetting there can point a later test at the real
-data directory mid-run).
+own sqlite file and `sprint.json`. That override is process-global, and `.serialized` only orders tests *within* one suite —
+separate top-level suites still run in parallel and stomp it mid-test. So **every suite that uses
+`TestEnv` is nested inside `TTTests`** (`extension TTTests { @Suite(.serialized) struct … }`), which
+makes the trait cover all of them; suites that don't touch `TestEnv` stay top-level and parallel.
+`TestEnv.deinit` also deliberately does NOT reset the override — deinit isn't ordered against the
+next test's init, so resetting there can point a later test at the real data directory mid-run.
 
 Most of the suite is `PeriodCompiler` invariants pinned after the PR #5 review — exact sources
 surviving the corpus gate, manual `retag` granularity, the `hasActivity` floor, break clipping,

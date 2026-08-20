@@ -178,7 +178,9 @@ final class Atlassian: IssueProvider {
         return keys
     }
 
-    private func parseTicket(_ issue: [String: Any], sprintKeys: Set<String>, queueKeys: Set<String>,
+    /// Internal rather than private so the assignee tri-state below can be tested against fixture
+    /// payloads — the bug it encodes (field read but never requested) shipped once.
+    func parseTicket(_ issue: [String: Any], sprintKeys: Set<String>, queueKeys: Set<String>,
                              commonKeys: Set<String>, sprintFieldId: String?) -> Ticket? {
         guard let key = issue["key"] as? String, let f = issue["fields"] as? [String: Any] else { return nil }
         let summary = f["summary"] as? String ?? ""
