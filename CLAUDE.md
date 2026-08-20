@@ -303,8 +303,11 @@ change into duplicate worklogs on the next submit.
 record which ones already happened. The target builds with
 `-strict-concurrency=targeted` (see `Package.swift` for why targeted and not complete), so anything
 using async/await, `Task`, or a `@Sendable` closure is compiler-checked — Swift 5 language mode
-alone caught none of this, which is how a live data race shipped clean. Keep the build at one
-known warning; if you add a second, you added a race:
+alone caught none of this, which is how a live data race shipped clean. **The build is at zero
+warnings; a new one means you added a race.** `AppDelegate` is `@MainActor`, and the provider
+clients / `Store` / `RepoTicketBridge` / `AzurePRBridge` are `@unchecked Sendable` — each *earns*
+that by guarding its own state (an `NSLock` or a serial queue), so don't add the annotation to a
+type that doesn't:
 
 - Enrichment (AppleScript, `git`, `lsof`, `pgrep`, `kubectl`, `ps`) runs on `FocusMonitor`'s serial
   `enrichQueue`, never on main — it froze the menu bar. The enricher's caches assume that serial queue.
