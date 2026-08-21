@@ -16,7 +16,14 @@ final class AzureDevOps: IssueProvider, Preloadable, @unchecked Sendable {
     var displayName: String { "Azure DevOps" }
     struct Credentials: Codable { var org: String; var pat: String }
 
-    private static let account = "azdo_credentials"
+    /// Test-only redirection of this client's Keychain item to a throwaway account.
+    ///
+    /// Exists so a test can deliberately fail `connect()` and assert that nothing was persisted,
+    /// WITHOUT risking the real stored credential: if the write-before-validate ordering ever
+    /// regressed, such a test would otherwise overwrite a working PAT with the bogus one it just
+    /// tried. nil (always, in the shipping app) = the real account.
+    nonisolated(unsafe) static var keychainAccountOverride: String?
+    private static var account: String { keychainAccountOverride ?? "azdo_credentials" }
     private let config: Config
 
     init(config: Config) { self.config = config }
