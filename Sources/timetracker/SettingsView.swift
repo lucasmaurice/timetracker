@@ -35,6 +35,24 @@ struct SettingsView: View {
                     num("Workday length (hours)", \.workdayHours, "Total tracked hours/day. Blocks = workday ÷ block length (e.g. 8 ÷ 1 = 8 blocks).")
                 }
 
+                Section("Periods (day totals, not clock times)") {
+                    Text("Regular and code-review time are totaled per ticket for the day — exact start/stop times aren't tracked or shown. Daily/break/meeting still get their own carved-out entries.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                    text("Daily standup title match", $model.config.dailyStandupTitleMatch, "Substring (case-insensitive) that identifies your daily standup among detected meetings.")
+                    text("Daily standup ticket", $model.config.dailyStandupTicket, "Where standup time is logged. Empty = abstain (no ticket).")
+                    num("Break starts at hour", \.breakStartHour, "Local hour the fixed daily break begins, e.g. 9 = 9am. Injected unconditionally, not detected from an idle gap.")
+                    num("Break length (minutes)", \.breakDurationMinutes, "Fixed duration injected once/day regardless of actual activity then.")
+                    text("Break ticket", $model.config.breakTicket, "Where break time is logged. Empty = abstain (no ticket).")
+                    text("Generic code-review ticket", $model.config.genericCodeReviewTicket, "Where code-review time on a PR with no linked board work item is logged. Empty = that time abstains.")
+                    num("Meeting merge gap (minutes)", \.periodMergeGapMinutes, "A brief interruption shorter than this doesn't split one continuous meeting into two sessions before ticket-guessing.")
+                    num("Round non-regular periods to (minutes)", \.periodRoundMinutes, "Daily/break/code-review/meeting reported duration rounds to the nearest this-many minutes.")
+                    num("Minimum period length (minutes)", \.periodMinMinutes, "Floor for daily/break/code-review/meeting reported duration.")
+                    toggle("Summer Friday enabled", $model.config.summerFridayEnabled, "Shortened Friday target during a yearly-recurring date range, instead of the normal workday length above.")
+                    text("Summer Friday start (MM-dd)", $model.config.summerFridayStartMonthDay, "Inclusive range start, reapplied every year, e.g. 06-01.")
+                    text("Summer Friday end (MM-dd)", $model.config.summerFridayEndMonthDay, "Inclusive range end, e.g. 08-31. Must not wrap across Dec→Jan.")
+                    num("Summer Friday target (hours)", \.summerFridayHours, "Daily target on a qualifying Friday, e.g. 6.")
+                }
+
                 Section("Privacy — never watch") {
                     text("Excluded apps", csv(\.excludedApps), "Private apps to never record (matched on bundle id / name), e.g. perplexity, TrainingPeaks, Spotify.")
                     text("Excluded window/URL patterns", csv(\.excludedWindowPatterns), "Don't record windows whose app/title/URL contains these, e.g. facebook.com, reddit.com.")

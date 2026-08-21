@@ -1,8 +1,18 @@
 import Foundation
 
 enum AppPaths {
+    /// Test-only redirection of the ENTIRE data surface — db, config.json, sprint.json, the
+    /// worklog maps, everything derived from `dataDir` below. One override instead of threading a
+    /// path through `Store.init`, `Attribution.reloadSprint`, `Config.load` and the provider
+    /// clients separately, all of which read their location from here.
+    ///
+    /// nil (always, in the shipping app) = the real Application Support location. Tests that set
+    /// it must run serialized — it's process-global state.
+    nonisolated(unsafe) static var overrideDataDir: URL?
+
     static var dataDir: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        if let overrideDataDir { return overrideDataDir }
+        return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("TimeTracker", isDirectory: true)
     }
     static var configFile: URL { dataDir.appendingPathComponent("config.json") }
@@ -116,6 +126,43 @@ struct Config: Codable {
     var sevenPaceOrg: String = ""
     /// Activity type id (UUID) attached to every submitted worklog. Empty = omit the field.
     var sevenPaceActivityTypeId: String = ""
+
+    // MARK: Periods (floating regular blocks + carved-out daily/break/meeting/code-review)
+
+    /// Substring (case-insensitive) matched against a detected meeting's label to identify your
+    /// daily standup among meetings generally. Follows the same plain-substring convention as
+    /// excludedApps/CategoryRule.anyOf.
+    var dailyStandupTitleMatch: String = "daily"
+    /// Where daily-standup time is logged. Empty = daily periods abstain like any other meeting.
+    var dailyStandupTicket: String = ""
+    /// Local hour the fixed daily break starts, e.g. 12 = noon. Injected unconditionally — not
+    /// detected from an actual idle gap.
+    var breakStartHour: Double = 12
+    /// Fixed break length (minutes), injected once/day regardless of actual activity then.
+    var breakDurationMinutes: Double = 20
+    /// Where break time is logged. Empty = the break period abstains.
+    var breakTicket: String = ""
+    /// A code-review period (PR-review window detected live) whose PR has no work item linked on
+    /// your board still counts as real code-review time — logged here instead of abstaining, same
+    /// idea as breakTicket/dailyStandupTicket. Empty = that time abstains like any other.
+    var genericCodeReviewTicket: String = ""
+    /// Meeting segments within this gap merge into one session (for Ollama ticket-guessing
+    /// purposes), so a brief interruption doesn't split what's really one continuous meeting.
+    var periodMergeGapMinutes: Double = 5
+    /// Non-regular (daily/break/code-review/meeting) periods round their REPORTED duration to the
+    /// nearest this-many minutes. Does not apply to regular work (grouped by ticket, not time).
+    var periodRoundMinutes: Double = 5
+    /// ...and clamp up to at least this many minutes. Break's fixed duration already satisfies both.
+    var periodMinMinutes: Double = 15
+
+    // MARK: Summer Friday (yearly-recurring shortened workday)
+
+    var summerFridayEnabled: Bool = false
+    /// Inclusive "MM-dd" range, reapplied every year. Must not wrap across Dec→Jan (unsupported).
+    var summerFridayStartMonthDay: String = "06-01"
+    var summerFridayEndMonthDay: String = "08-31"
+    /// Daily target (hours) on a Friday inside the range above, instead of `workdayHours`.
+    var summerFridayHours: Double = 6
 
     // MARK: Housekeeping / pruning
 
@@ -349,6 +396,22 @@ enum TimeBlocks {
     static func dayString(_ date: Date) -> String {
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.calendar = calendar
         return f.string(from: date)
+    }
+
+    /// True if `date` is a Friday inside the configured (yearly-recurring) summer date range.
+    /// Plain "MM-dd" string comparison — doesn't handle a range wrapping across Dec→Jan, matching
+    /// `Config.summerFridayEndMonthDay`'s documented limitation.
+    static func isSummerFriday(_ date: Date, _ c: Config) -> Bool {
+        guard c.summerFridayEnabled, calendar.component(.weekday, from: date) == 6 else { return false }
+        let f = DateFormatter(); f.dateFormat = "MM-dd"; f.calendar = calendar
+        let md = f.string(from: date)
+        return md >= c.summerFridayStartMonthDay && md <= c.summerFridayEndMonthDay
+    }
+
+    /// The day's target tracked seconds — `workdayHours`, or `summerFridayHours` on a qualifying
+    /// Friday. Used by both the legacy fixed-block model and `PeriodCompiler`'s padding step.
+    static func dailyTargetSeconds(_ date: Date, _ c: Config) -> Double {
+        (isSummerFriday(date, c) ? c.summerFridayHours : c.workdayHours) * 3600
     }
 
     struct Block: Identifiable {

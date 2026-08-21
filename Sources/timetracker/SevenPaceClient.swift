@@ -11,14 +11,20 @@ import Foundation
 /// API infers it from the bearer token, and the exact response envelope shape. `createWorklog`
 /// logs the raw response body via `lastRawResponse` for the first real submit to be checked
 /// against; adjust `WorklogResponse`'s decoding if the tenant's shape differs.
-final class SevenPaceClient: WorklogProvider {
+/// `@unchecked Sendable`: all mutable state is guarded by `lock`.
+final class SevenPaceClient: WorklogProvider, Preloadable, @unchecked Sendable {
     var displayName: String { "7pace" }
     private static let account = "sevenpace_token"
     private let config: Config
 
+    /// Guards every mutable field. `preload()` deliberately runs on a background queue (the
+    /// Keychain can block on a permission prompt), while main reads `configured` when rebuilding
+    /// the menu — so these were genuinely racing. Never held across an `await`.
+    private let lock = NSLock()
+    private func sync<T>(_ body: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return body() }
     private var loaded = false
     private var cachedToken: String?
-    var configured: Bool { cachedToken != nil }
+    var configured: Bool { sync { cachedToken != nil } }
 
     /// (day|block) → 7pace worklog id (a UUID string). Its own file — see the type note above.
     private var worklogMap: [String: String] = [:]
@@ -26,7 +32,8 @@ final class SevenPaceClient: WorklogProvider {
 
     /// The raw JSON of the most recent createWorklog response, for verifying the envelope shape
     /// against a real tenant (see the type-level doc comment).
-    private(set) var lastRawResponse: String?
+    private var _lastRawResponse: String?
+    var lastRawResponse: String? { sync { _lastRawResponse } }
 
     init(config: Config) {
         self.config = config
@@ -35,17 +42,24 @@ final class SevenPaceClient: WorklogProvider {
     }
 
     private func mapKey(day: String, block: String) -> String { "\(day)|\(block)" }
-    func worklogId(day: String, block: String) -> String? { worklogMap[mapKey(day: day, block: block)] }
+    func worklogId(day: String, block: String) -> String? { sync { worklogMap[mapKey(day: day, block: block)] } }
+
+    func legacyFixedBlockWorklogIds(day: String) -> [(block: String, id: String)] {
+        WorklogKey.legacyIds(in: sync { worklogMap }, day: day)
+    }
 
     func setWorklogId(day: String, block: String, id: String?) {
-        if let id { worklogMap[mapKey(day: day, block: block)] = id }
-        else { worklogMap.removeValue(forKey: mapKey(day: day, block: block)) }
+        sync {
+            if let id { worklogMap[mapKey(day: day, block: block)] = id }
+            else { worklogMap.removeValue(forKey: mapKey(day: day, block: block)) }
+        }
         saveMap()
     }
 
     private func saveMap() {
         try? FileManager.default.createDirectory(at: AppPaths.dataDir, withIntermediateDirectories: true)
-        if let data = try? JSONEncoder().encode(worklogMap) { try? data.write(to: mapFile, options: [.atomic]) }
+        let snapshot = sync { worklogMap }
+        if let data = try? JSONEncoder().encode(snapshot) { try? data.write(to: mapFile, options: [.atomic]) }
     }
 
     /// Drop map entries for days older than `days` (resubmission no longer realistic).
@@ -53,27 +67,29 @@ final class SevenPaceClient: WorklogProvider {
         guard days > 0 else { return }
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.calendar = .current
         let cutoff = Date().addingTimeInterval(-days * 86400)
-        worklogMap = worklogMap.filter { kv in
+        sync {
+            worklogMap = worklogMap.filter { kv in
             guard let dayStr = kv.key.split(separator: "|").first, let d = f.date(from: String(dayStr)) else { return true }
             return d >= cutoff
+        }
         }
         saveMap()
     }
 
     func preload() {
-        guard !loaded else { return }
-        cachedToken = Keychain.getCodable(String.self, account: Self.account)
-        loaded = true
+        guard sync({ !loaded }) else { return }
+        let t = Keychain.getCodable(String.self, account: Self.account)   // outside the lock
+        sync { cachedToken = t; loaded = true }
     }
 
     func connect(token: String) {
         Keychain.setCodable(token, account: Self.account)
-        cachedToken = token; loaded = true
+        sync { cachedToken = token; loaded = true }
     }
 
     func disconnect() {
         Keychain.delete(account: Self.account)
-        cachedToken = nil; loaded = true
+        sync { cachedToken = nil; loaded = true }
     }
 
     private func base() -> String? {
@@ -99,7 +115,7 @@ final class SevenPaceClient: WorklogProvider {
     @discardableResult
     func createWorklog(issueId: String, author: String?, date: String, startTime: String,
                        seconds: Int, description: String) async throws -> String? {
-        guard let token = cachedToken else { throw SevenPaceError.notConfigured }
+        guard let token = sync({ cachedToken }) else { throw SevenPaceError.notConfigured }
         guard let base = base(), let url = URL(string: "\(base)/workLogs?api-version=3.2") else {
             throw SevenPaceError.notConfigured
         }
@@ -127,7 +143,7 @@ final class SevenPaceClient: WorklogProvider {
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, resp) = try await URLSession.shared.data(for: req)
-        lastRawResponse = String(data: data, encoding: .utf8)
+        sync { _lastRawResponse = String(data: data, encoding: .utf8) }
         guard let http = resp as? HTTPURLResponse else { throw SevenPaceError.badRequest("no response") }
         guard (200..<300).contains(http.statusCode) else {
             throw SevenPaceError.http(http.statusCode, String(String(data: data, encoding: .utf8)?.prefix(400) ?? ""))
@@ -138,7 +154,7 @@ final class SevenPaceClient: WorklogProvider {
     }
 
     func deleteWorklog(id: String) async {
-        guard let token = cachedToken, let base = base(),
+        guard let token = sync({ cachedToken }), let base = base(),
               let url = URL(string: "\(base)/workLogs/\(id)?api-version=3.2") else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "DELETE"
@@ -150,7 +166,7 @@ final class SevenPaceClient: WorklogProvider {
     /// instead of asking for a bare UUID.
     struct ActivityType: Decodable { var id: String; var name: String }
     func fetchActivityTypes() async -> [ActivityType] {
-        guard let token = cachedToken, let base = base(),
+        guard let token = sync({ cachedToken }), let base = base(),
               let url = URL(string: "\(base)/activityTypes?api-version=3.2") else { return [] }
         var req = URLRequest(url: url)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")

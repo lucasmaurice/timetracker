@@ -214,7 +214,8 @@ final class FocusMonitor {
                 idle: st.idle, ticket: st.attribution.ticket,
                 ticketSource: st.attribution.source, category: st.attribution.category,
                 confidence: st.attribution.confidence,
-                contextDoc: doc?.isEmpty == true ? nil : doc))
+                contextDoc: doc?.isEmpty == true ? nil : doc,
+                meeting: (st.idle || st.context.excluded) ? nil : st.context.meeting))
         }
         openStart = nil
         openState = nil

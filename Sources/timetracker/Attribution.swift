@@ -18,6 +18,53 @@ struct Ticket: Codable, Equatable {
     /// doesn't distinguish "in review" from "in progress", so Jira tickets leave this nil and fall
     /// back to the name-based heuristic below — this only takes over where it adds precision.
     var statusCategory: String?
+    /// True for every ticket populated the normal way (Jira's JQL, Azure DevOps' WIQL both already
+    /// mean "assigned to me"). Only ever `false` for a ticket resolved live via the PR-review path
+    /// (`AzureDevOps.resolveWorkItem(forPullRequestId:)`), which is explicitly allowed to surface a
+    /// teammate's work item — see `PeriodCompiler`'s regular-block candidate gate, which requires
+    /// this to be true (code-review periods deliberately don't).
+    var assignedToMe: Bool = true
+    /// Azure Boards project name (the first segment of AreaPath, e.g. "DevOps" from
+    /// "DevOps\Service Desk") — nil for Jira, where the key prefix already implies the project.
+    /// Needed because the work-item browser URL requires a project segment
+    /// (`/{org}/{project}/_workitems/edit/{id}`) and this org's work spans multiple projects
+    /// (DevOps/Infra/Platform), so it can't be assumed from `config.azureProject` alone.
+    var project: String?
+
+    init(key: String, summary: String, text: String? = nil, status: String? = nil, updated: String? = nil,
+         done: Bool = false, inSprint: Bool = false, inQueue: Bool = false, common: Bool = false,
+         issueId: String? = nil, statusCategory: String? = nil, assignedToMe: Bool = true, project: String? = nil) {
+        self.key = key; self.summary = summary; self.text = text; self.status = status; self.updated = updated
+        self.done = done; self.inSprint = inSprint; self.inQueue = inQueue; self.common = common
+        self.issueId = issueId; self.statusCategory = statusCategory; self.assignedToMe = assignedToMe
+        self.project = project
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case key, summary, text, status, updated, done, inSprint, inQueue, common, issueId, statusCategory, assignedToMe, project
+    }
+
+    /// A plain synthesized `Decodable` would throw on any `sprint.json` written before this field
+    /// existed (missing key on a non-Optional property, unlike `text`'s Optional-driven backward
+    /// compat above) — silently emptying the whole ticket corpus on the very next launch after an
+    /// update, exactly the `Config.load()` bug this project already hit once. `decodeIfPresent` +
+    /// the field's own default sidesteps it the same way.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        key = try c.decode(String.self, forKey: .key)
+        summary = try c.decode(String.self, forKey: .summary)
+        text = try c.decodeIfPresent(String.self, forKey: .text)
+        status = try c.decodeIfPresent(String.self, forKey: .status)
+        updated = try c.decodeIfPresent(String.self, forKey: .updated)
+        done = try c.decodeIfPresent(Bool.self, forKey: .done) ?? false
+        inSprint = try c.decodeIfPresent(Bool.self, forKey: .inSprint) ?? false
+        inQueue = try c.decodeIfPresent(Bool.self, forKey: .inQueue) ?? false
+        common = try c.decodeIfPresent(Bool.self, forKey: .common) ?? false
+        issueId = try c.decodeIfPresent(String.self, forKey: .issueId)
+        statusCategory = try c.decodeIfPresent(String.self, forKey: .statusCategory)
+        assignedToMe = try c.decodeIfPresent(Bool.self, forKey: .assignedToMe) ?? true
+        project = try c.decodeIfPresent(String.self, forKey: .project)
+    }
 
     /// What the lexical/embedding matcher sees (rich, includes the description).
     var matchText: String { (text?.isEmpty == false ? text! : summary) }
@@ -90,6 +137,18 @@ struct Ticket: Codable, Equatable {
             else if days > 60 { out.append(("stale >60d", w.stale60dPenalty)) }
         }
         return out
+    }
+
+    /// "Actively being worked" for `PeriodCompiler`'s regular-block candidate gate — mirrors the
+    /// exact fallback chain `priorBreakdown` above already uses (statusCategory, else
+    /// preferredTicketStates membership, else a name-based heuristic), since Jira tickets never
+    /// have `statusCategory` set at all: gating on `statusCategory == "InProgress"` literally would
+    /// make every Jira user's regular blocks abstain forever.
+    func isInProgressLike(preferredStates: Set<String>) -> Bool {
+        if done { return false }
+        if let statusCategory { return statusCategory == "InProgress" }
+        if let status, preferredStates.contains(status.lowercased()) { return true }
+        return (status ?? "").lowercased().contains("progress")
     }
 
     /// Jira's `updated` (and Azure Boards' `ChangedDate`) include fractional seconds
@@ -168,6 +227,17 @@ final class Attribution {
     static let exactSources: Set<String> = ["url", "branch", "title", "commit", "session", "learned", "manual", "pinned", "prReview"]
     static func isExact(_ source: String?) -> Bool { source.map { exactSources.contains($0) } ?? false }
 
+    /// Human-readable phrase for an attribution source, for the menu-bar "Why" line and anywhere
+    /// else a raw `ticket_source`/`guessSource` value needs to read as a sentence, not a keyword.
+    private static let sourceDescriptions: [String: String] = [
+        "url": "the page URL", "branch": "your git branch", "title": "the window title",
+        "commit": "a commit message", "session": "your AI session", "prReview": "reviewing this PR",
+        "learned": "a correction you confirmed before", "manual": "set manually", "pinned": "pinned",
+        "rule": "a no-ticket rule", "semantic": "lexical match", "memory": "similar past work",
+        "repo": "repo history", "embed": "embedding match", "llm": "the local LLM", "guess": "best guess",
+    ]
+    static func sourceDescription(_ source: String) -> String { sourceDescriptions[source] ?? source }
+
     /// True if a ticket key is on the exclusion list (exact or glob match).
     func isExcluded(_ key: String) -> Bool {
         let r = NSRange(key.startIndex..., in: key)
@@ -234,6 +304,68 @@ final class Attribution {
             if let key = keyFormat.extract(from: text, source: source), !isExcluded(key) { return key }
         }
         return nil
+    }
+
+    /// A `Sendable` handle to exactly the parts of `Attribution` that are safe to touch off the
+    /// main thread: the repo bridge (guards its own state behind a serial queue), the store
+    /// (SQLite in serialized mode), immutable workspace paths, and pure key-extraction closures.
+    ///
+    /// It exists so the launch mining pass can capture THIS instead of `Attribution` or
+    /// `AppDelegate`. `Attribution`'s `sprint`/`guessKeys` are main-owned and unguarded — handing
+    /// the whole object to a background task is the shape of bug #9 was, and nothing but a type
+    /// boundary stops it recurring.
+    struct BackgroundMiner: Sendable {
+        let bridge: RepoTicketBridge
+        let store: Store
+        let workspaceDirs: [URL]
+        let extract: @Sendable (String) -> String?
+        let isExcluded: @Sendable (String) -> Bool
+
+        /// Heavy: spawns git per repo. Replaces the bridge's map wholesale.
+        func rebuildRepoBridge(now: Date = Date()) {
+            bridge.rebuild(workspaceDirs: workspaceDirs, now: now, extract: extract)
+        }
+
+        /// MUST run after `rebuildRepoBridge` in the same pass — that call replaces the map
+        /// wholesale, so merging first would be silently wiped.
+        func ingestPRBridgeResults(_ results: [(repo: String, keys: [(key: String, ts: Double)])], now: Date = Date()) {
+            for r in results { bridge.ingestResolvedKeys(repo: r.repo, keys: r.keys, now: now) }
+        }
+
+        /// Seed `labels` from git history. Returns rows inserted; the caller reloads the in-memory
+        /// index on main.
+        @discardableResult
+        func backfillFromHistory() -> Int {
+            let examples = bridge.backfillExamples(workspaceDirs: workspaceDirs, extract: extract)
+            var inserted = 0
+            for e in examples where !isExcluded(e.ticket) {
+                var lines = ["Repo: \(e.repo)" + (e.branch.map { " (branch \($0))" } ?? "")]
+                if !e.subjects.isEmpty { lines.append("Recent commits: " + e.subjects.prefix(4).joined(separator: " | ")) }
+                store.insertLabel(contextDoc: lines.joined(separator: "\n"), ticket: e.ticket, kind: "backfill")
+                inserted += 1
+            }
+            return inserted
+        }
+    }
+
+    /// Build the background handle. `keyFormat` and `excludeRegexes` are `let`s fixed in `init`,
+    /// so the captured closures read nothing mutable.
+    func backgroundMiner() -> BackgroundMiner {
+        let keyFormat = self.keyFormat
+        let regexes = self.excludeRegexes
+        let excluded: @Sendable (String) -> Bool = { key in
+            let r = NSRange(key.startIndex..., in: key)
+            return regexes.contains { $0.firstMatch(in: key, options: [], range: r) != nil }
+        }
+        return BackgroundMiner(
+            bridge: repoBridge, store: store, workspaceDirs: config.expandedWorkspaceDirs,
+            extract: { text in
+                for source: KeySource in [.commit, .branch] {
+                    if let key = keyFormat.extract(from: text, source: source), !excluded(key) { return key }
+                }
+                return nil
+            },
+            isExcluded: excluded)
     }
 
     /// Re-mine workspace git history into the repo→ticket bridge. Heavy (spawns git per repo);
@@ -456,14 +588,20 @@ final class Attribution {
     /// to sprint.json — it's a narrow, moment-specific exception, not a corpus widening). Set by
     /// the async resolver in main.swift once the network round trip completes; from then on the
     /// exact-match check in `decideAttribution` below fires purely from this in-memory map, no
-    /// further network on the hot attribution path.
-    private var prReviewTickets: [Int: Ticket] = [:]
+    /// further network on the hot attribution path. The value is `Ticket??` (present-but-nil means
+    /// "checked, no linked work item" — still worth remembering as code-review activity for
+    /// `PeriodCompiler`'s generic-code-review fallback — vs. key-absent meaning "not checked yet").
+    private var prReviewTickets: [Int: Ticket?] = [:]
 
-    /// Called once a PR's linked work item is fetched. Merges the ticket into the live guess pool
-    /// too (not just the PR-id cache) so ranking/lexical-match/priorBreakdown treat it like any
-    /// other candidate if it also turns up via other signals — e.g. its own title/branch.
-    func cachePRReviewTicket(prId: Int, ticket: Ticket) {
+    /// Called once a PR's linked-work-item lookup completes, successful or not. Merges a found
+    /// ticket into the live guess pool too (not just the PR-id cache) so ranking/lexical-match/
+    /// priorBreakdown treat it like any other candidate if it also turns up via other signals —
+    /// e.g. its own title/branch. A nil `ticket` still records the PR as checked (source
+    /// "prReview" fires with no key), so a PR with no board work item is recognized as code-review
+    /// activity rather than falling through to ordinary fusion guessing.
+    func cachePRReviewTicket(prId: Int, ticket: Ticket?) {
         prReviewTickets[prId] = ticket
+        guard let ticket else { return }
         if !guessKeys.contains(ticket.key) {
             guessKeys.insert(ticket.key)
             guessTickets.append(ticket)
@@ -502,9 +640,11 @@ final class Attribution {
         // 1a) Reviewing someone else's PR (window title "Pull request NNNN: ... - Repos") is an
         // exception to "only your own assigned tickets get exact treatment" — the work item was
         // resolved live via the AzDO API (see main.swift's PR-review resolver) specifically
-        // because you're looking at it right now, regardless of who it's assigned to.
-        if let prId = extractPRNumber(fromTitle: ctx.title), let t = prReviewTickets[prId] {
-            return .init(ticket: t.key, source: "prReview", category: cat)
+        // because you're looking at it right now, regardless of who it's assigned to. A PR with no
+        // linked work item still resolves the source to "prReview" (ticket nil, an abstain) rather
+        // than falling through to fusion — PeriodCompiler recognizes it as code review either way.
+        if let prId = extractPRNumber(fromTitle: ctx.title), let resolution = prReviewTickets[prId] {
+            return .init(ticket: resolution?.key, source: "prReview", category: cat)
         }
 
         // 1b) A standing "this context is non-billable" rule resolves to no-ticket (still logged).

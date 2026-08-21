@@ -10,11 +10,16 @@ import Foundation
 /// old PRs contribute almost nothing regardless), falling back to a per-PR `/workitems` lookup
 /// only for PRs where no key was found in title/description/branch text — bounded, and negative
 /// results are cached too, so unresolvable PRs aren't re-requested on every launch.
-final class AzurePRBridge {
+/// `@unchecked Sendable`: `cache` is guarded by `cacheQueue`; everything else is immutable.
+final class AzurePRBridge: @unchecked Sendable {
     private struct CacheEntry: Codable { var workItemKeys: [String]; var closedAt: Double }
     /// repo -> prId -> resolved keys (+ closed timestamp). Empty `workItemKeys` = confirmed
     /// unresolved (the negative cache).
     private var cache: [String: [String: CacheEntry]] = [:]
+    /// Guards `cache`. Today this runs only from the single launch mining pass, so the map is
+    /// never touched concurrently — but "safe because only one caller exists" is a property of the
+    /// callers, not of this type, and it is one refactor from being false.
+    private let cacheQueue = DispatchQueue(label: "ca.justereseau.timetracker.prbridge")
     private let file = AppPaths.dataDir.appendingPathComponent("pr-workitems.json")
     /// Strict extraction only (AB#1234 or a leading-digit branch name) — no corpus-gated bare
     /// number fallback here, since that needs the live guess pool this bridge doesn't have access
@@ -108,7 +113,7 @@ final class AzurePRBridge {
 
     private func resolveRepo(project: String, repo: String, azureDevOps: AzureDevOps, now: Date) async -> [(key: String, ts: Double)] {
         guard let prs = await azureDevOps.listCompletedPullRequests(project: project, repo: repo) else { return [] }
-        var repoCache = cache[repo] ?? [:]
+        var repoCache = cacheQueue.sync { cache[repo] ?? [:] }
         var out: [(key: String, ts: Double)] = []
         var unresolvedIds: [Int] = []
         var tsById: [Int: Double] = [:]
@@ -143,7 +148,7 @@ final class AzurePRBridge {
             for k in keys { out.append((k, ts)) }
         }
 
-        cache[repo] = repoCache
+        cacheQueue.sync { cache[repo] = repoCache }
         return out
     }
 }

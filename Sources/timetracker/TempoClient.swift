@@ -5,13 +5,19 @@ import Foundation
 /// stored in the Keychain. Read off-main via preload() to avoid blocking the UI on the prompt.
 /// Tempo's worklog author is a Jira accountId, so this client is handed the connected `Atlassian`
 /// instance to resolve it — `resolveAuthor()` is the only WorklogProvider method that needs it.
-final class TempoClient: WorklogProvider {
+/// `@unchecked Sendable`: all mutable state is guarded by `lock`.
+final class TempoClient: WorklogProvider, Preloadable, @unchecked Sendable {
     var displayName: String { "Tempo" }
     private static let account = "tempo_token"
     private static let base = "https://api.tempo.io/4"
     private let config: Config
     private let atlassian: Atlassian
 
+    /// Guards every mutable field. `preload()` deliberately runs on a background queue (the
+    /// Keychain can block on a permission prompt), while main reads `configured` when rebuilding
+    /// the menu — so these were genuinely racing. Never held across an `await`.
+    private let lock = NSLock()
+    private func sync<T>(_ body: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return body() }
     private var loaded = false
     private var cachedToken: String?
 
@@ -24,12 +30,12 @@ final class TempoClient: WorklogProvider {
         self.config = config
         self.atlassian = atlassian
         if let data = try? Data(contentsOf: mapFile),
-           let m = try? JSONDecoder().decode([String: Int].self, from: data) { worklogMap = m }
+           let m = try? JSONDecoder().decode([String: Int].self, from: data) { worklogMap = m }   // init: no contention yet
     }
 
     private func mapKey(day: String, block: String) -> String { "\(day)|\(block)" }
     func worklogId(day: String, block: String) -> String? {
-        worklogMap[mapKey(day: day, block: block)].map(String.init)
+        sync { worklogMap[mapKey(day: day, block: block)] }.map(String.init)
     }
 
     /// The Tempo worklog author is your Jira account — Tempo has no separate identity of its own.
@@ -37,12 +43,19 @@ final class TempoClient: WorklogProvider {
 
     private func saveMap() {
         try? FileManager.default.createDirectory(at: AppPaths.dataDir, withIntermediateDirectories: true)
-        if let data = try? JSONEncoder().encode(worklogMap) { try? data.write(to: mapFile, options: [.atomic]) }
+        let snapshot = sync { worklogMap }
+        if let data = try? JSONEncoder().encode(snapshot) { try? data.write(to: mapFile, options: [.atomic]) }
+    }
+
+    func legacyFixedBlockWorklogIds(day: String) -> [(block: String, id: String)] {
+        WorklogKey.legacyIds(in: sync { worklogMap }, day: day)
     }
 
     func setWorklogId(day: String, block: String, id: String?) {
-        if let id, let intId = Int(id) { worklogMap[mapKey(day: day, block: block)] = intId }
-        else { worklogMap.removeValue(forKey: mapKey(day: day, block: block)) }
+        sync {
+            if let id, let intId = Int(id) { worklogMap[mapKey(day: day, block: block)] = intId }
+            else { worklogMap.removeValue(forKey: mapKey(day: day, block: block)) }
+        }
         saveMap()
     }
 
@@ -51,30 +64,32 @@ final class TempoClient: WorklogProvider {
         guard days > 0 else { return }
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.calendar = .current
         let cutoff = Date().addingTimeInterval(-days * 86400)
-        worklogMap = worklogMap.filter { kv in
-            guard let dayStr = kv.key.split(separator: "|").first, let d = f.date(from: String(dayStr)) else { return true }
-            return d >= cutoff
+        sync {
+            worklogMap = worklogMap.filter { kv in
+                guard let dayStr = kv.key.split(separator: "|").first, let d = f.date(from: String(dayStr)) else { return true }
+                return d >= cutoff
+            }
         }
         saveMap()
     }
 
     /// Read the token once, off the main thread (Keychain can block on a permission prompt).
     func preload() {
-        guard !loaded else { return }
-        cachedToken = Keychain.getCodable(String.self, account: Self.account)
-        loaded = true
+        guard sync({ !loaded }) else { return }
+        let t = Keychain.getCodable(String.self, account: Self.account)   // outside the lock
+        sync { cachedToken = t; loaded = true }
     }
 
-    var configured: Bool { cachedToken != nil }
+    var configured: Bool { sync { cachedToken != nil } }
 
     func connect(token: String) {
         Keychain.setCodable(token, account: Self.account)
-        cachedToken = token; loaded = true
+        sync { cachedToken = token; loaded = true }
     }
 
     func disconnect() {
         Keychain.delete(account: Self.account)
-        cachedToken = nil; loaded = true
+        sync { cachedToken = nil; loaded = true }
     }
 
     /// Create one Tempo worklog. Throws with the server message on failure (e.g. a missing
@@ -83,7 +98,7 @@ final class TempoClient: WorklogProvider {
     @discardableResult
     func createWorklog(issueId: String, author: String?, date: String, startTime: String,
                        seconds: Int, description: String) async throws -> String? {
-        guard let token = cachedToken else { throw TempoError.notConfigured }
+        guard let token = sync({ cachedToken }) else { throw TempoError.notConfigured }
         guard let author else { throw TempoError.notConfigured }
         guard let issueIdInt = Int(issueId) else { throw TempoError.badURL }
         guard let url = URL(string: "\(Self.base)/worklogs") else { throw TempoError.badURL }
@@ -111,7 +126,7 @@ final class TempoClient: WorklogProvider {
 
     /// Delete a previously-created worklog. 404 (already gone) is tolerated.
     func deleteWorklog(id: String) async {
-        guard let token = cachedToken, let url = URL(string: "\(Self.base)/worklogs/\(id)") else { return }
+        guard let token = sync({ cachedToken }), let url = URL(string: "\(Self.base)/worklogs/\(id)") else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "DELETE"
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")

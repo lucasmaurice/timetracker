@@ -7,15 +7,16 @@ struct ReviewAlt: Identifiable {
     var id: String { key }
 }
 
-/// One editable timesheet block in the review screen.
-struct ReviewBlock: Identifiable {
-    let block: String          // block id ("1"..."N")
-    let rangeText: String
-    let activeSeconds: Double
-    let idleSeconds: Double
+/// One editable period in the review screen — a floating regular block, or a carved-out
+/// daily/break/code-review/meeting period. See `PeriodCompiler`.
+struct ReviewPeriod: Identifiable {
+    let id: String                // Period.id ("kind|ticket") — see PeriodCompiler
+    let kind: PeriodKind
+    let durationText: String      // reported duration, e.g. "2h15" — no clock times tracked/shown
+    let activeSeconds: Double     // trueSeconds
     let slices: [Slice]        // time by ticket (proportion bar)
     let recap: String          // what you did (repo · files · session · app)
-    let guessKey: String?      // the system's best guess for the block
+    let guessKey: String?      // the system's best guess for the period
     let guessSummary: String?  // its description
     let guessWhy: String?      // why it was picked (source · confidence)
     let alternatives: [ReviewAlt]
@@ -23,18 +24,17 @@ struct ReviewBlock: Identifiable {
     var ticket: String          // editable final ticket
     var note: String            // editable
     var confirmed: Bool = false // explicit ✓ (teaches the model even if unchanged)
-    var id: String { block }
 }
 
 final class ReviewModel: ObservableObject {
     @Published var dayText: String
-    @Published var blocks: [ReviewBlock]
+    @Published var periods: [ReviewPeriod]
     let tickets: [Ticket]
     let noTicketLabel: String
 
-    init(dayText: String, blocks: [ReviewBlock], tickets: [Ticket], noTicketLabel: String) {
+    init(dayText: String, periods: [ReviewPeriod], tickets: [Ticket], noTicketLabel: String) {
         self.dayText = dayText
-        self.blocks = blocks
+        self.periods = periods
         self.tickets = tickets
         self.noTicketLabel = noTicketLabel
     }
@@ -60,8 +60,8 @@ struct ReviewView: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    ForEach($model.blocks) { $block in
-                        BlockCard(block: $block, model: model)
+                    ForEach($model.periods) { $period in
+                        PeriodCard(period: $period, model: model)
                     }
                 }
                 .padding(20)
@@ -89,16 +89,37 @@ struct ReviewView: View {
     }
 }
 
-private struct BlockCard: View {
-    @Binding var block: ReviewBlock
+private extension PeriodKind {
+    var icon: String {
+        switch self {
+        case .regular: return "circle"
+        case .daily: return "calendar"
+        case .breakPeriod: return "cup.and.saucer"
+        case .codeReview: return "arrow.triangle.2.circlepath"
+        case .meeting: return "video"
+        }
+    }
+    var label: String {
+        switch self {
+        case .regular: return "Regular"
+        case .daily: return "Daily"
+        case .breakPeriod: return "Break"
+        case .codeReview: return "Code review"
+        case .meeting: return "Meeting"
+        }
+    }
+}
+
+private struct PeriodCard: View {
+    @Binding var period: ReviewPeriod
     @ObservedObject var model: ReviewModel
 
-    private var isNoTicket: Bool { block.ticket.caseInsensitiveCompare(model.noTicketLabel) == .orderedSame }
+    private var isNoTicket: Bool { period.ticket.caseInsensitiveCompare(model.noTicketLabel) == .orderedSame }
     private var isEdited: Bool {
-        !block.ticket.isEmpty && block.ticket.caseInsensitiveCompare(block.originalGuess) != .orderedSame
+        !period.ticket.isEmpty && period.ticket.caseInsensitiveCompare(period.originalGuess) != .orderedSame
     }
     private var tint: Color {
-        if block.confirmed { return .green }
+        if period.confirmed { return .green }
         if isEdited { return .orange }
         return .gray
     }
@@ -106,44 +127,44 @@ private struct BlockCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text(block.rangeText).font(.system(.title3, design: .monospaced)).bold()
-                Spacer()
-                Text("active \(Summary.hm(block.activeSeconds)) · idle \(Summary.hm(block.idleSeconds))")
+                Label(period.kind.label, systemImage: period.kind.icon)
                     .font(.caption).foregroundStyle(.secondary)
+                Text(period.durationText).font(.system(.title3, design: .monospaced)).bold()
+                Spacer()
             }
 
-            if block.slices.isEmpty {
-                Text("No activity in this block.").font(.caption).foregroundStyle(.secondary)
+            if period.slices.isEmpty {
+                Text("No activity in this period.").font(.caption).foregroundStyle(.secondary)
             } else {
-                if !block.recap.isEmpty {
-                    Label(block.recap, systemImage: "doc.text.magnifyingglass")
+                if !period.recap.isEmpty {
+                    Label(period.recap, systemImage: "doc.text.magnifyingglass")
                         .font(.caption).foregroundStyle(.secondary).lineLimit(2).fixedSize(horizontal: false, vertical: true)
                 }
-                Chart(block.slices) { s in
+                Chart(period.slices) { s in
                     BarMark(x: .value("Hours", s.hours), y: .value("row", ""))
                         .foregroundStyle(by: .value("Ticket", s.label))
                 }
                 .chartLegend(.hidden).chartXAxis(.hidden).chartYAxis(.hidden).frame(height: 16)
-                Text(block.slices.prefix(5).map { "\($0.label) \(Summary.hm($0.seconds))" }.joined(separator: "  ·  "))
+                Text(period.slices.prefix(5).map { "\($0.label) \(Summary.hm($0.seconds))" }.joined(separator: "  ·  "))
                     .font(.caption2).foregroundStyle(.secondary).lineLimit(2).fixedSize(horizontal: false, vertical: true)
             }
 
             // Best guess + why + one-click confirm + alternatives.
-            if let g = block.guessKey {
+            if let g = period.guessKey {
                 HStack(spacing: 8) {
                     VStack(alignment: .leading, spacing: 1) {
-                        Text("\(g)\(block.guessSummary.map { " — \($0.prefix(48))" } ?? "")").font(.callout).lineLimit(1)
-                        if let why = block.guessWhy { Text(why).font(.caption2).foregroundStyle(.secondary) }
+                        Text("\(g)\(period.guessSummary.map { " — \($0.prefix(48))" } ?? "")").font(.callout).lineLimit(1)
+                        if let why = period.guessWhy { Text(why).font(.caption2).foregroundStyle(.secondary) }
                     }
                     Spacer()
-                    Button { block.ticket = g; block.confirmed = true } label: {
+                    Button { period.ticket = g; period.confirmed = true } label: {
                         Label("Confirm", systemImage: "checkmark.circle.fill")
                     }.buttonStyle(.borderedProminent).controlSize(.small)
-                    if !block.alternatives.isEmpty {
+                    if !period.alternatives.isEmpty {
                         Menu("Alternatives") {
-                            ForEach(block.alternatives) { a in
+                            ForEach(period.alternatives) { a in
                                 Button(String(format: "%@ (%.2f) — %@", a.key, a.score, String(a.summary.prefix(40)))) {
-                                    block.ticket = a.key; block.confirmed = false
+                                    period.ticket = a.key; period.confirmed = false
                                 }
                             }
                         }.menuStyle(.borderlessButton).fixedSize()
@@ -155,25 +176,25 @@ private struct BlockCard: View {
 
             // Final ticket + inline description + searchable picker + no-ticket.
             HStack(spacing: 8) {
-                Image(systemName: block.confirmed ? "checkmark.circle.fill" : (isEdited ? "pencil.circle" : "circle"))
+                Image(systemName: period.confirmed ? "checkmark.circle.fill" : (isEdited ? "pencil.circle" : "circle"))
                     .foregroundStyle(tint)
                 VStack(alignment: .leading, spacing: 1) {
-                    TextField("Ticket (e.g. CLOUDINFRA-1234)", text: $block.ticket).textFieldStyle(.roundedBorder)
-                    if !isNoTicket, let s = model.summary(for: block.ticket) {
+                    TextField("Ticket (e.g. CLOUDINFRA-1234)", text: $period.ticket).textFieldStyle(.roundedBorder)
+                    if !isNoTicket, let s = model.summary(for: period.ticket) {
                         Text(s).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                     }
                 }
                 .frame(maxWidth: 280)
-                TicketPicker(tickets: model.tickets) { block.ticket = $0 }
-                Button("No ticket") { block.ticket = model.noTicketLabel; block.confirmed = true }
+                TicketPicker(tickets: model.tickets) { period.ticket = $0 }
+                Button("No ticket") { period.ticket = model.noTicketLabel; period.confirmed = true }
                     .controlSize(.small)
             }
 
-            TextField("note (optional summary override)", text: $block.note).textFieldStyle(.roundedBorder)
+            TextField("note (optional summary override)", text: $period.note).textFieldStyle(.roundedBorder)
         }
         .padding(14)
-        .background(tint.opacity(block.confirmed || isEdited ? 0.10 : 0.04), in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(tint.opacity(block.confirmed ? 0.4 : 0.15), lineWidth: 1))
+        .background(tint.opacity(period.confirmed || isEdited ? 0.10 : 0.04), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(tint.opacity(period.confirmed ? 0.4 : 0.15), lineWidth: 1))
     }
 }
 

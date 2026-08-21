@@ -1,5 +1,32 @@
 import Foundation
 
+/// Shared shape between `BlockReport` (fixed blocks) and `Period` (floating periods, see
+/// PeriodCompiler.swift) so `Summary.describe(_:)`/`recap` work against either without duplicating
+/// the "what dominated this stretch of time" logic.
+protocol PeriodicReport {
+    var byTicket: [(ticket: String?, seconds: Double)] { get }
+    var byCategory: [(category: String?, seconds: Double)] { get }
+}
+
+/// Whether a day already has a timesheet record, in any of the three forms that count.
+///
+/// All three are needed. `period_assignments` is the newest table, so on its own it reports EVERY
+/// day predating the floating-period compiler as unrecorded — including days already reviewed and
+/// submitted under the fixed-block model. That isn't just reminder noise: it nudges the user to
+/// reopen and re-submit historical days, which is exactly the path that duplicates worklogs (their
+/// old map keys no longer resolve — see `WorklogKey`).
+///
+/// Split out of `AppDelegate.dayNeedsFilling` so it can be tested without AppKit.
+enum TimesheetRecord {
+    static func exists(day: Date, config: Config, store: Store, submittedDays: [String]) -> Bool {
+        let dayStr = TimeBlocks.dayString(day)
+        if !store.periodAssignments(day: dayStr).isEmpty { return true }
+        if submittedDays.contains(dayStr) { return true }
+        return TimeBlocks.blocks(for: day, config)
+            .contains { store.blockAssignment(day: dayStr, block: $0.id)?.ticket?.isEmpty == false }
+    }
+}
+
 struct BlockReport {
     var day: Date
     var dayString: String
@@ -34,6 +61,8 @@ struct BlockReport {
 
     var hasActivity: Bool { activeSeconds >= 60 }
 }
+
+extension BlockReport: PeriodicReport {}
 
 /// Buckets segments into the two daily 4h blocks and produces timesheet output.
 final class Summary {
@@ -138,8 +167,8 @@ final class Summary {
         return h == h.rounded() ? "\(Int(h))h" : String(format: "%gh", h)
     }
 
-    /// One-line description of what dominated a block (for the summary column).
-    func describe(_ r: BlockReport) -> String {
+    /// One-line description of what dominated a block/period (for the summary column).
+    func describe(_ r: PeriodicReport) -> String {
         var bits: [String] = []
         for (ticket, secs) in r.byTicket.prefix(3) where secs >= 300 {
             if let t = ticket {
@@ -166,6 +195,25 @@ final class Summary {
             let summary = r.assignedNote ?? describe(r)
             rows.append("| \(r.dayString) | \(ticket) | \(dur) | \(summary) |")
         }
+        return Self.writeTimesheetRows(rows, day: day)
+    }
+
+    /// `appendTimesheet(day:)`'s counterpart for the floating-period model: one row per period,
+    /// using its own real (rounded/padded) duration instead of the fixed `blockHoursLabel`.
+    @discardableResult
+    func appendTimesheet(periods: [Period], day: Date) -> [String] {
+        let dayStr = TimeBlocks.dayString(day)
+        var rows: [String] = []
+        for p in periods where p.hasActivity {
+            let ticket = p.effectiveTicket ?? "—"
+            let summary = p.assignedNote ?? describe(p)
+            rows.append("| \(dayStr) | \(ticket) | \(Summary.hm(p.reportedSeconds)) | \(summary) |")
+        }
+        return Self.writeTimesheetRows(rows, day: day)
+    }
+
+    @discardableResult
+    private static func writeTimesheetRows(_ rows: [String], day: Date) -> [String] {
         guard !rows.isEmpty else { return [] }
         let header = "\n<!-- timetracker \(TimeBlocks.dayString(day)) -->\n"
         let blob = header + rows.joined(separator: "\n") + "\n"

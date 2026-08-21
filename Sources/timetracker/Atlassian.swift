@@ -11,11 +11,19 @@ import Foundation
 ///
 /// Credentials live in the login Keychain, never in config.json. Network calls happen only
 /// on Connect (cloud-id resolve + validate) and Refresh; focus logging stays fully offline.
-final class Atlassian: IssueProvider {
+/// `@unchecked Sendable`: all mutable state is guarded by `lock`.
+final class Atlassian: IssueProvider, Preloadable, @unchecked Sendable {
     var displayName: String { "Jira" }
     struct Credentials: Codable { var site: String; var email: String; var token: String; var cloudId: String }
 
-    private static let account = "api_credentials"
+    /// Test-only redirection of this client's Keychain item to a throwaway account.
+    ///
+    /// Exists so a test can deliberately fail `connect()` and assert that nothing was persisted,
+    /// WITHOUT risking the real stored credential: if the write-before-validate ordering ever
+    /// regressed, such a test would otherwise overwrite a working PAT with the bogus one it just
+    /// tried. nil (always, in the shipping app) = the real account.
+    nonisolated(unsafe) static var keychainAccountOverride: String?
+    private static var account: String { keychainAccountOverride ?? "api_credentials" }
     private let config: Config
 
     init(config: Config) { self.config = config }
@@ -24,25 +32,30 @@ final class Atlassian: IssueProvider {
     // every focus change, and hitting the Keychain each time caused a prompt storm under
     // ad-hoc signing (every read re-prompts). After the first read (one prompt, click
     // "Always Allow"), all later checks are in-memory.
+    /// Guards every mutable field. `preload()` deliberately runs on a background queue (the
+    /// Keychain can block on a permission prompt), while main reads `configured` when rebuilding
+    /// the menu — so these were genuinely racing. Never held across an `await`.
+    private let lock = NSLock()
+    private func sync<T>(_ body: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return body() }
     private var loaded = false
     private var cached: Credentials?
 
     /// Pure in-memory — NEVER hits the Keychain on the calling thread. SecItemCopyMatching
     /// can block waiting on a permission prompt, which froze the menu-bar UI at launch.
-    private var credentials: Credentials? { cached }
-    var configured: Bool { cached != nil }
-    var site: String? { cached?.site }
+    private var credentials: Credentials? { sync { cached } }
+    var configured: Bool { sync { cached != nil } }
+    var site: String? { sync { cached?.site } }
 
     /// Read the Keychain exactly once. MUST be called off the main thread (see above).
     func preload() {
-        guard !loaded else { return }
-        cached = Keychain.getCodable(Credentials.self, account: Self.account)
-        loaded = true
+        guard sync({ !loaded }) else { return }
+        let creds = Keychain.getCodable(Credentials.self, account: Self.account)   // outside the lock
+        sync { cached = creds; loaded = true }
     }
 
     func disconnect() {
         Keychain.delete(account: Self.account)
-        cached = nil; loaded = true
+        sync { cached = nil; loaded = true }
     }
 
     /// Accepts "acme", "acme.atlassian.net", or "https://acme.atlassian.net/" → host only.
@@ -69,9 +82,13 @@ final class Atlassian: IssueProvider {
         let normSite = Self.normalizeSite(site)
         let cloudId = try await resolveCloudId(site: normSite)
         let creds = Credentials(site: normSite, email: email, token: token, cloudId: cloudId)
-        Keychain.setCodable(creds, account: Self.account)
-        cached = creds; loaded = true   // own the item under THIS binary; no re-read needed
-        return try await testConnection()
+        // Same ordering rule as AzureDevOps.connect: in memory so testConnection() can use them,
+        // on disk only once they're known good. resolveCloudId above validates the SITE, not the
+        // token — an unverified token was still being persisted whenever the test threw.
+        sync { cached = creds; loaded = true }
+        let who = try await testConnection()
+        Keychain.setCodable(creds, account: Self.account)   // own the item under THIS binary
+        return who
     }
 
     // MARK: - Requests
@@ -98,18 +115,18 @@ final class Atlassian: IssueProvider {
         let (data, resp) = try await URLSession.shared.data(for: req)
         try Self.check(resp, data)
         let me = try JSONDecoder().decode(Myself.self, from: data)
-        cachedAccountId = me.accountId
+        sync { cachedAccountId = me.accountId }
         return me.displayName ?? me.emailAddress ?? "connected"
     }
 
     /// The current user's Atlassian accountId (needed as the Tempo worklog author).
     func accountId() async -> String? {
-        if let id = cachedAccountId { return id }
+        if let id = sync({ cachedAccountId }) { return id }
         guard let req = try? authedRequest(path: "/rest/api/3/myself"),
               let (data, resp) = try? await URLSession.shared.data(for: req),
               (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) == true,
               let me = try? JSONDecoder().decode(Myself.self, from: data) else { return nil }
-        cachedAccountId = me.accountId
+        sync { cachedAccountId = me.accountId }
         return me.accountId
     }
 
@@ -120,6 +137,11 @@ final class Atlassian: IssueProvider {
               (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) == true,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return obj["id"] as? String
+    }
+
+    func browserURL(forKey key: String, project: String?) -> URL? {
+        guard let site else { return nil }
+        return URL(string: "https://\(site)/browse/\(key)")
     }
 
     /// Recursively flatten an ADF (Atlassian Document Format) node tree into plain text.
@@ -169,7 +191,9 @@ final class Atlassian: IssueProvider {
         return keys
     }
 
-    private func parseTicket(_ issue: [String: Any], sprintKeys: Set<String>, queueKeys: Set<String>,
+    /// Internal rather than private so the assignee tri-state below can be tested against fixture
+    /// payloads — the bug it encodes (field read but never requested) shipped once.
+    func parseTicket(_ issue: [String: Any], sprintKeys: Set<String>, queueKeys: Set<String>,
                              commonKeys: Set<String>, sprintFieldId: String?) -> Ticket? {
         guard let key = issue["key"] as? String, let f = issue["fields"] as? [String: Any] else { return nil }
         let summary = f["summary"] as? String ?? ""
@@ -187,9 +211,30 @@ final class Atlassian: IssueProvider {
         // inSprint = in a board's active sprint (Agile API) OR the issue's Sprint custom field has
         // an active sprint (fallback for boards where the Agile sprint endpoint returns nothing).
         let inSprint = sprintKeys.contains(key) || Self.hasActiveSprint(f[sprintFieldId ?? ""])
+        // parseTicket is shared by the "assignee = currentUser()" fetch AND the queue/common-JQL
+        // fetches (which explicitly pull in tickets that may not be assigned to you) — so check the
+        // issue's own assignee against the connected account rather than trusting which query found
+        // it. Three distinct cases, deliberately NOT collapsed into one `else` (an earlier version
+        // did, which made an unassigned ticket read as yours):
+        //   key absent   → the field wasn't requested; we genuinely can't tell → true (majority case)
+        //   key null     → the issue really is unassigned → NOT yours
+        //   dict present → compare identity; fall back to true only if we have no identity at all
+        let assignedToMe: Bool
+        if let assignee = f["assignee"] as? [String: Any] {
+            if let acct = assignee["accountId"] as? String, let mine = sync({ cachedAccountId }) {
+                assignedToMe = acct == mine
+            } else if let email = assignee["emailAddress"] as? String, let mine = credentials?.email {
+                assignedToMe = email.caseInsensitiveCompare(mine) == .orderedSame
+            } else {
+                assignedToMe = true   // assigned to someone, but we can't resolve our own identity
+            }
+        } else {
+            assignedToMe = !f.keys.contains("assignee")   // null = unassigned; absent = unknown
+        }
         return Ticket(key: key, summary: summary, text: text, status: status, updated: updated,
                       done: done, inSprint: inSprint, inQueue: queueKeys.contains(key),
-                      common: commonKeys.contains(key.uppercased()), issueId: issue["id"] as? String)
+                      common: commonKeys.contains(key.uppercased()), issueId: issue["id"] as? String,
+                      assignedToMe: assignedToMe)
     }
 
     /// True if a Sprint custom-field value contains an active sprint. Jira Cloud returns an array
@@ -207,15 +252,15 @@ final class Atlassian: IssueProvider {
     /// Resolve the Sprint custom-field id once (its schema.custom is the greenhopper sprint type).
     private var cachedSprintFieldId: String??
     private func sprintFieldId() async -> String? {
-        if let cached = cachedSprintFieldId { return cached }
+        if let hit = sync({ cachedSprintFieldId }) { return hit }
         guard let req = try? authedRequest(path: "/rest/api/3/field"),
               let (data, resp) = try? await URLSession.shared.data(for: req),
               (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) == true,
               let fields = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-            cachedSprintFieldId = .some(nil); return nil
+            sync { cachedSprintFieldId = .some(nil) }; return nil
         }
         let id = fields.first { (($0["schema"] as? [String: Any])?["custom"] as? String) == "com.pyxis.greenhopper.jira:gh-sprint" }?["id"] as? String
-        cachedSprintFieldId = .some(id)
+        sync { cachedSprintFieldId = .some(id) }
         return id
     }
 
@@ -223,8 +268,11 @@ final class Atlassian: IssueProvider {
     /// and (over)write sprint.json. Returns total and not-done counts.
     /// Fully-paginated `/search/jql` fetch for a JQL, returning raw issue dicts.
     private func fetchIssues(jql: String) async throws -> [[String: Any]] {
-        var fields = "summary,labels,components,issuetype,parent,description,status,updated"
-        if let sf = cachedSprintFieldId ?? nil { fields += ",\(sf)" }
+        // `assignee` is load-bearing, not cosmetic: parseTicket derives `Ticket.assignedToMe`
+        // from it, and PeriodCompiler gates regular work on that. Omit it and every ticket silently
+        // reads as "assigned to me" — the gate becomes a no-op with no visible error.
+        var fields = "summary,labels,components,issuetype,parent,description,status,updated,assignee"
+        if let sf = sync({ cachedSprintFieldId }) ?? nil { fields += ",\(sf)" }
         var out: [[String: Any]] = []
         var token: String?
         var pages = 0

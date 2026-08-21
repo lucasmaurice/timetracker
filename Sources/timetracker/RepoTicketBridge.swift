@@ -8,7 +8,11 @@ import Foundation
 /// Weights are **recency-decayed** (a ticket you touched here last week beats one from last
 /// quarter) and normalized to [0,1] per repo. Persisted to `repo-tickets.json`; rebuilt in the
 /// background on launch and after each sprint refresh. Fully local, zero dependencies.
-final class RepoTicketBridge {
+/// `@unchecked Sendable`: every access to `map` goes through the serial `queue` below, and the
+/// remaining stored properties are `let`. This is what lets the launch mining pass hold it
+/// directly instead of capturing `Attribution`, whose `sprint`/`guessKeys` are main-owned and
+/// genuinely unguarded.
+final class RepoTicketBridge: @unchecked Sendable {
     struct Stat: Codable { var score: Double; var lastSeen: Double }  // decayed weight + newest unix ts
 
     private var map: [String: [String: Stat]] = [:]   // repoName -> (ticket -> stat)

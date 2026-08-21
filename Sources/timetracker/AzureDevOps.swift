@@ -11,40 +11,67 @@ import Foundation
 /// ProgiDev/DevOps project: Task and User Story states include "Dev" and "Resolved", neither of
 /// which is a standard Agile-template name, and "Resolved" categorizes as InProgress there, not a
 /// distinct Resolved category).
-final class AzureDevOps: IssueProvider {
+/// `@unchecked Sendable` is earned, not asserted: every mutable field is guarded by `lock` above.
+final class AzureDevOps: IssueProvider, Preloadable, @unchecked Sendable {
     var displayName: String { "Azure DevOps" }
     struct Credentials: Codable { var org: String; var pat: String }
 
-    private static let account = "azdo_credentials"
+    /// Test-only redirection of this client's Keychain item to a throwaway account.
+    ///
+    /// Exists so a test can deliberately fail `connect()` and assert that nothing was persisted,
+    /// WITHOUT risking the real stored credential: if the write-before-validate ordering ever
+    /// regressed, such a test would otherwise overwrite a working PAT with the bogus one it just
+    /// tried. nil (always, in the shipping app) = the real account.
+    nonisolated(unsafe) static var keychainAccountOverride: String?
+    private static var account: String { keychainAccountOverride ?? "azdo_credentials" }
     private let config: Config
 
     init(config: Config) { self.config = config }
 
-    private var loaded = false
-    private var cached: Credentials?
-    private var credentials: Credentials? { cached }
-    var configured: Bool { cached != nil }
+    /// Guards every mutable field on this class. The launch mining pass (`AzurePRBridge`) reads
+    /// credentials from a background task while `connect`/`disconnect`/`refreshSprint` mutate them
+    /// on main, so "main-confined" was never quite true. Never held across an `await` — lock,
+    /// read-or-write, unlock.
+    private let lock = NSLock()
+    private func sync<T>(_ body: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return body() }
+
+    private var _loaded = false
+    private var _cached: Credentials?
+    private var credentials: Credentials? { sync { _cached } }
+    var configured: Bool { sync { _cached != nil } }
     /// The connected organization, for `AzurePRBridge` to skip repos hosted in a different org
     /// than the PAT is scoped to (a PAT is always single-org).
-    var connectedOrg: String? { cached?.org }
+    var connectedOrg: String? { sync { _cached?.org } }
+    /// The PAT owner's display name, for the menu's "Connected as … " line. Resolved lazily (once
+    /// per session, from `refreshSprint`) rather than at `preload()` — preload must stay
+    /// network-free (see CLAUDE.md's threading invariants), so this is nil until the first
+    /// refresh (launch or manual) completes.
+    private var _cachedUser: String?
+    var connectedUser: String? { sync { _cachedUser } }
 
     func preload() {
-        guard !loaded else { return }
-        cached = Keychain.getCodable(Credentials.self, account: Self.account)
-        loaded = true
+        guard sync({ !_loaded }) else { return }
+        let creds = Keychain.getCodable(Credentials.self, account: Self.account)   // outside the lock
+        sync { _cached = creds; _loaded = true }
     }
 
     func disconnect() {
         Keychain.delete(account: Self.account)
-        cached = nil; loaded = true
+        sync { _cached = nil; _loaded = true }
     }
 
     @discardableResult
     func connect(org: String, pat: String) async throws -> String {
         let trimmedOrg = org.trimmingCharacters(in: .whitespaces)
         let creds = Credentials(org: trimmedOrg, pat: pat)
-        cached = creds; loaded = true
-        return try await testConnection()
+        // In memory first so testConnection() can use them, but persist ONLY once they're known
+        // good. Writing first left an unverified PAT on disk whenever the test threw, recoverable
+        // only because the caller happens to call disconnect() in its catch — an invariant about
+        // secret storage shouldn't depend on every future call site's error handling.
+        sync { _cached = creds; _loaded = true }
+        let who = try await testConnection()
+        Keychain.setCodable(creds, account: Self.account)   // own the item under THIS binary
+        return who
     }
 
     // MARK: - Requests
@@ -74,6 +101,53 @@ final class AzureDevOps: IssueProvider {
         return credentials?.org ?? "connected"
     }
 
+    private struct ConnectionData: Decodable {
+        struct AuthenticatedUser: Decodable { var providerDisplayName: String?; var customDisplayName: String? }
+        var authenticatedUser: AuthenticatedUser?
+    }
+
+    /// The PAT owner's identity, via the same connection-negotiation endpoint AzDO's own tooling
+    /// (e.g. the git credential helper) uses to validate a PAT — confirmed needing no scope beyond
+    /// what's already granted for Work Items/Code, unlike the Profile API
+    /// (app.vssps.visualstudio.com/_apis/profile/profiles/me), which 401'd against a real PAT
+    /// scoped exactly as this app's own connect dialog instructs. Reuses `orgBase()` (same host as
+    /// every other call in this file). Cached for the session; a failure just means the menu omits
+    /// the "as <user>" part (cosmetic, not functional), but logs the actual status/body to stderr
+    /// (~/Library/Application Support/TimeTracker/stderr.log when run via the LaunchAgent).
+    private func resolveIdentity() async {
+        guard sync({ _cachedUser == nil }) else { return }
+        // connectionData is a preview-only resource — confirmed via a real 400
+        // (VssInvalidPreviewVersionException) against plain api-version=7.1. Pin the REVISION
+        // (-preview.1), not a bare -preview: Microsoft deprecates a preview once its released
+        // version ships and deactivates it ~12 weeks later, after which requests naming a preview
+        // version are rejected outright. A bare -preview is the least specific form there is, so
+        // it's the first to break.
+        guard let url = URL(string: "\((try? orgBase()) ?? "")/_apis/connectionData?api-version=7.1-preview.1"),
+              let req = try? authedRequest(url: url)
+        else { return }
+        guard let (data, resp) = try? await URLSession.shared.data(for: req) else {
+            FileHandle.standardError.write("azdo identity: request failed (network)\n".data(using: .utf8)!)
+            return
+        }
+        do {
+            try Self.check(resp, data)
+        } catch {
+            let body = String(data: data, encoding: .utf8)?.prefix(500) ?? ""
+            FileHandle.standardError.write("azdo identity: \(error.localizedDescription) — body: \(body)\n".data(using: .utf8)!)
+            return
+        }
+        guard let profile = (try? JSONDecoder().decode(ConnectionData.self, from: data))?.authenticatedUser else {
+            let body = String(data: data, encoding: .utf8)?.prefix(500) ?? ""
+            FileHandle.standardError.write("azdo identity: decode failed — body: \(body)\n".data(using: .utf8)!)
+            return
+        }
+        let name = profile.customDisplayName ?? profile.providerDisplayName
+        sync { _cachedUser = name }
+        if name == nil {
+            FileHandle.standardError.write("azdo identity: decoded authenticatedUser had no display name\n".data(using: .utf8)!)
+        }
+    }
+
     /// 7pace and worklog submission need no AzDO identity — `resolveAuthor` on `WorklogProvider`
     /// only matters for Tempo. `fetchIssueId` for AzDO is just the numeric part of "AB#12345",
     /// already known locally — no network round trip needed, unlike Jira where the corpus doesn't
@@ -81,6 +155,23 @@ final class AzureDevOps: IssueProvider {
     func fetchIssueId(forKey key: String) async -> String? {
         AzureBoardsKeyFormat(branchPattern: config.azureBranchKeyPattern).canonicalize(key)
             .flatMap { $0.hasPrefix("AB#") ? String($0.dropFirst(3)) : nil }
+    }
+
+    /// Unlike the PR→work-item API lookups (which accept a bare id org-wide), the web UI edit URL
+    /// genuinely needs a project segment to resolve — confirmed against a real link
+    /// (https://dev.azure.com/ProgiDev/DevOps/_workitems/edit/59482). `project` should be the
+    /// ticket's own stored `Ticket.project`; falls back to `config.azureProject` if that's nil
+    /// (e.g. a single-project setup, or a ticket predating this field), and gives up rather than
+    /// guess wrong if neither is known.
+    func browserURL(forKey key: String, project: String?) -> URL? {
+        let proj = (project?.isEmpty == false ? project : nil) ?? config.azureProject
+        guard let org = connectedOrg, !proj.isEmpty,
+              let id = AzureBoardsKeyFormat(branchPattern: config.azureBranchKeyPattern).canonicalize(key)
+                  .flatMap({ $0.hasPrefix("AB#") ? String($0.dropFirst(3)) : nil })
+        else { return nil }
+        let encodedOrg = org.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? org
+        let encodedProject = proj.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? proj
+        return URL(string: "https://dev.azure.com/\(encodedOrg)/\(encodedProject)/_workitems/edit/\(id)")
     }
 
     // MARK: - Pull requests (for AzurePRBridge)
@@ -148,11 +239,11 @@ final class AzureDevOps: IssueProvider {
     /// widening of the guess pool to the whole team's backlog. Cached briefly per PR id so
     /// repeated attribution samples during one review don't re-hit the API on every tick.
     func resolveWorkItem(forPullRequestId prId: Int) async -> Ticket? {
-        if let cached = prResolutionCache[prId], Date().timeIntervalSince(cached.ts) < Self.prCacheTTL {
-            return cached.ticket
+        if let hit = sync({ prResolutionCache[prId] }), Date().timeIntervalSince(hit.ts) < Self.prCacheTTL {
+            return hit.ticket
         }
         let ticket = await fetchWorkItemForPR(prId)
-        prResolutionCache[prId] = (ticket, Date())
+        sync { prResolutionCache[prId] = (ticket, Date()) }
         return ticket
     }
 
@@ -174,17 +265,20 @@ final class AzureDevOps: IssueProvider {
               let items = try? await batchFetch(ids: [workItemId], fields: Self.fetchFields),
               let item = items.first
         else { return nil }
-        return await ticket(fromBatchItem: item)
+        // false: this is the one path that resolves a work item regardless of who it's assigned
+        // to — see `Ticket.assignedToMe`'s doc comment.
+        return await ticket(fromBatchItem: item, assignedToMe: false)
     }
 
     /// Field-mapping shared with `refreshSprint` below, minus area-exclusion/parent-epic lookup
     /// (not worth another round trip for a single ad hoc ticket resolved this way).
-    private func ticket(fromBatchItem item: BatchItem) async -> Ticket {
+    private func ticket(fromBatchItem item: BatchItem, assignedToMe: Bool) async -> Ticket {
         let f = item.fields
         let areaPath = f["System.AreaPath"]?.stringValue ?? ""
+        let project = areaPath.split(separator: "\\").first.map(String.init) ?? config.azureProject
         let type = f["System.WorkItemType"]?.stringValue ?? ""
         let state = f["System.State"]?.stringValue ?? ""
-        let categories = await stateCategories(forType: type, project: areaPath.split(separator: "\\").first.map(String.init) ?? config.azureProject)
+        let categories = await stateCategories(forType: type, project: project)
         let category = categories[state]
         let done = category == "Completed" || category == "Removed"
         let title = f["System.Title"]?.stringValue ?? ""
@@ -194,7 +288,8 @@ final class AzureDevOps: IssueProvider {
         return Ticket(key: "AB#\(item.id)", summary: title, text: text, status: state,
                       updated: f["System.ChangedDate"]?.stringValue, done: done,
                       inSprint: false, inQueue: false, common: false,
-                      issueId: "\(item.id)", statusCategory: category)
+                      issueId: "\(item.id)", statusCategory: category, assignedToMe: assignedToMe,
+                      project: project.isEmpty ? nil : project)
     }
 
     // MARK: - WIQL → workitemsbatch → sprint.json
@@ -286,7 +381,7 @@ final class AzureDevOps: IssueProvider {
     private var stateCategoryCache: [String: [String: String]] = [:]  // workItemType -> state -> category
 
     private func stateCategories(forType type: String, project: String) async -> [String: String] {
-        if let cached = stateCategoryCache[type] { return cached }
+        if let hit = sync({ stateCategoryCache[type] }) { return hit }
         guard let base = try? orgBase() else { return [:] }
         let projPath = project.isEmpty ? "" : "/\(project.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? project)"
         let encodedType = type.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? type
@@ -298,7 +393,7 @@ final class AzureDevOps: IssueProvider {
         else { return [:] }
         var map: [String: String] = [:]
         for s in parsed.states { map[s.name] = s.category }
-        stateCategoryCache[type] = map
+        sync { stateCategoryCache[type] = map }
         return map
     }
 
@@ -322,8 +417,10 @@ final class AzureDevOps: IssueProvider {
     /// and (over)write sprint.json stamped for this provider. Mirrors `Atlassian.refreshSprint()`.
     @discardableResult
     func refreshSprint() async throws -> RefreshResult {
+        async let identity: () = resolveIdentity()   // independent of the WIQL/batch fetch below
         let ids = try await wiqlIds()
         let items = try await batchFetch(ids: ids, fields: Self.fetchFields)
+        await identity
 
         // Resolve parent titles in a second batch call — workitemsbatch doesn't expand relations.
         let parentIds = Set(items.compactMap { $0.fields["System.Parent"]?.stringValue.flatMap(Int.init) })
@@ -339,9 +436,10 @@ final class AzureDevOps: IssueProvider {
             let areaPath = f["System.AreaPath"]?.stringValue ?? ""
             if excludedAreas.contains(where: { !$0.isEmpty && areaPath.lowercased().hasPrefix($0) }) { continue }
 
+            let project = areaPath.split(separator: "\\").first.map(String.init) ?? config.azureProject
             let type = f["System.WorkItemType"]?.stringValue ?? ""
             let state = f["System.State"]?.stringValue ?? ""
-            let categories = await stateCategories(forType: type, project: areaPath.split(separator: "\\").first.map(String.init) ?? config.azureProject)
+            let categories = await stateCategories(forType: type, project: project)
             let category = categories[state]
             let done = category == "Completed" || category == "Removed"
 
@@ -358,7 +456,9 @@ final class AzureDevOps: IssueProvider {
                 key: key, summary: title, text: text, status: state,
                 updated: f["System.ChangedDate"]?.stringValue, done: done,
                 inSprint: false,  // resolved below, once, from the team's current iteration
-                inQueue: false, common: false, issueId: "\(item.id)", statusCategory: category))
+                inQueue: false, common: false, issueId: "\(item.id)", statusCategory: category,
+                assignedToMe: true,  // the WIQL is always "AssignedTo = @Me" — explicit for clarity
+                project: project.isEmpty ? nil : project))
         }
 
         if let currentPath = await currentIterationPath() {

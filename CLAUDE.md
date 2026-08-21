@@ -37,8 +37,35 @@ Running the app needs Accessibility (window titles) and Automation (browser tab 
 
 ## Testing
 
-There is **no unit-test target**. The equivalent is `timetracker --eval` (`EvalHarness.swift`),
-a read-only headless harness that never starts the menu-bar app. It reports:
+Two layers, and they cover different things.
+
+**Unit / regression tests — `swift test`.** `Tests/timetrackerTests`, using swift-testing
+(`@Test`/`#expect`). Deterministic and fully offline: `testConfig()` pins `ollamaEnabled = false`
+and the period knobs, so a `Config` default change can't silently move an assertion.
+
+`TestEnv` (in `TestSupport.swift`) redirects `AppPaths.overrideDataDir` at a fresh temp directory,
+so a test never reads or writes the real `~/Library/Application Support/TimeTracker` — it seeds its
+own sqlite file and `sprint.json`. That override is process-global, and `.serialized` only orders tests *within* one suite —
+separate top-level suites still run in parallel and stomp it mid-test. So **every suite that uses
+`TestEnv` is nested inside `TTTests`** (`extension TTTests { @Suite(.serialized) struct … }`), which
+makes the trait cover all of them; suites that don't touch `TestEnv` stay top-level and parallel.
+`TestEnv.deinit` also deliberately does NOT reset the override — deinit isn't ordered against the
+next test's init, so resetting there can point a later test at the real data directory mid-run.
+
+Most of the suite is `PeriodCompiler` invariants pinned after the PR #5 review — exact sources
+surviving the corpus gate, manual `retag` granularity, the `hasActivity` floor, break clipping,
+shortfall padding, period-id uniqueness — plus `WorklogKey` legacy detection and `Ticket`'s
+backward-compatible decoding. Use `PeriodCompiler.compileFast` in tests: it is the whole pipeline
+minus the Ollama meeting guess, so it stays offline.
+
+One trap worth knowing: inside the `#expect` macro an integer *expression* (`8 * 3600`) is
+type-checked in isolation and defaults to `Int`, so comparing it against a `Double?` silently
+yields false. Spell expected Doubles explicitly (`28800.0`). A bare literal takes its type from
+context and is fine.
+
+**Attribution quality — `timetracker --eval`.** Not replaceable by unit tests: it measures ranking
+quality against your real labels rather than asserting behaviour. `EvalHarness.swift`,
+is a read-only headless harness that never starts the menu-bar app. It reports:
 
 - timesheet coverage over the last 30 days, broken down by `ticket_source`
 - the mined repo→ticket bridge
@@ -187,12 +214,84 @@ from a human or a model must go through it. A one-time repair migration (`ttMigr
 
 ### Timesheet output
 
-`Summary` buckets segments into `TimeBlocks.blocks` (a `workdayHours` day of `blockHours` blocks
-starting at `dayStartHour`; the first block absorbs early activity and the last absorbs late, so
-nothing is lost). Each block becomes a `BlockReport` carrying both the inferred guess *and* any
-manual `block_assignments` override, plus the representative `context_doc` and a human recap.
-`effectiveTicket` resolves override-then-inference. Output goes to `~/timesheet-log.md` or, via
-whichever `WorklogProvider` is active, to Tempo or 7pace — each keeps its **own**
+Two coexisting models, split by how retrospective vs. live the consumer is:
+
+**Fixed blocks (`TimeBlocks`/`BlockReport`/`Summary`) — real-time only.** `Summary` buckets
+segments into `TimeBlocks.blocks` (a `workdayHours` day of `blockHours` blocks starting at
+`dayStartHour`; the first block absorbs early activity and the last absorbs late, so nothing is
+lost). Each block becomes a `BlockReport`. This model is now used ONLY by the live paths that need
+a cheap, synchronous "which block is `now` in": `checkAbstainNudge`/`checkUnknownBacklog`'s
+real-time prompts, `AssignView`'s `.thisBlock` scope, `llmHints`'s "already logged today" line, and
+`exportToday()`'s quick menu export. `block_assignments` (keyed `(day, block-id)`) still backs
+manual overrides for exactly these paths.
+
+`PeriodCompiler` deliberately does **not** read `block_assignments`, and adding such an override is
+a mistake that has already been made once. Manual assignment doesn't need it: `applyAssignment`
+writes through to the segments themselves via `Store.retag`, which stamps
+`ticket_source = "manual"` — an exact source, so `PeriodCompiler` picks it up from `Segment.ticket`
+and skips the corpus gate. Re-applying the coarse whole-block row on top re-broadened every finer
+assignment (`Last 1 hour`, `Current activity`) back to its entire block.
+
+**Per-ticket day totals (`PeriodCompiler`/`Period`) — Review and Submit.**
+`PeriodCompiler.compile(day: config: store: attribution: ollama:)` (async) is the retrospective/
+batch day-builder used by **Review today…** and worklog submission. Exact clock times are
+deliberately NOT tracked as meaningful data — only how much time landed on which ticket. A day
+compiles to a `[Period]` (`kind`: `.regular`/`.daily`/`.breakPeriod`/`.codeReview`/`.meeting`),
+each one a total for a `(kind, ticket)` pair, not a slice of the clock:
+
+- **Regular and code-review time are totaled per ticket for the whole day** — no synthetic time
+  bucketing. Each segment already carries its own live-resolved `ticket` (from the normal
+  fusion/PR-review pipeline, which sees far richer signal per moment than any bucket-level
+  re-scoring could), so `PeriodCompiler` just sums by that ticket directly
+  (`PeriodCompiler.groupByTicket`). Regular work is gated to
+  `Ticket.assignedToMe && Ticket.isInProgressLike(preferredStates:)` — `isInProgressLike` exists
+  because `statusCategory` is Azure-DevOps-only (always nil for Jira), so it falls back through
+  `preferredTicketStates` membership, then a plain "contains progress" name heuristic, before
+  giving up. The gate runs in strict precedence order — **`Attribution.isExact(ticketSource)` →
+  the assigned-and-active check**. Exact sources are never
+  gated: gating them dumped correctly-attributed work into "untracked" whenever the key wasn't in
+  your own assigned corpus (anything mined from git history lives in `guessTickets`, not `sprint`),
+  which contradicts the invariant that an exact source is never second-guessed. Gated-out/untracked
+  time pools into one unticketed `.regular` entry (still visible and assignable in Review) instead
+  of vanishing. The corpus lookup is built once per compile, not per segment. Code-review segments (`ticketSource == "prReview"`,
+  set live by the PR-review feature — see below) are NOT gated (a teammate's ticket is fine), and a
+  PR with no linked board work item falls back to `config.genericCodeReviewTicket` instead of
+  abstaining.
+- **Meeting/daily still needs time-proximity session grouping** (`PeriodCompiler.groupRuns`,
+  `periodMergeGapMinutes`) — unlike regular/code-review, a meeting's ticket isn't already known
+  per-segment, so distinct sessions must be identified before asking Ollama once per session. A
+  session whose `Segment.meeting` label matches `config.dailyStandupTitleMatch` becomes `.daily` on
+  the fixed `dailyStandupTicket` instead of going through the Ollama guess. `Segment.meeting` is set
+  by `FocusMonitor.flush()` from `WorkContext.meeting`. Sessions are merged back together by
+  resulting ticket afterward (`PeriodCompiler.mergeByTicket`) — two separate meetings Ollama
+  resolves to the same ticket become one row.
+- A `.breakPeriod` is injected unconditionally at `config.breakStartHour` for
+  `breakDurationMinutes` — not detected from an idle gap — and clips overlapping time out of every
+  other period (break wins outright over whatever else was scheduled then).
+- Non-regular periods — daily/break/**code-review**/meeting — round their *reported* (submitted)
+  duration to `periodRoundMinutes`, clamped up to `periodMinMinutes`. Only `.regular` is exempt
+  (it's a real day sum, not a synthetic window). Code review is rounded despite also being a day
+  sum, because a PR glance is otherwise billed at its literal duration; note the clamp means a
+  sub-`periodMinMinutes` review is inflated, so `hasActivity` (≥60s) gates both export *and*
+  submission to keep the two reconcilable. If the day's total falls short of the target (`workdayHours`, or
+  `summerFridayHours` on a qualifying Friday — `TimeBlocks.isSummerFriday`/`dailyTargetSeconds`),
+  the shortfall pads the single most-dominant regular period's reported duration; overtime is never
+  trimmed. `Period.trueSeconds` always holds the real, unrounded, unpadded total, independent of
+  `reportedSeconds` — load-bearing for a possible future time-bank/weekly-rebalance feature, so
+  don't collapse the two.
+- **`Period.id` is exactly `"\(kind)|\(ticket ?? "")"`** — a period's identity IS which ticket its
+  time landed on, so `period_assignments` (keyed `day, kind, ticket_key`) and the worklog-id map
+  (keyed `"day|\(period.id)"` in place of the old block-id string) can look it up directly
+  (`PeriodCompiler.applySavedAssignments`) instead of the fuzzy time-window matching a clock-based
+  model would need. The one edge case: if Ollama's meeting classification genuinely changes between
+  two compiles of the same day, the id changes too and the old saved row/worklog is orphaned rather
+  than replaced — accepted as narrow and non-destructive (no data loss, just a possible stray
+  duplicate), not worth chasing further.
+
+Both `BlockReport` and `Period` conform to `PeriodicReport` (`byTicket`/`byCategory`) so
+`Summary.describe(_:)` works against either. `Summary.appendTimesheet(day:)` (fixed blocks) and
+`appendTimesheet(periods:day:)` (per-ticket totals) both write to `~/timesheet-log.md`; submission
+goes via whichever `WorklogProvider` is active, to Tempo or 7pace — each keeps its **own**
 `(day|block) → worklogId` map file (`tempo-worklogs.json` is `[String: Int]`, 7pace's ids are UUID
 strings) so re-submitting replaces rather than duplicates. Don't merge them into one shared file —
 `TempoClient`'s decode is `try?`-and-silently-empty on a shape mismatch, which would turn a format
@@ -201,7 +300,14 @@ change into duplicate worklogs on the next submit.
 ## Conventions and constraints
 
 **Threading.** This is the most common source of real bugs here, and the comments in the code
-record which ones already happened:
+record which ones already happened. The target builds with
+`-strict-concurrency=targeted` (see `Package.swift` for why targeted and not complete), so anything
+using async/await, `Task`, or a `@Sendable` closure is compiler-checked — Swift 5 language mode
+alone caught none of this, which is how a live data race shipped clean. **The build is at zero
+warnings; a new one means you added a race.** `AppDelegate` is `@MainActor`, and the provider
+clients / `Store` / `RepoTicketBridge` / `AzurePRBridge` are `@unchecked Sendable` — each *earns*
+that by guarding its own state (an `NSLock` or a serial queue), so don't add the annotation to a
+type that doesn't:
 
 - Enrichment (AppleScript, `git`, `lsof`, `pgrep`, `kubectl`, `ps`) runs on `FocusMonitor`'s serial
   `enrichQueue`, never on main — it froze the menu bar. The enricher's caches assume that serial queue.
@@ -255,7 +361,7 @@ All under `~/Library/Application Support/TimeTracker/` (`AppPaths.dataDir`):
 
 | File | Contents |
 |------|----------|
-| `timetracker.sqlite` | `segments`, `labels`, `block_assignments` (WAL mode; schema + `ALTER TABLE` migrations in `Store.createSchema`, which intentionally ignores "column exists" errors) |
+| `timetracker.sqlite` | `segments`, `labels`, `block_assignments`, `period_assignments` (WAL mode; schema + `ALTER TABLE` migrations in `Store.createSchema`, which intentionally ignores "column exists" errors) |
 | `config.json` | the `Config` struct |
 | `sprint.json` | ticket/work-item corpus written by the active `IssueProvider`'s refresh or `sync-sprint.sh` (gitignored); stamped with `provider` so a stale cross-provider file is ignored, not reused |
 | `corrections.json` | signature → ticket counts |

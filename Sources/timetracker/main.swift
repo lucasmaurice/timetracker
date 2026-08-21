@@ -1,7 +1,12 @@
 import AppKit
 import ApplicationServices
 import SwiftUI
+import UserNotifications
 
+/// Main-actor isolated as a whole. Everything here is menu/window/timer work that already ran on
+/// main by convention; stating it lets the compiler check the background hops instead of trusting
+/// comments, and makes `[weak self]` legal inside the `@Sendable` closures below.
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let config = Config.load()
@@ -27,6 +32,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var reviewWindow: NSWindow?
     private var reviewHost: NSHostingController<ReviewView>?
     private var reviewModel: ReviewModel?
+    private var reviewPeriods: [Period] = []
+    /// The in-flight review compile, so a new one supersedes it instead of racing it — see
+    /// `refreshReviewView`.
+    private var reviewTask: Task<Void, Never>?
     private var reviewDay = Date()
     private var assignWindow: NSWindow?
     private var assignHost: NSHostingController<AssignView>?
@@ -77,6 +86,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupMainMenu()
         setupStatusItem()
         requestAccessibilityIfNeeded()
+        if Self.canUseUserNotifications {
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        }
 
         monitor.onUpdate = { [weak self] state in
             DispatchQueue.main.async {
@@ -88,38 +100,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // repo-bridge pass (which now also checks azureDevOps.configured, for the PR bridge) is
         // chained inside this same completion instead of independently scheduled, so it can't
         // race the preload and see credentials as "not configured" simply because it ran first.
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            self?.atlassian.preload()
-            self?.tempo.preload()
-            self?.azureDevOps.preload()
-            self?.sevenPace.preload()
+        // Bind the clients here, on main. They're `@unchecked Sendable` (each guards its own
+        // state behind a lock), so the background queue can call `preload()` on them without
+        // reaching back through `self` for main-isolated stored properties.
+        let clients: [any Preloadable] = [atlassian, tempo, azureDevOps, sevenPace]
+        DispatchQueue.global(qos: .utility).async { [self] in
+            for c in clients { c.preload() }
             DispatchQueue.main.async {
-                self?.rebuildMenu(current: self?.monitor.currentState)
-                self?.runRefresh(silent: true)   // freshen the ticket corpus on launch if connected
-                self?.buildRepoBridgeAndBackfill()
+                MainActor.assumeIsolated {
+                    self.rebuildMenu(current: self.monitor.currentState)
+                    self.runRefresh(silent: true)   // freshen the ticket corpus on launch if connected
+                    self.buildRepoBridgeAndBackfill()
+                    self.notifyIfIssueProviderDisconnected()
+                }
             }
         }
         reindexEmbeddings()
 
         if config.jiraRefreshMinutes > 0 {
             jiraTimer = Timer.scheduledTimer(withTimeInterval: config.jiraRefreshMinutes * 60, repeats: true) { [weak self] _ in
-                self?.runRefresh(silent: true)
+                MainActor.assumeIsolated { self?.runRefresh(silent: true) }   // Timer fires on the main run loop
             }
         }
 
-        DispatchQueue.global(qos: .background).async { [weak self] in self?.housekeeping() }
+        // housekeeping() only touches Store (serialized SQLite) and the worklog maps (lock-guarded),
+        // so it is safe off-main; it lives on AppDelegate purely for access to those.
+        if let store, let tempo, let sevenPace {
+            let config = self.config
+            DispatchQueue.global(qos: .background).async {
+                Self.housekeeping(store: store, tempo: tempo, sevenPace: sevenPace, config: config)
+            }
+        }
 
         promptTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            self?.checkAbstainNudge()
-            self?.checkUnknownBacklog()
-            self?.checkReminders()
+            // A scheduled Timer fires on the main run loop, so this closure is main-thread by
+            // construction — assumeIsolated states that to the compiler without a Task hop, which
+            // would otherwise defer these checks by a turn for no reason.
+            MainActor.assumeIsolated {
+                self?.checkAbstainNudge()
+                self?.checkUnknownBacklog()
+                self?.checkReminders()
+            }
         }
         // The LLM is now event-driven (fired by `maybeEmbed` when fusion is still ambiguous), but
         // keep a low-frequency safety pass for long single-context sessions where no focus change
         // ever re-triggers embedding. `llmRefine` no-ops unless the segment is still undecided.
         if config.ollamaEnabled, config.llmRefreshMinutes > 0 {
             llmTimer = Timer.scheduledTimer(withTimeInterval: config.llmRefreshMinutes * 60, repeats: true) { [weak self] _ in
-                self?.llmRefine()
+                MainActor.assumeIsolated { self?.llmRefine() }   // Timer fires on the main run loop
             }
         }
     }
@@ -132,18 +160,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// seed `labels` from that history (warm-start). All git/store/network work is off the main
     /// thread; the in-memory label index is reloaded on main. Mirrors the housekeeping pattern.
     private func buildRepoBridgeAndBackfill() {
-        Task.detached(priority: .utility) { [weak self] in
-            guard let self else { return }
-            self.attribution.rebuildRepoBridge()
+        // Capture a narrow, Sendable handle rather than `self`. Handing a background task the whole
+        // AppDelegate (and through it `Attribution`, whose sprint/guessKeys are main-owned and
+        // unguarded) is the exact shape of the data race in #9 — the type boundary is what stops
+        // it recurring, since nothing else will.
+        let miner = attribution.backgroundMiner()
+        // Implicitly-unwrapped stored properties: bind them concretely here, on main, so the
+        // background task holds real instances rather than optionals it would have to re-unwrap.
+        guard let prBridge = azurePRBridge, let azdo = azureDevOps else { return }
+        let dirs = config.expandedWorkspaceDirs
+        let usePRBridge = config.issueProvider == .azureDevOps && config.azurePRBridgeEnabled
+        Task.detached(priority: .utility) { [self] in
+            miner.rebuildRepoBridge()
             // MUST run after rebuildRepoBridge (above): that call replaces the bridge's map
             // wholesale, so merging PR results first would have them silently wiped.
-            if self.config.issueProvider == .azureDevOps, self.config.azurePRBridgeEnabled, self.azureDevOps.configured {
-                let results = await self.azurePRBridge.resolve(
-                    workspaceDirs: self.config.expandedWorkspaceDirs, azureDevOps: self.azureDevOps, now: Date())
-                self.attribution.ingestPRBridgeResults(results)
+            if usePRBridge, azdo.configured {
+                let results = await prBridge.resolve(workspaceDirs: dirs, azureDevOps: azdo, now: Date())
+                miner.ingestPRBridgeResults(results)
             }
             let firstRun = !UserDefaults.standard.bool(forKey: "ttBackfilledV1")
-            let inserted = firstRun ? self.attribution.backfillFromHistory() : 0
+            let inserted = firstRun ? miner.backfillFromHistory() : 0
             if firstRun { UserDefaults.standard.set(true, forKey: "ttBackfilledV1") }
             await MainActor.run {
                 // The bridge was (re)built after init's reloadSprint, so reload to widen the guess
@@ -245,16 +281,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(.separator())
         }
 
+        let attr = current?.attribution
+
+        // Section 1 — the current ticket itself: description (itself the "open in browser" link,
+        // when resolvable) and why it was picked. Only shown when a ticket is actually resolved
+        // (not a bare guess).
+        if let t = attr?.ticket, t != config.noTicketLabel {
+            let summary = attribution.summary(for: t)
+            let titleLine = "\(t)\(summary.map { " — \($0.prefix(60))" } ?? "")"
+            let project = attribution.tickets(for: [t]).first?.project
+            if let url = issueProvider.browserURL(forKey: t, project: project) {
+                let item = NSMenuItem(title: titleLine, action: #selector(openTicketURL), keyEquivalent: "")
+                item.target = self; item.representedObject = url
+                menu.addItem(item)
+            } else {
+                menu.addItem(disabled(titleLine))
+            }
+            let src = attr?.source ?? "?"
+            let conf = attr?.confidence.map { String(format: " · %.2f", $0) } ?? ""
+            let why = Attribution.isExact(src) ? "from \(Attribution.sourceDescription(src))"
+                : "\(Attribution.sourceDescription(src))\(conf)"
+            menu.addItem(disabled("Why: \(why)"))
+            menu.addItem(.separator())
+        }
+
+        // Section 2 — the raw signals behind that decision.
         let appLine = current.map { "\($0.appName)\($0.idle ? " (idle)" : "")" } ?? "—"
         menu.addItem(disabled("App: \(appLine)"))
-        if let t = current?.title, !t.isEmpty {
-            menu.addItem(disabled("Window: \(t.prefix(60))"))
-        }
-        let attr = current?.attribution
         if let t = attr?.ticket {
-            let src = attr?.source ?? "?"
-            let conf = attr?.confidence.map { String(format: " %.2f", $0) } ?? ""
-            menu.addItem(disabled("Ticket: \(t) (\(src)\(conf))"))
+            menu.addItem(disabled("Ticket: \(t)"))
         } else if let top = attr?.candidates.first {
             menu.addItem(disabled(String(format: "Guess: %@ (%.2f) — confirm below", top.key, top.score)))
         } else {
@@ -265,9 +320,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if let ctx = current?.context {
             if let b = ctx.branch { menu.addItem(disabled("Branch: \(b.prefix(44))")) }
+            if let s = ctx.aiSession { menu.addItem(disabled("Session: \(s.prefix(52))")) }
+        }
+        if let t = current?.title, !t.isEmpty {
+            menu.addItem(disabled("Window: \(t.prefix(60))"))
+        }
+        if let ctx = current?.context {
             if let u = ctx.url, let host = URL(string: u)?.host { menu.addItem(disabled("URL: \(host)")) }
             if let m = ctx.meeting { menu.addItem(disabled("Meeting: \(m.prefix(44))")) }
-            if let s = ctx.aiSession { menu.addItem(disabled("Session: \(s.prefix(52))")) }
         }
         if let llm = lastLLM {
             menu.addItem(disabled("LLM: \(llm.key) (\(String(format: "%.2f", llm.confidence))) \(llm.reason.prefix(34))"))
@@ -323,6 +383,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         case .azureDevOps:
             if azureDevOps.configured {
+                if let org = azureDevOps.connectedOrg {
+                    let who = azureDevOps.connectedUser.map { "as \($0) " } ?? ""
+                    menu.addItem(disabled("Connected \(who)to \(org) (Azure DevOps)"))
+                }
                 let logout = NSMenuItem(title: "Disconnect Azure DevOps", action: #selector(disconnectAzureDevOps), keyEquivalent: "")
                 logout.target = self; menu.addItem(logout)
             } else {
@@ -340,6 +404,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         folder.target = self; menu.addItem(folder)
 
         menu.addItem(.separator())
+        // TTBuildSHA, not CFBundleVersion: the latter is reserved for a digits-and-periods
+        // version string (build.sh puts the commit count there), so the identifying SHA lives in
+        // our own key. Fall back to CFBundleVersion for bundles built before that split.
+        let info = Bundle.main.infoDictionary
+        if let build = (info?["TTBuildSHA"] as? String ?? info?["CFBundleVersion"] as? String), !build.isEmpty {
+            let time = info?["TTBuildTime"] as? String
+            menu.addItem(disabled("Build \(build)" + (time.map { " (\($0))" } ?? "")))
+        }
         let quit = NSMenuItem(title: "Quit TimeTracker", action: #selector(quit), keyEquivalent: "q")
         quit.target = self; menu.addItem(quit)
 
@@ -465,15 +537,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func openReview() { presentReview(day: Date()) }
+    @MainActor @objc private func openReview() { presentReview(day: Date()) }
 
+    @MainActor
     private func presentReview(day: Date) {
         reviewDay = day
         monitor.flush()   // persist the in-progress segment so today's latest work shows + can be learned
-        let view = makeReviewView(day: reviewDay)
+        refreshReviewView(day: reviewDay, present: true)
+    }
+
+    /// Compiles `day` and swaps it into the review window, cancelling any compile still running.
+    ///
+    /// Both guards matter. `PeriodCompiler.compile` awaits one Ollama round trip per meeting
+    /// session, so it is easily seconds long: without cancellation, paging days quickly leaves
+    /// several compiles in flight and the one that *finishes* last wins the view — not the one the
+    /// user asked for last. And since `reviewDay` has already moved on by then, `saveReview` would
+    /// write `TimeBlocks.dayString(reviewDay)` against a `reviewPeriods` array belonging to a
+    /// different day. The staleness check is belt-and-braces for the same reason: cancellation is
+    /// cooperative, so a task can still return a result after being cancelled.
+    @MainActor
+    private func refreshReviewView(day: Date, present: Bool) {
+        reviewTask?.cancel()
+        // Paint the synchronous result NOW. The full compile awaits one Ollama round trip per
+        // meeting session, and blocking the window on that meant clicking "Review today…"
+        // produced nothing at all — no window, no spinner — for as long as that took.
+        show(makeReviewView(day: day, periods: PeriodCompiler.compileFast(
+            day: day, config: config, store: store, attribution: attribution)), present: present)
+        reviewTask = Task { @MainActor in
+            let periods = await PeriodCompiler.compile(day: day, config: self.config, store: self.store,
+                                                        attribution: self.attribution, ollama: self.ollama)
+            // Cancellation is cooperative, so a superseded task can still get here; the day check
+            // catches the case where the user paged on while this was in flight.
+            guard !Task.isCancelled, day == self.reviewDay else { return }
+            self.show(self.makeReviewView(day: day, periods: periods), present: false)
+        }
+    }
+
+    /// Swap a freshly-built review view into the window, creating the window on first use.
+    @MainActor
+    private func show(_ view: ReviewView, present: Bool) {
         if let host = reviewHost, let win = reviewWindow {
             host.rootView = view
-            NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil)
+            if present { NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil) }
             return
         }
         let host = NSHostingController(rootView: view)
@@ -487,30 +592,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true); win.makeKeyAndOrderFront(nil)
     }
 
-    private func makeReviewView(day: Date) -> ReviewView {
-        let blocks = summary.dayReports(day).map { r -> ReviewBlock in
-            let alts = (r.contextDoc.map { attribution.explain(doc: $0) } ?? [])
+    /// `@MainActor` for the same reason `PeriodCompiler` is: this touches `reviewPeriods`,
+    /// `reviewModel` and `attribution`, all main-owned. Being called from inside a
+    /// `Task { @MainActor in }` does NOT confer isolation on a nonisolated `async` function — it
+    /// would still hop to the cooperative pool at the await.
+    @MainActor
+    private func makeReviewView(day: Date, periods: [Period]) -> ReviewView {
+        reviewPeriods = periods
+        let reviewPeriodsUI = periods.map { p -> ReviewPeriod in
+            let alts = (p.contextDoc.map { attribution.explain(doc: $0) } ?? [])
                 .map { ReviewAlt(key: $0.key, summary: $0.summary, score: $0.score) }
             var why: String?
-            if let src = r.guessSource {
-                why = Attribution.isExact(src) ? "from \(src)"
-                    : "\(src)" + (r.guessConfidence.map { String(format: " · %.2f", $0) } ?? "")
+            if let src = p.guessSource {
+                why = Attribution.isExact(src) ? "from \(Attribution.sourceDescription(src))"
+                    : "\(Attribution.sourceDescription(src))" + (p.guessConfidence.map { String(format: " · %.2f", $0) } ?? "")
             }
-            return ReviewBlock(
-                block: r.block,
-                rangeText: r.label,
-                activeSeconds: r.activeSeconds, idleSeconds: r.idleSeconds,
-                slices: r.byTicket.map { Slice(label: $0.ticket ?? "untracked", seconds: $0.seconds) },
-                recap: r.recap ?? "",
-                guessKey: r.guessKey,
-                guessSummary: r.guessKey.flatMap { attribution.summary(for: $0) },
+            return ReviewPeriod(
+                id: p.id, kind: p.kind,
+                durationText: Summary.hm(p.reportedSeconds),
+                activeSeconds: p.trueSeconds,
+                slices: p.byTicket.map { Slice(label: $0.ticket ?? "untracked", seconds: $0.seconds) },
+                recap: p.recap ?? "",
+                guessKey: p.ticket,
+                guessSummary: p.ticket.flatMap { attribution.summary(for: $0) },
                 guessWhy: why,
                 alternatives: alts,
-                originalGuess: r.guessKey ?? "",
-                ticket: r.effectiveTicket ?? "",
-                note: r.assignedNote ?? "")
+                originalGuess: p.ticket ?? "",
+                ticket: p.effectiveTicket ?? "",
+                note: p.assignedNote ?? "")
         }
-        let model = ReviewModel(dayText: TimeBlocks.dayString(day), blocks: blocks,
+        let model = ReviewModel(dayText: TimeBlocks.dayString(day), periods: reviewPeriodsUI,
                                 tickets: attribution.pickerTickets, noTicketLabel: config.noTicketLabel)
         reviewModel = model
         return ReviewView(model: model,
@@ -521,7 +632,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Housekeeping / pruning
 
-    private func housekeeping() {
+    /// `static` and dependency-injected so it can genuinely run off-main: everything it touches is
+    /// either the Store (serialized SQLite), a lock-guarded worklog map, or UserDefaults (its own
+    /// synchronization). Previously an instance method, which meant the background queue reached
+    /// through `self` for main-owned properties.
+    nonisolated private static func housekeeping(store: Store, tempo: TempoClient, sevenPace: SevenPaceClient, config: Config) {
+        let worklogProvider: any WorklogProvider = config.worklogProvider == .tempo ? tempo : sevenPace
         let now = Date()
         if config.segmentRetentionDays > 0 {
             store.deleteSegments(before: now.addingTimeInterval(-config.segmentRetentionDays * 86400))
@@ -556,37 +672,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func submitToTempoFromReview() {
         guard let model = reviewModel else { return }
         let dayStr = TimeBlocks.dayString(reviewDay)
-        let blocks = TimeBlocks.blocks(for: reviewDay, config)
-        let seconds = Int(config.blockHours * 3600)
-        let planned: [PlannedWorklog] = model.blocks.compactMap { b in
-            let raw = b.ticket.trimmingCharacters(in: .whitespaces)
+        // `uniquingKeysWith`, not `uniqueKeysWithValues`: the latter TRAPS on a duplicate key, and
+        // id uniqueness here holds only because `compile` runs `mergeByTicket` before returning —
+        // a dependency nothing at this call site expresses. Reordering that pipeline should not be
+        // able to turn into a hard crash in Submit.
+        let periodsById = Dictionary(reviewPeriods.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let tf = DateFormatter(); tf.dateFormat = "HH:mm:ss"
+        let planned: [PlannedWorklog] = model.periods.compactMap { rp in
+            guard let p = periodsById[rp.id] else { return nil }
+            // Same predicate the timesheet export uses (`appendTimesheet(periods:day:)` filters on
+            // `hasActivity`). They used to disagree: submit billed periods the export omitted, so a
+            // sub-minute period clamped up to `periodMinMinutes` became a 15-minute worklog that
+            // appeared nowhere in timesheet-log.md — impossible to reconcile after the fact.
+            guard p.hasActivity else { return nil }
+            let raw = rp.ticket.trimmingCharacters(in: .whitespaces)
             guard !raw.isEmpty else { return nil }
             let ticket: String
             if raw.caseInsensitiveCompare(config.noTicketLabel) == .orderedSame {
-                // "No ticket": map to the configured fallback, or skip Tempo for this block.
+                // "No ticket": map to the configured fallback, or skip Tempo for this period.
                 let fb = config.noTicketTempoTicket.trimmingCharacters(in: .whitespaces).uppercased()
                 guard !fb.isEmpty else { return nil }
                 ticket = fb
             } else {
                 ticket = raw.uppercased()
             }
-            let startHour = blocks.first { $0.id == b.block }?.nominalStartHour ?? config.dayStartHour
-            let startTime = String(format: "%02d:%02d:00", Int(startHour) % 24, Int((startHour - startHour.rounded(.down)) * 60))
-            let desc = b.note.trimmingCharacters(in: .whitespaces).isEmpty
-                ? "\(ticket) — \(dayStr) \(b.rangeText) (TimeTracker)" : b.note
-            return PlannedWorklog(date: dayStr, block: b.block, ticket: ticket, startTime: startTime, seconds: seconds, description: desc)
+            // REPORTED duration (rounded/padded, not a fixed blockHours) — the whole point of the
+            // per-ticket day-total model. startTime is a formality some worklog APIs require; it's
+            // not meaningful data here (exact clock time isn't tracked), so the earliest touch on
+            // this ticket today is as good a placeholder as any.
+            let startTime = tf.string(from: p.start)
+            let seconds = Int(p.reportedSeconds)
+            let desc = rp.note.trimmingCharacters(in: .whitespaces).isEmpty
+                ? "\(ticket) — \(dayStr) \(p.kind.rawValue) (TimeTracker)" : rp.note
+            return PlannedWorklog(date: dayStr, block: rp.id, ticket: ticket, startTime: startTime, seconds: seconds, description: desc)
         }
-        guard !planned.isEmpty else { showInfo("Nothing to submit — assign a ticket to a block first."); return }
+        guard !planned.isEmpty else { showInfo("Nothing to submit — assign a ticket to a period first."); return }
 
         // Preview exactly what will be posted.
         NSApp.activate(ignoringOtherApps: true)
         let preview = NSAlert()
         preview.messageText = "Submit \(planned.count) worklog(s) to \(worklogProvider.displayName)?"
-        preview.informativeText = planned.map { "• \($0.date) \($0.block) · \($0.ticket) · 4h\n   “\($0.description)”" }
+        preview.informativeText = planned.map { "• \($0.date) · \($0.ticket) · \(Summary.hm(Double($0.seconds)))\n   “\($0.description)”" }
             .joined(separator: "\n") + "\n\nThis posts to your official \(worklogProvider.displayName) timesheet."
         preview.addButton(withTitle: "Submit to \(worklogProvider.displayName)")
         preview.addButton(withTitle: "Cancel")
         guard preview.runModal() == .alertFirstButtonReturn else { return }
+
+        // This day may already carry worklogs posted under the OLD fixed-block model, whose map
+        // keys the floating-period ids can't resolve (see `WorklogKey`). Posting on top of them
+        // duplicates the whole day on an official timesheet, so make it an explicit, informed
+        // choice rather than a silent one — we hold the old ids, so we can actually clean up.
+        let legacy = worklogProvider.legacyFixedBlockWorklogIds(day: dayStr)
+        if !legacy.isEmpty {
+            let warn = NSAlert()
+            warn.alertStyle = .warning
+            warn.messageText = "\(dayStr) was already submitted under the previous timesheet model"
+            warn.informativeText = "\(legacy.count) worklog(s) from the old fixed-block model still exist in "
+                + "\(worklogProvider.displayName) for this day. They can't be matched to the new per-ticket "
+                + "periods, so submitting now would ADD to them and bill the day twice.\n\n"
+                + "Delete the old worklog(s) first, then submit the periods above?"
+            warn.addButton(withTitle: "Delete \(legacy.count) old, then submit")
+            warn.addButton(withTitle: "Cancel")
+            guard warn.runModal() == .alertFirstButtonReturn else { return }
+        }
 
         if !worklogProvider.configured {
             guard let token = promptForWorklogToken() else { return }
@@ -599,6 +747,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let author = await worklogProvider.resolveAuthor()
             var ok = 0
             var fails: [String] = []
+            // Confirmed above. Clear the map entry as each one goes, so an interrupted run doesn't
+            // re-prompt for worklogs that are already gone.
+            for old in legacy {
+                await worklogProvider.deleteWorklog(id: old.id)
+                worklogProvider.setWorklogId(day: dayStr, block: old.block, id: nil)
+            }
             for p in planned {
                 var idStr = attribution.issueId(forKey: p.ticket)
                 if idStr == nil { idStr = await issueProvider.fetchIssueId(forKey: p.ticket) }
@@ -674,25 +828,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func saveReview() {
         guard let model = reviewModel else { return }
         let dayStr = TimeBlocks.dayString(reviewDay)
+        let periodsById = Dictionary(reviewPeriods.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         var taught = 0
-        for b in model.blocks {
-            let raw = b.ticket.trimmingCharacters(in: .whitespaces)
+        for rp in model.periods {
+            guard let p = periodsById[rp.id] else { continue }
+            let raw = rp.ticket.trimmingCharacters(in: .whitespaces)
             // Normalize (pasted URL → key); the review stays authoritative for free-form keys.
             let key = raw.isEmpty ? nil : (attribution.normalizeTicketEntry(raw) ?? raw.uppercased())
-            let note = b.note.trimmingCharacters(in: .whitespaces)
-            store.setBlockAssignment(day: dayStr, block: b.block,
-                                     ticket: key, note: note.isEmpty ? nil : note)
+            let note = rp.note.trimmingCharacters(in: .whitespaces)
+            store.setPeriodAssignment(day: dayStr, kind: p.kind.rawValue, ticketKey: p.ticket ?? "",
+                                      ticket: key, note: note.isEmpty ? nil : note)
 
             // Teach the guesser — but only from signal, never from silence: when the user changed
             // the system's guess, or explicitly confirmed it. This is the primary labeling pipeline.
             if let key, !key.isEmpty {
-                let changed = key.caseInsensitiveCompare(b.originalGuess) != .orderedSame
-                if changed || b.confirmed { taught += learnBlock(blockId: b.block, ticket: key) }
+                let changed = key.caseInsensitiveCompare(rp.originalGuess) != .orderedSame
+                if changed || rp.confirmed { taught += learnPeriod(p, ticket: key) }
             }
         }
         if taught > 0 { attribution.reloadMemory() }   // new labels feed content memory (k-NN)
 
-        let rows = summary.appendTimesheet(day: reviewDay)
+        let rows = summary.appendTimesheet(periods: reviewPeriods, day: reviewDay)
         let alert = NSAlert()
         alert.messageText = rows.isEmpty ? "Nothing to export" : "Exported \(rows.count) row(s)"
         var info = rows.joined(separator: "\n")
@@ -701,13 +857,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.runModal()
     }
 
-    /// Turn a confirmed/corrected block into training examples from its REAL work contexts (the
-    /// persisted `context_doc` of its segments), capped to the few longest distinct contexts.
-    /// Returns how many labels were written.
+    /// Turn a confirmed/corrected period into training examples from its REAL work contexts (the
+    /// persisted `context_doc` of its OWN member segments — not re-queried from the store, so a
+    /// floating regular block's skipped-over carve-outs are never pulled in). Capped to the few
+    /// longest distinct contexts. Returns how many labels were written.
     @discardableResult
-    private func learnBlock(blockId: String, ticket: String) -> Int {
-        guard let bounds = TimeBlocks.bounds(day: reviewDay, id: blockId, config) else { return 0 }
-        let segs = store.segments(from: bounds.start, to: bounds.end).filter { !$0.idle }
+    private func learnPeriod(_ period: Period, ticket: String) -> Int {
+        let segs = period.members.map { $0.segment }
         guard !segs.isEmpty else { return 0 }
         // Distinct rich contexts by total duration; fall back to a reconstructed app+title doc.
         var byDoc: [String: Double] = [:]
@@ -730,9 +886,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return docs.count
     }
 
+    @MainActor
     private func shiftReview(_ delta: Int) {
         reviewDay = Calendar.current.date(byAdding: .day, value: delta, to: reviewDay) ?? reviewDay
-        reviewHost?.rootView = makeReviewView(day: reviewDay)
+        refreshReviewView(day: reviewDay, present: false)
     }
 
     private func clock(_ d: Date) -> String {
@@ -983,8 +1140,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         teachModel?.count = attribution.labelCount
     }
 
+    /// Quick menu export. Uses the SAME model Review and Submit use — `PeriodCompiler` —
+    /// otherwise the same day exported through the two menu items appends two incompatible sets of
+    /// rows to one `timesheet-log.md`, with different durations and groupings and nothing to say
+    /// which is authoritative. `compileFast` keeps this synchronous (no Ollama round trip), so the
+    /// quick export stays quick; meetings just export un-ticketed, as they already do when Ollama
+    /// is disabled.
+    @MainActor
     @objc private func exportToday() {
-        let rows = summary.appendTimesheet(day: Date())
+        let day = Date()
+        let periods = PeriodCompiler.compileFast(day: day, config: config, store: store, attribution: attribution)
+        let rows = summary.appendTimesheet(periods: periods, day: day)
         let alert = NSAlert()
         alert.messageText = rows.isEmpty ? "No activity to export yet" : "Appended \(rows.count) row(s) to timesheet-log.md"
         alert.informativeText = rows.joined(separator: "\n")
@@ -1039,6 +1205,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 attribution.reloadSprint()
                 reindexEmbeddings()
                 rebuildMenu(current: monitor.currentState)
+                // Remember the org on disk so it pre-fills next time (and survives a restart) —
+                // re-read first, same as addNoTicketRule, so this doesn't clobber unrelated
+                // Settings edits made since launch. AppDelegate's own `config` is a `let` (every
+                // setting needs a restart to take effect, by design), so this only affects the
+                // NEXT launch's prefill, not this session's live dialog.
+                var disk = Config.load()
+                if disk.azureOrg != creds.org { disk.azureOrg = creds.org; disk.save() }
                 showInfo("Connected to \(who). Loaded \(r.open) open / \(r.total) total work item(s).")
             } catch {
                 azureDevOps.disconnect()   // don't keep bad credentials
@@ -1177,6 +1350,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc private func togglePause() { monitor.setPaused(!monitor.paused); updateStatus(monitor.currentState) }
     @objc private func openDataFolder() { NSWorkspace.shared.open(AppPaths.dataDir) }
+    @objc private func openTicketURL(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        NSWorkspace.shared.open(url)
+    }
     @objc private func openAccessibilitySettings() {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
@@ -1189,12 +1366,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = AXIsProcessTrustedWithOptions(opts)
     }
 
+    /// A silently-disconnected issue provider (e.g. a Keychain item that didn't survive a rebuild,
+    /// or credentials never entered) otherwise shows up only as "Connect …" quietly sitting in the
+    /// menu — easy to miss, and everything downstream (guessing, Review, submission) just degrades
+    /// with no obvious cause. Called once preload() has actually run, so `configured` is reliable.
+    /// `UNUserNotificationCenter.current()` raises `bundleProxyForCurrentProcess is nil` — a hard
+    /// crash, not a throw — in any process without a real bundle. `swift build` + running
+    /// `.build/debug/timetracker` directly is a documented dev path here (see CLAUDE.md), so every
+    /// call site has to be gated on actually being bundled.
+    private static var canUseUserNotifications: Bool { Bundle.main.bundleIdentifier != nil }
+
+    private func notifyIfIssueProviderDisconnected() {
+        guard !issueProvider.configured else { return }
+        guard Self.canUseUserNotifications else {
+            // Un-bundled dev run: no notification centre, but don't swallow the signal entirely.
+            FileHandle.standardError.write("timetracker: not connected to \(issueProvider.displayName)\n".data(using: .utf8)!)
+            return
+        }
+        let content = UNMutableNotificationContent()
+        content.title = "TimeTracker"
+        content.body = "Not connected to \(issueProvider.displayName) — tickets won't be guessed until you reconnect."
+        content.sound = .default
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "issue-provider-disconnected", content: content, trigger: nil))
+    }
+
     // MARK: - Continuous embeddings (async, off the hot path)
 
     private func reindexEmbeddings() {
         guard embeddings.enabled else { return }
         let tickets = attribution.guessTickets   // embeddings only over the guessable pool
-        Task.detached { [weak self] in await self?.embeddings.index(tickets) }
+        guard let matcher = embeddings else { return }   // bound on main; the matcher owns its state
+        Task.detached { await matcher.index(tickets) }
     }
 
     /// On context change, rank by embeddings async, then re-fuse all signals. Embedding is now a
@@ -1236,7 +1438,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         prReviewInFlight.insert(prId)
         Task { @MainActor in
             defer { self.prReviewInFlight.remove(prId) }
-            guard let ticket = await self.azureDevOps.resolveWorkItem(forPullRequestId: prId) else { return }
+            // Cache the result either way — nil (no linked work item) still marks this PR as
+            // "checked" so the segment reads as code-review activity instead of falling through
+            // to ordinary fusion guessing (see PeriodCompiler's generic-code-review fallback).
+            let ticket = await self.azureDevOps.resolveWorkItem(forPullRequestId: prId)
             self.attribution.cachePRReviewTicket(prId: prId, ticket: ticket)
             self.refineCurrent()
         }
@@ -1373,6 +1578,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Timesheet fill reminders
 
+    @MainActor
     private func checkReminders() {
         guard config.remindersEnabled, !monitor.paused, !promptOpen else { return }
         let now = Date()
@@ -1397,12 +1603,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// True if the day has activity but at least one active 4h block has no assignment yet.
+    /// True if the day has activity but Review was never saved for it. Deliberately coarser than
+    /// the old per-block check (which read `block_assignments` directly) — now that Save writes
+    /// `period_assignments` instead, per-block granularity doesn't carry over cleanly (a day's
+    /// period shape is data-dependent, not a fixed list of ids), and "did you forget entirely" is
+    /// what this reminder is actually for, not "did you assign every period."
+    ///
+    /// All three checks are needed. `period_assignments` is a new table, so on its own it reports
+    /// EVERY day predating the floating-period compiler as unfilled — including days already
+    /// reviewed and submitted under the fixed-block model. That isn't just noise: it nudges the
+    /// user to reopen and re-submit historical days, which is exactly the path that duplicates
+    /// worklogs (their old map keys no longer resolve — see `WorklogKey`).
     private func dayNeedsFilling(_ day: Date) -> Bool {
-        for r in summary.dayReports(day) where r.hasActivity {
-            if store.blockAssignment(day: TimeBlocks.dayString(day), block: r.block) == nil { return true }
-        }
-        return false
+        guard summary.dayReports(day).contains(where: { $0.hasActivity }) else { return false }
+        return !TimesheetRecord.exists(day: day, config: config, store: store,
+                                       submittedDays: UserDefaults.standard.stringArray(forKey: "submittedDays") ?? [])
     }
 
     /// The most recent prior day that had activity; returned only if it still needs filling.
@@ -1417,6 +1632,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return nil
     }
 
+    // Runs a modal alert, so it is main-thread by construction anyway.
+    @MainActor
     private func remind(day: Date, message: String) {
         promptOpen = true
         NSApp.activate(ignoringOtherApps: true)
@@ -1568,8 +1785,50 @@ if CommandLine.arguments.contains("--eval") {
     exit(0)
 }
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)   // menu-bar only, no Dock icon
-app.run()
+// Headless period-compiler dump (`--dump-periods [--day yyyy-MM-dd]`): the manual-verification
+// vehicle for PeriodCompiler against the real local DB, ahead of any Review UI risk. Temporary —
+// remove once the Review UI is wired to periods and this is superseded by using the app directly.
+if CommandLine.arguments.contains("--dump-periods") {
+    let config = Config.load()
+    let store = Store()
+    let attribution = Attribution(config: config, store: store)
+    let ollama = Ollama(config: config)
+    var day = Date()
+    if let idx = CommandLine.arguments.firstIndex(of: "--day"), idx + 1 < CommandLine.arguments.count {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
+        if let d = f.date(from: CommandLine.arguments[idx + 1]) { day = d }
+    }
+    // Pump the run loop rather than blocking on a semaphore: PeriodCompiler is @MainActor (see
+    // its doc comment), so parking the main thread here would deadlock the very work we're
+    // awaiting. Pumping also lets URLSession's delegate callbacks land for the Ollama pass.
+    var done = false
+    Task { @MainActor in
+        let periods = await PeriodCompiler.compile(day: day, config: config, store: store, attribution: attribution, ollama: ollama)
+        print("Periods for \(TimeBlocks.dayString(day)):")
+        for p in periods {
+            let kind = p.kind.rawValue.padding(toLength: 10, withPad: " ", startingAt: 0)
+            let trueH = String(format: "%.2f", p.trueSeconds / 3600)
+            let repH = String(format: "%.2f", p.reportedSeconds / 3600)
+            print("  \(kind) true=\(trueH)h reported=\(repH)h  ticket=\(p.effectiveTicket ?? "—")  source=\(p.guessSource ?? "-")")
+        }
+        let totalTrue = periods.reduce(0.0) { $0 + $1.trueSeconds } / 3600
+        let totalReported = periods.reduce(0.0) { $0 + $1.reportedSeconds } / 3600
+        let target = TimeBlocks.dailyTargetSeconds(day, config) / 3600
+        print(String(format: "Total: true=%.2fh reported=%.2fh target=%.2fh", totalTrue, totalReported, target))
+        done = true
+    }
+    while !done { RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05)) }
+    exit(0)
+}
+
+// Top-level code in a main.swift is nonisolated, but this all genuinely runs on the main thread
+// before the run loop starts. `assumeIsolated` states that rather than hopping, which would defer
+// app setup past `run()`.
+MainActor.assumeIsolated {
+    let app = NSApplication.shared
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    app.setActivationPolicy(.accessory)   // menu-bar only, no Dock icon
+    _ = delegate                          // keep the delegate alive; NSApplication doesn't retain it
+    app.run()
+}
